@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - docs/m00-proposal
+      - feat/3-m01-bootstrap
   pull_request:
 
 permissions:
