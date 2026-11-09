@@ -246,14 +246,10 @@ fn cfg03_rejects_duplicate_listener_ids() {
         &two_listeners(("same", "127.0.0.1:3128"), ("same", "127.0.0.2:3128")),
         "\"auto\"",
     );
-    assert_rejected(
-        &text,
-        &[
-            "listeners[1].id",
-            "duplicate listener id `same`",
-            "listeners[0]",
-        ],
-    );
+    let message = message(&text);
+    assert!(message.contains("listeners[1].id"), "{message}");
+    assert!(message.contains("duplicates listeners[0].id"), "{message}");
+    assert!(!message.contains("same"), "listener id leaked: {message}");
 }
 
 #[test]
@@ -262,12 +258,15 @@ fn cfg03_rejects_duplicate_listener_addresses() {
         &two_listeners(("first", "127.0.0.1:3128"), ("second", "127.0.0.1:3128")),
         "\"auto\"",
     );
-    assert_rejected(
-        &text,
-        &[
-            "listeners[1].bind",
-            "duplicate listener address `127.0.0.1:3128`",
-        ],
+    let message = message(&text);
+    assert!(message.contains("listeners[1].bind"), "{message}");
+    assert!(
+        message.contains("duplicates listeners[0].bind"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("127.0.0.1:3128"),
+        "listener address leaked: {message}"
     );
 }
 
@@ -277,18 +276,25 @@ fn cfg03_rejects_wildcard_overlap_in_same_family() {
         &two_listeners(("wildcard", "0.0.0.0:3128"), ("specific", "127.0.0.1:3128")),
         "\"auto\"",
     );
-    assert_rejected(
-        &text,
-        &["listeners[1].bind", "wildcard conflict", "0.0.0.0:3128"],
+    let diagnostic = message(&text);
+    assert!(diagnostic.contains("listeners[1].bind"), "{diagnostic}");
+    assert!(diagnostic.contains("wildcard conflict"), "{diagnostic}");
+    assert!(diagnostic.contains("listeners[0].bind"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("0.0.0.0:3128"),
+        "listener address leaked: {diagnostic}"
     );
 
     let text = config_with(
         &two_listeners(("wildcard", "[::]:3128"), ("specific", "[::1]:3128")),
         "\"auto\"",
     );
-    assert_rejected(
-        &text,
-        &["listeners[1].bind", "wildcard conflict", "[::]:3128"],
+    let diagnostic = message(&text);
+    assert!(diagnostic.contains("listeners[1].bind"), "{diagnostic}");
+    assert!(diagnostic.contains("wildcard conflict"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("[::]:3128"),
+        "listener address leaked: {diagnostic}"
     );
 }
 
@@ -535,6 +541,75 @@ fn cfg01_rejects_invalid_listener_ids_without_echoing_them() {
 }
 
 #[test]
+fn cfg03_semantic_conflicts_do_not_echo_listener_values() {
+    const MARKER: &str = "MARKER-SECRET-REVIEW-123";
+
+    let duplicate_id = config_with(
+        &format!(
+            "{}{}",
+            listener(MARKER, "127.0.0.1:3128"),
+            listener(MARKER, "127.0.0.2:3128")
+        ),
+        "\"auto\"",
+    );
+    let diagnostic = message(&duplicate_id);
+    assert!(
+        !diagnostic.contains(MARKER),
+        "duplicate-id diagnostic leaked listener id: {diagnostic}"
+    );
+    assert!(diagnostic.contains("listeners[1].id"), "{diagnostic}");
+
+    let wildcard = config_with(
+        &format!(
+            "{}{}",
+            listener(MARKER, "0.0.0.0:3128"),
+            listener("other", "127.0.0.1:3128")
+        ),
+        "\"auto\"",
+    );
+    let diagnostic = message(&wildcard);
+    assert!(
+        !diagnostic.contains(MARKER),
+        "wildcard diagnostic leaked listener id: {diagnostic}"
+    );
+    assert!(diagnostic.contains("wildcard conflict"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("0.0.0.0:3128"),
+        "wildcard diagnostic leaked address: {diagnostic}"
+    );
+}
+
+#[test]
+fn cfg01_escapes_control_characters_in_field_diagnostics() {
+    let text =
+        config("\"auto\"").replace("[runtime]", "[runtime]\n\"first\\nFORGED-LOG-LINE\" = true");
+    let message = message(&text);
+    assert!(
+        !message.contains('\n'),
+        "raw newline in diagnostic: {message:?}"
+    );
+    assert!(
+        message.contains("\\n"),
+        "newline is not shown as escape: {message}"
+    );
+    assert!(message.contains("FORGED-LOG-LINE"), "{message}");
+    assert!(message.contains("runtime"), "{message}");
+}
+
+#[test]
+fn cfg01_limits_unknown_field_fragment_length() {
+    let key = "K".repeat(1_000);
+    let text = config("\"auto\"").replace("[runtime]", &format!("[runtime]\n{key} = true"));
+    let message = message(&text);
+    assert!(
+        message.chars().count() <= 400,
+        "diagnostic is too long: {} chars",
+        message.chars().count()
+    );
+    assert!(message.contains("..."), "{message}");
+}
+
+#[test]
 fn cfg01_never_echoes_sensitive_values() {
     const MARKER: &str = "MARKER-SECRET-123";
 
@@ -546,6 +621,7 @@ fn cfg01_never_echoes_sensitive_values() {
             &listener("loopback", "127.0.0.1:3128").replace("\"http\"", &format!("\"{MARKER}\"")),
             "\"auto\"",
         ),
+        config("\"auto\"").replace("\"auto\"", &format!("'{MARKER}'")),
         with_limit("max_connections", &format!("\"{MARKER}\"")),
         config(&format!("\"{MARKER}\"")),
         format!("schema_version = \"{MARKER}"),

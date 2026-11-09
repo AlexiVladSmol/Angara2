@@ -34,6 +34,10 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
 }
 
+fn listener(id: &str, bind: &str) -> String {
+    format!("\n[[listeners]]\nid = \"{id}\"\nbind = \"{bind}\"\ntransport = \"http\"\n")
+}
+
 #[test]
 fn cli_version_prints_version_and_succeeds() {
     let output = output(&["--version"]);
@@ -103,7 +107,7 @@ fn cli_check_rejects_invalid_config_with_nonzero_exit() {
     assert_eq!(status(&output), 1);
     assert!(stdout(&output).is_empty());
     let error = stderr(&output);
-    assert!(error.contains("duplicate listener id"), "{error}");
+    assert!(error.contains("duplicates listeners[0].id"), "{error}");
     assert!(error.contains("listeners[1].id"), "{error}");
 }
 
@@ -254,6 +258,82 @@ fn cli_error_keeps_field_and_position() {
     assert!(error.contains("runtime.worker_threads"), "{error}");
     assert!(error.contains("line 5"), "{error}");
     assert!(!error.contains("MARKER-WORKER"), "{error}");
+}
+
+#[test]
+fn cli_semantic_errors_do_not_leak_listener_values() {
+    const MARKER: &str = "MARKER-SECRET-REVIEW-123";
+    let dir = TempDir::new("cli-semantic-secret");
+
+    let duplicate = config_with(
+        &format!(
+            "{}{}",
+            listener(MARKER, "127.0.0.1:3128"),
+            listener(MARKER, "127.0.0.2:3128")
+        ),
+        "\"auto\"",
+    );
+    let wildcard = config_with(
+        &format!(
+            "{}{}",
+            listener(MARKER, "0.0.0.0:3128"),
+            listener("other", "127.0.0.1:3128")
+        ),
+        "\"auto\"",
+    );
+
+    for (name, text) in [("duplicate.toml", duplicate), ("wildcard.toml", wildcard)] {
+        let path = dir.write(name, &text);
+        for mode in ["check", "serve"] {
+            let output = angara()
+                .arg(mode)
+                .arg("--config")
+                .arg(&path)
+                .output()
+                .expect("run angara");
+
+            assert_eq!(status(&output), 1, "{mode} {name}");
+            assert!(stdout(&output).is_empty(), "{mode} {name}");
+            let error = stderr(&output);
+            assert!(
+                !error.contains(MARKER),
+                "{mode} {name} leaked listener id: {error}"
+            );
+            assert!(error.contains("listeners[1]"), "{mode} {name}: {error}");
+        }
+    }
+}
+
+#[test]
+fn cli_escapes_control_characters_in_unknown_field_diagnostic() {
+    let dir = TempDir::new("cli-newline");
+    let text =
+        config("\"auto\"").replace("[runtime]", "[runtime]\n\"first\\nFORGED-LOG-LINE\" = true");
+    let path = dir.write("injected.toml", &text);
+
+    for mode in ["check", "serve"] {
+        let output = angara()
+            .arg(mode)
+            .arg("--config")
+            .arg(&path)
+            .output()
+            .expect("run angara");
+
+        assert_eq!(status(&output), 1, "{mode}");
+        assert!(stdout(&output).is_empty(), "{mode}");
+        let error = stderr(&output);
+        assert_eq!(
+            error.lines().count(),
+            1,
+            "{mode}: diagnostic must stay one record: {error:?}"
+        );
+        assert!(
+            error.contains("\\n"),
+            "{mode}: newline is not shown as escape: {error:?}"
+        );
+        assert!(error.contains("FORGED-LOG-LINE"), "{mode}: {error:?}");
+        assert!(!error.contains("\nFORGED"), "{mode}: {error:?}");
+    }
 }
 
 #[test]

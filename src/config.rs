@@ -43,6 +43,9 @@ const MIN_MAX_HEADER_BYTES: i64 = 1_024;
 const MIN_HEADER_READ_TIMEOUT_MS: i64 = 100;
 const MIN_IDLE_TIMEOUT_MS: i64 = 1_000;
 const MIN_SHUTDOWN_TIMEOUT_MS: i64 = 1;
+const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
+const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
+const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
 const WORKER_THREADS_EXPECTED: &str = "must be `auto` or an integer from 1 to 64";
 
 /// A validated Angara configuration.
@@ -274,10 +277,11 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read { path, source } => {
+                let path = escape_control(&path.to_string_lossy(), MAX_DIAGNOSTIC_PATH_CHARS);
+                let source = escape_control(&source.to_string(), MAX_DIAGNOSTIC_MESSAGE_CHARS);
                 write!(
                     formatter,
-                    "cannot read configuration file `{}`: {source}",
-                    path.display()
+                    "cannot read configuration file `{path}`: {source}"
                 )
             }
             Self::Toml {
@@ -294,11 +298,15 @@ impl fmt::Display for ConfigError {
                     formatter.write_str("invalid configuration")?;
                 }
                 if let Some(path) = path {
+                    let path = escape_control(path, MAX_DIAGNOSTIC_PATH_CHARS);
                     write!(formatter, ", field `{path}`")?;
                 }
+                let message = escape_control(message, MAX_DIAGNOSTIC_MESSAGE_CHARS);
                 write!(formatter, ": {message}")
             }
             Self::Validation { path, message } => {
+                let path = escape_control(path, MAX_DIAGNOSTIC_PATH_CHARS);
+                let message = escape_control(message, MAX_DIAGNOSTIC_MESSAGE_CHARS);
                 write!(
                     formatter,
                     "invalid configuration, field `{path}`: {message}"
@@ -342,28 +350,39 @@ fn line_column(input: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// Removes string values from a serde/TOML diagnostic.
+/// Removes string values from a serde/TOML diagnostic and escapes control
+/// characters so one error always occupies exactly one log record.
 ///
 /// Serde renders unexpected string values between double quotes, so a secret
 /// that was placed in a wrong field cannot reach stdout, stderr or CI logs.
-/// Field names and expected tokens are preserved.
+/// Field names and expected tokens are preserved, but are escaped and length
+/// limited before they are inserted into the message.
 fn sanitize_message(message: &str) -> String {
-    if let Some(rest) = message.strip_prefix("unknown field `")
+    let normalized = if let Some(rest) = message.strip_prefix("unknown field `")
         && let Some((field, _)) = rest.split_once('`')
     {
-        return if is_future_feature_field(field) {
+        let future_feature = is_future_feature_field(field);
+        let field = escape_control(field, MAX_UNKNOWN_FIELD_CHARS);
+        if future_feature {
             format!("field `{field}` is not supported in M01")
         } else {
             format!("unknown field `{field}`")
-        };
-    }
+        }
+    } else {
+        redact_double_quoted(message)
+    };
 
-    let mut sanitized = String::with_capacity(message.len());
+    escape_control(&normalized, MAX_DIAGNOSTIC_MESSAGE_CHARS)
+}
+
+fn redact_double_quoted(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len().min(512));
     let mut characters = message.chars();
     while let Some(character) = characters.next() {
         if character == '`' {
             // Backtick-quoted tokens are field names and expected literals,
-            // not user values. Copy them as-is so diagnostics stay useful.
+            // not user values. Copy them as-is so diagnostics stay useful;
+            // control characters are escaped afterwards.
             sanitized.push(character);
             for inner in characters.by_ref() {
                 sanitized.push(inner);
@@ -387,13 +406,40 @@ fn sanitize_message(message: &str) -> String {
             sanitized.push(character);
         }
     }
+    sanitized
+}
 
-    let mut single_line = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.chars().count() > 240 {
-        single_line = single_line.chars().take(240).collect::<String>();
-        single_line.push_str("...");
+fn escape_control(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut count = 0;
+    for character in input.chars() {
+        if count >= max_chars {
+            output.push_str("...");
+            break;
+        }
+
+        let escaped = match character {
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            character
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
+                format!("\\u{{{:x}}}", u32::from(character))
+            }
+            character => character.to_string(),
+        };
+        count += escaped.chars().count();
+        output.push_str(&escaped);
     }
-    single_line
+    output
 }
 
 fn is_future_feature_field(field: &str) -> bool {
@@ -525,10 +571,7 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
             if left.id == right.id {
                 return Err(validation(
                     format!("listeners[{second}].id"),
-                    format!(
-                        "duplicate listener id `{}` (already used by listeners[{first}].id)",
-                        left.id
-                    ),
+                    format!("listeners[{second}].id duplicates listeners[{first}].id"),
                 ));
             }
 
@@ -540,10 +583,7 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
             if left.bind == right.bind {
                 return Err(validation(
                     format!("listeners[{second}].bind"),
-                    format!(
-                        "duplicate listener address `{}` (already used by listeners[{first}].bind)",
-                        right.bind
-                    ),
+                    format!("listeners[{second}].bind duplicates listeners[{first}].bind"),
                 ));
             }
 
@@ -551,8 +591,7 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
                 return Err(validation(
                     format!("listeners[{second}].bind"),
                     format!(
-                        "wildcard conflict: listeners[{first}] `{}` = `{}` and listeners[{second}] `{}` = `{}` share an IP family and port",
-                        left.id, left.bind, right.id, right.bind
+                        "wildcard conflict between listeners[{first}].bind and listeners[{second}].bind on the same IP family and port"
                     ),
                 ));
             }
