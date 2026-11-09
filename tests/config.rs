@@ -234,6 +234,13 @@ fn cfg03_rejects_port_zero_and_ipv4_mapped_ipv6() {
 }
 
 #[test]
+fn cfg03_rejects_scoped_or_unparsable_ipv6_listener() {
+    let text = config_with(&listener("loopback", "[fe80::1%25eth0]:3128"), "\"auto\"");
+    let message = message(&text);
+    assert!(message.contains("listeners[0].bind"), "{message}");
+}
+
+#[test]
 fn cfg03_rejects_duplicate_listener_ids() {
     let text = config_with(
         &two_listeners(("same", "127.0.0.1:3128"), ("same", "127.0.0.2:3128")),
@@ -272,7 +279,7 @@ fn cfg03_rejects_wildcard_overlap_in_same_family() {
     );
     assert_rejected(
         &text,
-        &["listeners[1].bind", "overlaps wildcard", "0.0.0.0:3128"],
+        &["listeners[1].bind", "wildcard conflict", "0.0.0.0:3128"],
     );
 
     let text = config_with(
@@ -281,7 +288,7 @@ fn cfg03_rejects_wildcard_overlap_in_same_family() {
     );
     assert_rejected(
         &text,
-        &["listeners[1].bind", "overlaps wildcard", "[::]:3128"],
+        &["listeners[1].bind", "wildcard conflict", "[::]:3128"],
     );
 }
 

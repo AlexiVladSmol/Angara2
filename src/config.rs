@@ -551,8 +551,8 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
                 return Err(validation(
                     format!("listeners[{second}].bind"),
                     format!(
-                        "address `{}` overlaps wildcard address of listeners[{first}] `{}` ({}) on the same IP family and port",
-                        right.bind, left.id, left.bind
+                        "wildcard conflict: listeners[{first}] `{}` = `{}` and listeners[{second}] `{}` = `{}` share an IP family and port",
+                        left.id, left.bind, right.id, right.bind
                     ),
                 ));
             }
