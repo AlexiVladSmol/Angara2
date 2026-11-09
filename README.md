@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00 согласован владельцем 9 ноября 2026 года; M01 готов к выдаче DeepSeek.** Ревизия документов: 0.2. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. Реализация и исполняемые тесты пока отсутствуют. Согласование требований и слияние PR — отдельные действия.
+**Статус: M01 реализован в ветке `feat/3-m01-bootstrap` и передан на ревью; работающего proxy ещё нет.** Ревизия документов: 0.2. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `check` и `serve` проверяют конфигурацию, но HTTP forwarding, CONNECT, TLS, auth, ACL, egress, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия.
 
 ## Участники и работа
 
@@ -40,8 +40,133 @@ HTTPS внутри CONNECT остаётся сквозным: TLS содержи
 | [Задание M01](docs/tasks/M01_BOOTSTRAP.md) | Каркас Rust, CLI, конфигурация, подготовка многопоточного runtime и CI |
 | [Инструкции участникам](AGENTS.md) | Роли и правила работы агентов |
 
+## M01: сборка, CLI и конфигурация
+
+M01 добавляет минимальную поддерживаемую основу. HTTP forwarding, CONNECT,
+TLS, auth, ACL, egress, cache, TUI и admin API в неё не входят.
+
+### Toolchain и сборка
+
+- Rust 1.97.1, edition 2024; канал и компоненты закреплены в
+  [`rust-toolchain.toml`](rust-toolchain.toml), точные версии зависимостей — в
+  `Cargo.lock`.
+- Целевая среда первой проверки: Ubuntu Server 24.04 x86_64.
+- Сборка из чистой копии: `cargo build --locked`.
+
+Обычные проверки (те же команды выполняет CI):
+
+```console
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
+cargo test --locked
+cargo run --locked -- check --config examples/minimal.toml
+cargo run --locked -- check --config examples/multi-listener.toml
+cargo deny check
+```
+
+### CLI и коды завершения
+
+| Команда | Поведение |
+| --- | --- |
+| `angara --version` | Печатает `angara 0.1.0`, код 0 |
+| `angara check --config <path>` | Читает, разбирает и проверяет TOML; код 0 при успехе, без сети |
+| `angara serve --config <path>` | Проверяет config и завершается сообщением «proxy ещё не реализован», код 3; listeners и upstream не открываются |
+| `angara --help` | Печатает справку, код 0 |
+
+Коды: `0` — успех, `1` — ошибка конфигурации, `2` — ошибка аргументов,
+`3` — proxy ещё не реализован. Ошибки печатаются в stderr, не содержат
+значений config и по возможности указывают поле, строку и столбец.
+
+### Строгая схема TOML
+
+```toml
+schema_version = 1
+
+[runtime]
+worker_threads = "auto" # или целое 1..=64
+
+[limits]
+max_connections = 256
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[[listeners]]
+id = "proxy-loopback"
+bind = "127.0.0.1:3128"
+transport = "http"
+```
+
+- Неизвестные ключи и будущие активные разделы (TLS, auth, ACL, egress,
+  routing, cache, admin и т. п.) отклоняются, а не игнорируются.
+- `schema_version` поддерживается только `1`.
+- `listeners`: от 1 до 64 определений; `id` уникален, состоит из 1–64 ASCII
+  букв, цифр, `-`, `_`, `.`; `bind` — только числовой `IP:port` с портом
+  1–65535; `transport` в M01 — только `http`.
+- Дубли `id`/адресов и пересечение wildcard-адреса с конкретным адресом того
+  же семейства и порта отвергаются. IPv6 listener проектируется как IPv6-only:
+  будущий bind выставит `IPV6_V6ONLY`, поэтому `0.0.0.0` и `[::]` на одном
+  порту не конфликтуют. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) и scoped IPv6
+  отклоняются.
+- `limits`: `max_connections` 1–65535, `max_header_bytes` 1 KiB–1 MiB,
+  `header_read_timeout_ms` 100–300000, `idle_timeout_ms` 1000–3600000,
+  `shutdown_timeout_ms` 1–300000. Ноль, отрицательные значения,
+  переполнение и выход за границу — ошибка.
+- `worker_threads`: `auto` использует доступный процессу параллелизм (минимум
+  1, максимум 64); явное число задаёт multi-thread Tokio runtime. Число
+  workers не ограничивает число клиентов или соединений.
+- `check` не выполняет DNS, не открывает listener и не соединяется с
+  upstream. На Linux отсутствие вызовов `socket`/`bind`/`connect`/
+  `getaddrinfo`/`gethostbyname` доказывает LD_PRELOAD-тест с положительным
+  контролем; на других ОС этот тест не исполняется.
+
+Примеры: [`examples/minimal.toml`](examples/minimal.toml) и
+[`examples/multi-listener.toml`](examples/multi-listener.toml).
+
+Обоснование границ: 64 workers — верхняя граница выше типичного числа CPU на
+первом сервере; она предотвращает случайное создание сотен потоков, а `auto`
+использует доступный параллелизм, но не превышает её. 64 listeners с запасом
+покрывают несколько интерфейсов и не позволяют конфигурации разрастись
+незаметно. Числовые limits конечны, чтобы отвергать ноль, отрицательные
+значения, переполнение и бесконтрольные очереди; значения в примерах —
+безопасные стартовые, а не обещание производительности. `max_connections`
+ограничивает соединения независимо от числа workers.
+
+### Зависимости и лицензии
+
+Прямые зависимости M01: `tokio` (только feature `rt-multi-thread`, без
+net/time/io-драйверов), `serde`, `toml` и `serde_path_to_error` для строгой
+схемы и безопасного пути поля в ошибках. `hyper`, `rustls`, CLI-фреймворк и
+dev-зависимости пока не подключены. Политика зависимостей проверяется
+[`deny.toml`](deny.toml): RustSec advisories, allow-list MIT/Apache-2.0/
+Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
+не выбрана и `LICENSE` не создаётся; `[licenses.private]` исключает только
+непубликуемый crate Angara, внешние зависимости проверяются полностью.
+
+### CI
+
+Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
+`ubuntu-24.04` для PR и для push в `main`/`docs/m00-proposal`:
+
+| Job | Проверки |
+| --- | --- |
+| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, проверка обоих примеров через `angara check` |
+| `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
+
+Права workflow — только `contents: read`; production secrets не используются.
+Внешние actions закреплены commit SHA: `actions/checkout` v7.0.1
+(`3d3c42e5aac5ba805825da76410c181273ba90b1`) и
+`EmbarkStudios/cargo-deny-action` v2.1.1
+(`3c6349835b2b7b196a839186cb8b78e02f7b5f25`). Фактические результаты для
+конкретного head SHA указываются в PR.
+
 ## Текущее состояние
 
-Ответы владельца внесены в журнал решений, архитектуру и тестовую матрицу. Следующее действие — выполнение M01 DeepSeek по отдельному Ready Issue. До слияния PR документации исходной базой задания служит согласованный коммит ветки docs/m00-proposal; после слияния используется main, содержащий те же документы.
+Документы M00 согласованы; M01 реализован в ветке `feat/3-m01-bootstrap` и
+направлен PR в `docs/m00-proposal`. Работающего proxy нет: `serve` возвращает
+код 3, listeners не открываются. Следующие шаги — ревью M01, затем M02 с
+моделью ACL, egress/routing и контрактами resolver/transport.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

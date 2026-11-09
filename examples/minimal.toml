@@ -1,0 +1,22 @@
+# Angara M01 — минимальная безопасная конфигурация.
+# Прокси ещё не реализован: `angara check` только проверяет этот файл,
+# `angara serve` завершается кодом 3 и не открывает сеть.
+
+schema_version = 1
+
+[runtime]
+# "auto" использует доступный процессу параллелизм (минимум 1, максимум 64)
+# либо укажите целое число от 1 до 64.
+worker_threads = "auto"
+
+[limits]
+max_connections = 256
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[[listeners]]
+id = "proxy-loopback"
+bind = "127.0.0.1:3128"
+transport = "http"
