@@ -381,6 +381,34 @@ networks = ["10.0.0.0/8"]
 }
 
 #[test]
+fn m02_ip01_mapped_allow_cidr_matches_plain_and_mapped_candidates() {
+    let access = config(
+        r#"
+[access]
+source_allow = ["127.0.0.0/8"]
+ip_default = "deny"
+
+[[access.ip_rules]]
+id = "allow-mapped-loopback"
+action = "allow"
+networks = ["::ffff:127.0.0.0/104"]
+allow_special = true
+"#,
+    );
+    assert_eq!(
+        check_ip(access.access(), IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    );
+    assert_eq!(
+        check_ip(
+            access.access(),
+            IpAddr::V6("::ffff:127.0.0.1".parse().expect("mapped"))
+        ),
+        Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    );
+}
+
+#[test]
 fn m02_ip01_deny_before_allow_and_default_deny() {
     let access = config(
         r#"
