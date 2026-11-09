@@ -55,6 +55,8 @@ jobs:
         run: |
           cargo run --locked -- check --config examples/minimal.toml
           cargo run --locked -- check --config examples/multi-listener.toml
+          cargo run --locked -- check --config examples/m02-policy.toml
+          cargo run --locked -- check --config examples/m02-egress-local.toml
 
   deny:
     name: Dependency policy (advisories, licenses, sources)
