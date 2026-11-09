@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - docs/m00-proposal
+      # Development branches get CI even before the workflow exists on the
+      # base branch, for example when the workflow itself is introduced in a PR.
+      - "feat/**"
+      - "fix/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust checks (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Locked build
+        run: cargo build --locked
+
+      - name: Tests (unit, integration, CLI, Linux network guard)
+        run: cargo test --locked
+
+      - name: Validate example configurations
+        run: |
+          cargo run --locked -- check --config examples/minimal.toml
+          cargo run --locked -- check --config examples/multi-listener.toml
+
+  deny:
+    name: Dependency policy (advisories, licenses, sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: cargo-deny check
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          manifest-path: ./Cargo.toml
+          log-level: warn
