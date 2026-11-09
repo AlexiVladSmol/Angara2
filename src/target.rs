@@ -424,17 +424,21 @@ fn looks_like_numeric_ipv4(host: &str) -> bool {
         return false;
     }
     let host = host.to_ascii_lowercase();
-    if host
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return true;
+    let mut labels = host.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    is_numeric_ipv4_label(first) && labels.all(is_numeric_ipv4_label)
+}
+
+fn is_numeric_ipv4_label(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
     }
-    host.split('.').any(|label| {
-        label
+    label.bytes().all(|byte| byte.is_ascii_digit())
+        || label
             .strip_prefix("0x")
             .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    })
 }
 
 /// Errors produced while parsing or normalizing a target.

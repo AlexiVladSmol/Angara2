@@ -121,6 +121,100 @@ default_egress = "system"
 }
 
 #[test]
+fn m02_accepts_hex_like_domain_selectors() {
+    let text = with_extra(
+        r#"
+[access]
+source_allow = ["127.0.0.0/8"]
+
+[[access.rules]]
+id = "hex-like"
+action = "allow"
+host_exact = ["0xdead.example.com", "api.0xface.example.com"]
+"#,
+    );
+    let config = Config::parse(&text).expect("hex-like domain selectors");
+    let HostSelectors::Exact(domains) = config.access().rules()[0].selectors().hosts() else {
+        panic!("expected exact hosts");
+    };
+    assert_eq!(domains[0].as_str(), "0xdead.example.com");
+    assert_eq!(domains[1].as_str(), "api.0xface.example.com");
+
+    assert_rejected(
+        &with_extra(
+            r#"
+[access]
+source_allow = ["127.0.0.0/8"]
+
+[[access.rules]]
+id = "numeric"
+action = "allow"
+host_exact = ["0x7f000001"]
+"#,
+        ),
+        &[
+            "access.rules[0].host_exact[0]",
+            "must be a valid domain name",
+        ],
+    );
+}
+
+#[test]
+fn m02_normalizes_ipv4_mapped_cidrs_in_all_policy_places() {
+    let text = with_extra(
+        r#"
+[access]
+source_allow = ["::ffff:127.0.0.0/104"]
+ip_default = "deny"
+
+[[access.rules]]
+id = "allow-request"
+action = "allow"
+sources = ["::ffff:127.0.0.0/104"]
+
+[[access.ip_rules]]
+id = "deny-mapped"
+action = "deny"
+networks = ["::ffff:8.8.8.0/120"]
+
+[[egress]]
+id = "system"
+mode = "system"
+
+[routing]
+default_egress = "system"
+
+[[routing.rules]]
+id = "by-mapped-source"
+egress_id = "system"
+sources = ["::ffff:10.0.0.0/104"]
+"#,
+    );
+    let config = Config::parse(&text).expect("mapped CIDR config");
+    assert_eq!(config.access().source_allow()[0].to_string(), "127.0.0.0/8");
+    assert_eq!(
+        config.access().rules()[0]
+            .selectors()
+            .sources()
+            .expect("rule sources")[0]
+            .to_string(),
+        "127.0.0.0/8"
+    );
+    assert_eq!(
+        config.access().ip_rules()[0].networks()[0].to_string(),
+        "8.8.8.0/24"
+    );
+    assert_eq!(
+        config.routing().rules()[0]
+            .selectors()
+            .sources()
+            .expect("routing sources")[0]
+            .to_string(),
+        "10.0.0.0/8"
+    );
+}
+
+#[test]
 fn m02_rejects_cidr_with_host_bits() {
     for (section, field) in [
         ("access.source_allow", "source_allow"),
@@ -525,28 +619,37 @@ mode = "system"
         ),
         &["routing.default_egress", "unknown egress id"],
     );
+}
 
-    assert_rejected(
-        &with_extra(
-            r#"
-[access]
-source_allow = ["127.0.0.0/8"]
-
-[[access.rules]]
-id = "rule"
-action = "allow"
-
+#[test]
+fn m02_accepts_routing_source_selectors() {
+    let text = with_extra(
+        r#"
 [[egress]]
 id = "system"
 mode = "system"
 
+[routing]
+default_egress = "system"
+
 [[routing.rules]]
-id = "route"
+id = "by-source"
 egress_id = "system"
 sources = ["127.0.0.0/8"]
+
+[[routing.rules]]
+id = "by-mapped-source"
+egress_id = "system"
+sources = ["::ffff:10.0.0.0/104"]
 "#,
-        ),
-        &["routing.rules[0]", "unknown field `sources`"],
+    );
+    let config = Config::parse(&text).expect("routing sources");
+    let rules = config.routing().rules();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].selectors().sources().expect("sources").len(), 1);
+    assert_eq!(
+        rules[1].selectors().sources().expect("mapped sources")[0].to_string(),
+        "10.0.0.0/8"
     );
 }
 

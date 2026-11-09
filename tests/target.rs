@@ -130,6 +130,21 @@ fn m02_tgt02_normalizes_case_trailing_dot_and_idna() {
     assert_eq!(domain("Bücher.Example."), "xn--bcher-kva.example");
     assert_eq!(domain("XN--BCHER-KVA.example"), "xn--bcher-kva.example");
     assert_eq!(domain("foo_bar.example"), "foo_bar.example");
+    assert_eq!(domain("0xdead.example.com"), "0xdead.example.com");
+    assert_eq!(domain("api.0xface.example.com"), "api.0xface.example.com");
+    assert_eq!(domain("dead.example.com"), "dead.example.com");
+
+    let hex_named = target(&Method::GET, "http://0xdead.example.com/").expect("hex-like name");
+    assert_eq!(
+        hex_named.host().as_domain().map(DomainName::as_str),
+        Some("0xdead.example.com")
+    );
+    let hex_connect =
+        target(&Method::CONNECT, "api.0xface.example.com:443").expect("hex-like CONNECT");
+    assert_eq!(
+        hex_connect.host().as_domain().map(DomainName::as_str),
+        Some("api.0xface.example.com")
+    );
 
     let suffix = DomainName::parse("example.com").expect("suffix");
     assert!(
@@ -156,6 +171,7 @@ fn m02_tgt02_rejects_invalid_domains_and_numeric_ipv4_forms() {
         "0177.0.0.1",
         "2130706433",
         "0x7f000001",
+        "0x7f.0.0.1",
         "127.0.0.1",
         "::1",
         "bad host",
@@ -175,6 +191,7 @@ fn m02_tgt02_rejects_invalid_domains_and_numeric_ipv4_forms() {
         "http://0177.0.0.1/",
         "http://2130706433/",
         "http://0x7f000001/",
+        "http://0x7f.0.0.1/",
     ] {
         assert_eq!(
             target(&Method::GET, value).expect_err(value),

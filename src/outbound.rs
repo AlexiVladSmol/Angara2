@@ -294,6 +294,7 @@ impl OutboundService {
                     .resolve(domain.as_str(), deadline)
                     .await
                     .map_err(map_resolve)?;
+                check_deadline(deadline)?;
                 prepare_addresses(addresses, self.config.dns().max_answers())?
             }
         };
@@ -304,6 +305,7 @@ impl OutboundService {
                 allowed.push(address);
             }
         }
+        check_deadline(deadline)?;
         if allowed.is_empty() {
             return Err(OutboundError::DestinationDenied);
         }
@@ -318,6 +320,7 @@ impl OutboundService {
                 compatible.then(|| SocketAddr::new(ip, target.port()))
             })
             .collect::<Vec<_>>();
+        check_deadline(deadline)?;
         if compatible.is_empty() {
             return Err(OutboundError::NoCompatibleAddress);
         }
@@ -347,6 +350,9 @@ impl OutboundService {
             {
                 Ok(stream) => {
                     drop(connecting_permit);
+                    if Instant::now() >= deadline {
+                        return Err(OutboundError::TotalTimeout);
+                    }
                     return Ok(Connected {
                         stream,
                         _permit: outbound_permit,
@@ -359,7 +365,12 @@ impl OutboundService {
                         },
                     });
                 }
-                Err(DialError::BindFailed) => return Err(OutboundError::BindFailed),
+                Err(DialError::BindFailed) => {
+                    if Instant::now() >= deadline {
+                        return Err(OutboundError::TotalTimeout);
+                    }
+                    return Err(OutboundError::BindFailed);
+                }
                 Err(DialError::ConnectTimeout) => {
                     last_error = Some(OutboundError::ConnectTimeout);
                     if Instant::now() >= deadline {
@@ -367,6 +378,9 @@ impl OutboundService {
                     }
                 }
                 Err(DialError::ConnectFailed) => {
+                    if Instant::now() >= deadline {
+                        return Err(OutboundError::TotalTimeout);
+                    }
                     last_error = Some(OutboundError::ConnectFailed);
                 }
                 Err(DialError::NoCompatibleAddress) => {
@@ -376,6 +390,7 @@ impl OutboundService {
             }
         }
 
+        check_deadline(deadline)?;
         Err(last_error.unwrap_or(OutboundError::ConnectFailed))
     }
 }

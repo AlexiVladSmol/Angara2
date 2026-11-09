@@ -60,6 +60,28 @@ source_allow = ["127.0.0.0/8", "::ffff:10.0.0.0/104"]
 }
 
 #[test]
+fn m02_acl01_mapped_source_cidr_matches_plain_and_mapped_source() {
+    let access = config(
+        r#"
+[access]
+source_allow = ["::ffff:127.0.0.0/104"]
+"#,
+    );
+    assert!(check_source(access.access(), IpAddr::V4(Ipv4Addr::LOCALHOST)).is_ok());
+    assert!(
+        check_source(
+            access.access(),
+            IpAddr::V6("::ffff:127.0.0.1".parse().expect("mapped"))
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        check_source(access.access(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+        Ok(())
+    );
+}
+
+#[test]
 fn m02_acl01_first_match_and_selectors_and_or_semantics() {
     let access = config(
         r#"

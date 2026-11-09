@@ -194,7 +194,9 @@ M02 добавляет библиотечный `OutboundService`: довере�
 - Консервативный снимок IANA special-purpose registries от 2026-11-09
   (включая Globally Reachable записи), private, loopback, link-local/metadata,
   CGNAT, документационные сети, multicast, IPv4 240.0.0.0/4 и IPv6 вне
-  2000::/3 закрыт по умолчанию. IPv4-mapped IPv6 нормализуется до IPv4.
+  2000::/3 закрыт по умолчанию. IPv4-mapped IPv6 нормализуется до IPv4;
+  IPv4-mapped CIDR в правилах также пересчитывается в IPv4 с сохранением
+  семантики префикса, а CIDR с ненулевыми host bits отвергается.
   Прямой IP проходит ту же IP-политику без DNS.
 
 ### DNS, egress и transport
@@ -207,9 +209,9 @@ M02 добавляет библиотечный `OutboundService`: довере�
   сохранением порядка; пустой — `DnsNoAddresses`, превышение `max_answers` —
   `DnsTooManyAddresses`. Кэша DNS нет.
 - Egress: `system` либо `bind_ip` (конкретный исходящий IP, bind к `IP:0`).
-  Один профиль выбирается first-match `routing.rules` по listener/method/
-  port/domain, иначе `routing.default_egress`; маршрут не расширяет ACL.
-  Bind/connect failure не меняет профиль и не делает fallback.
+  Один профиль выбирается first-match `routing.rules` по
+  listener/source/method/port/domain, иначе `routing.default_egress`; маршрут
+  не расширяет ACL. Bind/connect failure не меняет профиль и не делает fallback.
 - Dial выполняется через `TcpSocket::connect` только с проверенным
   `SocketAddr`; попытки последовательные, не более `max_connect_attempts` и
   `max_connecting`, с общим deadline. `Connected` удерживает outbound permit до

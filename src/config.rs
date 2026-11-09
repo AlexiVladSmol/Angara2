@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use http::Method;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
@@ -475,7 +475,7 @@ impl RoutingRule {
         &self.egress_id
     }
 
-    /// Rule selectors. `sources` is always absent in M02 routing.
+    /// Rule selectors.
     pub fn selectors(&self) -> &Selectors {
         &self.selectors
     }
@@ -936,6 +936,25 @@ fn parse_cidr(value: &str, path: &str) -> Result<IpNet, ConfigError> {
     if network.addr() != network.network() {
         return Err(validation(path, "CIDR must have zero host bits"));
     }
+
+    // IPv4-mapped IPv6 destinations are normalized to IPv4 before policy
+    // matching. Normalize the corresponding CIDR too; otherwise a deny rule
+    // written in mapped form would be accepted but never match.
+    if let IpNet::V6(network) = network
+        && let Some(ipv4) = network.addr().to_ipv4_mapped()
+    {
+        if network.prefix_len() < 96 {
+            return Err(validation(
+                path,
+                "IPv4-mapped IPv6 CIDR must have a prefix of at least 96; use the IPv4 form",
+            ));
+        }
+        let prefix = network.prefix_len() - 96;
+        let network = Ipv4Net::new(ipv4, prefix)
+            .map_err(|_| validation(path, "CIDR must have zero host bits"))?;
+        return Ok(IpNet::V4(network));
+    }
+
     Ok(network)
 }
 
@@ -1042,7 +1061,6 @@ fn validate_selectors(
     host_exact: Option<Vec<String>>,
     host_suffix: Option<Vec<String>>,
     listener_ids: &[&str],
-    allow_sources: bool,
 ) -> Result<Selectors, ConfigError> {
     if host_exact.is_some() && host_suffix.is_some() {
         return Err(validation(
@@ -1054,16 +1072,9 @@ fn validate_selectors(
     let listeners = listeners
         .map(|values| parse_listener_refs(&values, &format!("{path}.listeners"), listener_ids))
         .transpose()?;
-    let sources = match sources {
-        Some(_values) if !allow_sources => {
-            return Err(validation(
-                format!("{path}.sources"),
-                "sources are not supported for routing in M02",
-            ));
-        }
-        Some(values) => Some(parse_cidr_list(&values, &format!("{path}.sources"), false)?),
-        None => None,
-    };
+    let sources = sources
+        .map(|values| parse_cidr_list(&values, &format!("{path}.sources"), false))
+        .transpose()?;
     let methods = methods
         .map(|values| parse_method_list(&values, &format!("{path}.methods")))
         .transpose()?;
@@ -1129,7 +1140,6 @@ fn validate_access(
             rule.host_exact,
             rule.host_suffix,
             listener_ids,
-            true,
         )?;
         rules.push(AccessRule {
             id: rule.id,
@@ -1359,13 +1369,12 @@ fn validate_egress_routing(
         let selectors = validate_selectors(
             &path,
             raw.listeners,
-            None,
+            raw.sources,
             raw.methods,
             raw.ports,
             raw.host_exact,
             raw.host_suffix,
             listener_ids,
-            false,
         )?;
         rules.push(RoutingRule {
             id: raw.id,
@@ -1644,6 +1653,8 @@ struct RawRoutingRule {
     egress_id: String,
     #[serde(default)]
     listeners: Option<Vec<String>>,
+    #[serde(default)]
+    sources: Option<Vec<String>>,
     #[serde(default)]
     methods: Option<Vec<String>>,
     #[serde(default)]

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use angara::config::Config;
 use angara::resolver::{ResolveError, ResolveFuture, Resolver};
-use angara::transport::{DialError, DialFuture, Dialer};
+use angara::transport::{DialError, DialFuture, Dialer, TcpDialer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -187,6 +187,31 @@ impl Dialer for GatedDialer {
             self.started.notify_one();
             self.release.notified().await;
             Err(DialError::ConnectFailed)
+        })
+    }
+}
+
+pub struct LateSuccessDialer {
+    delay: Duration,
+}
+
+impl LateSuccessDialer {
+    pub fn new(delay: Duration) -> Self {
+        Self { delay }
+    }
+}
+
+impl Dialer for LateSuccessDialer {
+    fn connect<'a>(
+        &'a self,
+        endpoint: SocketAddr,
+        egress: &'a angara::config::EgressProfile,
+        deadline: Instant,
+    ) -> DialFuture<'a> {
+        Box::pin(async move {
+            let stream = TcpDialer.connect(endpoint, egress, deadline).await?;
+            tokio::time::sleep(self.delay).await;
+            Ok(stream)
         })
     }
 }
