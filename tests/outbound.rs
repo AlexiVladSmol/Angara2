@@ -477,6 +477,76 @@ fn m02_net04_max_connect_attempts_is_enforced() {
 }
 
 #[test]
+fn m02_acl01_source_denied_prevents_dns_and_dial() {
+    let resolver = Arc::new(ScriptedResolver::new(vec![Ok(vec![IpAddr::V4(
+        Ipv4Addr::LOCALHOST,
+    )])]));
+    let dialer = Arc::new(RecordingDialer::new(
+        angara::transport::DialError::ConnectFailed,
+    ));
+    let config = config(&format!("{}{}", allow_loopback_access(), system_egress()));
+    let runtime = runtime(&config);
+    let service =
+        OutboundService::with_components(Arc::new(config), resolver.clone(), dialer.clone());
+
+    runtime.block_on(async {
+        let (target, host) = domain_target("example.test", 80);
+        let context = RequestContext::new(IpAddr::from([192, 0, 2, 1]), "lab");
+        let error = service
+            .open_outbound(&context, &Method::GET, &target, Some(&host))
+            .await
+            .err()
+            .expect("source denied");
+        assert_eq!(error, OutboundError::SourceDenied);
+        assert_eq!(resolver.calls(), 0);
+        assert!(dialer.attempts().is_empty());
+    });
+}
+
+#[test]
+fn m02_dns01_empty_and_oversized_resolver_answers_are_rejected() {
+    let resolver = Arc::new(ScriptedResolver::new(vec![
+        Ok(vec![
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
+        ]),
+        Ok(vec![]),
+    ]));
+    let dialer = Arc::new(RecordingDialer::new(
+        angara::transport::DialError::ConnectFailed,
+    ));
+    let config = config(&format!(
+        "{}{}{}",
+        allow_loopback_access(),
+        system_egress(),
+        "[dns]\nmax_answers = 2\n"
+    ));
+    let runtime = runtime(&config);
+    let service =
+        OutboundService::with_components(Arc::new(config), resolver.clone(), dialer.clone());
+
+    runtime.block_on(async {
+        let (target, host) = domain_target("example.test", 80);
+        assert_eq!(
+            service
+                .open_outbound(&context("lab"), &Method::GET, &target, Some(&host))
+                .await
+                .err(),
+            Some(OutboundError::DnsTooManyAddresses)
+        );
+        assert_eq!(
+            service
+                .open_outbound(&context("lab"), &Method::GET, &target, Some(&host))
+                .await
+                .err(),
+            Some(OutboundError::DnsNoAddresses)
+        );
+        assert!(dialer.attempts().is_empty());
+    });
+}
+
+#[test]
 fn m02_acl04_deny_prevents_dns_and_dial() {
     let resolver = Arc::new(ScriptedResolver::new(vec![Ok(vec![IpAddr::V4(
         Ipv4Addr::LOCALHOST,
