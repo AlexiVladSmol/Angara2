@@ -1,18 +1,23 @@
 //! Strict TOML configuration for Angara.
 //!
 //! The schema is intentionally closed: unknown keys are rejected rather than
-//! ignored. Features that are not implemented in M01 (TLS, auth, ACL, egress,
-//! cache, admin API) therefore cannot be mistaken for supported settings.
+//! ignored. Features that are not implemented in this milestone (TLS, auth,
+//! cache, admin API, parent proxy) therefore cannot be mistaken for supported
+//! settings.
 
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use http::Method;
+use ipnet::{IpNet, Ipv4Net};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
+
+use crate::target::{DomainName, parse_method};
 
 /// The only configuration schema version supported by this build.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -38,11 +43,38 @@ pub const IDLE_TIMEOUT_MS_LIMIT: u64 = 3_600_000;
 /// Upper bound for `limits.shutdown_timeout_ms` (5 minutes).
 pub const SHUTDOWN_TIMEOUT_MS_LIMIT: u64 = 300_000;
 
+/// Maximum number of entries in a rule/profile/selector list.
+pub const MAX_POLICY_LIST_ITEMS: usize = 256;
+
+/// Maximum identifier length for listeners, rules, and egress profiles.
+pub const MAX_ID_BYTES: usize = 64;
+
 const MIN_MAX_CONNECTIONS: i64 = 1;
 const MIN_MAX_HEADER_BYTES: i64 = 1_024;
 const MIN_HEADER_READ_TIMEOUT_MS: i64 = 100;
 const MIN_IDLE_TIMEOUT_MS: i64 = 1_000;
 const MIN_SHUTDOWN_TIMEOUT_MS: i64 = 1;
+const MIN_DNS_TIMEOUT_MS: i64 = 100;
+const MAX_DNS_TIMEOUT_MS: i64 = 30_000;
+const MIN_DNS_MAX_IN_FLIGHT: i64 = 1;
+const MAX_DNS_MAX_IN_FLIGHT: i64 = 64;
+const MIN_DNS_MAX_ANSWERS: i64 = 1;
+const MAX_DNS_MAX_ANSWERS: i64 = 64;
+const MIN_TOTAL_TIMEOUT_MS: i64 = 100;
+const MAX_TOTAL_TIMEOUT_MS: i64 = 120_000;
+const MIN_CONNECT_TIMEOUT_MS: i64 = 100;
+const MAX_CONNECT_TIMEOUT_MS: i64 = 30_000;
+const MIN_CONNECT_ATTEMPTS: i64 = 1;
+const MAX_CONNECT_ATTEMPTS: i64 = 8;
+const MIN_CONNECTING: i64 = 1;
+const MAX_CONNECTING: i64 = 256;
+const DEFAULT_DNS_TIMEOUT_MS: i64 = 3_000;
+const DEFAULT_DNS_MAX_IN_FLIGHT: i64 = 4;
+const DEFAULT_DNS_MAX_ANSWERS: i64 = 16;
+const DEFAULT_TOTAL_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 3_000;
+const DEFAULT_CONNECT_ATTEMPTS: i64 = 3;
+const DEFAULT_CONNECTING_CAP: i64 = 32;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -58,6 +90,11 @@ pub struct Config {
     runtime: RuntimeConfig,
     limits: Limits,
     listeners: Vec<Listener>,
+    access: AccessConfig,
+    dns: DnsConfig,
+    transport: TransportConfig,
+    egress: Vec<EgressProfile>,
+    routing: RoutingConfig,
 }
 
 impl Config {
@@ -100,6 +137,31 @@ impl Config {
     /// Validated listener definitions in configuration order.
     pub fn listeners(&self) -> &[Listener] {
         &self.listeners
+    }
+
+    /// Source gate, request ACL, and destination IP policy.
+    pub fn access(&self) -> &AccessConfig {
+        &self.access
+    }
+
+    /// System resolver limits.
+    pub fn dns(&self) -> &DnsConfig {
+        &self.dns
+    }
+
+    /// Outbound connect limits.
+    pub fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    /// Validated egress profiles.
+    pub fn egress(&self) -> &[EgressProfile] {
+        &self.egress
+    }
+
+    /// Egress routing rules.
+    pub fn routing(&self) -> &RoutingConfig {
+        &self.routing
     }
 }
 
@@ -193,10 +255,292 @@ impl Limits {
     }
 }
 
+/// Source gate, pre-DNS request ACL, and destination IP policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessConfig {
+    source_allow: Vec<IpNet>,
+    rules: Vec<AccessRule>,
+    ip_rules: Vec<IpRule>,
+    ip_default: IpDefault,
+}
+
+impl AccessConfig {
+    /// CIDRs allowed to act as clients. An empty list denies every source.
+    pub fn source_allow(&self) -> &[IpNet] {
+        &self.source_allow
+    }
+
+    /// Ordered pre-DNS request rules.
+    pub fn rules(&self) -> &[AccessRule] {
+        &self.rules
+    }
+
+    /// Ordered destination IP rules.
+    pub fn ip_rules(&self) -> &[IpRule] {
+        &self.ip_rules
+    }
+
+    /// Default when no destination IP rule matches.
+    pub fn ip_default(&self) -> IpDefault {
+        self.ip_default
+    }
+}
+
+/// Default policy for a destination IP with no matching rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpDefault {
+    /// Allow only ordinary global unicast addresses.
+    PublicOnly,
+    /// Deny every address without an explicit allow rule.
+    Deny,
+}
+
+/// First-match request rule action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    /// Allow the request to continue to DNS and dial.
+    Allow,
+    /// Deny the request before DNS.
+    Deny,
+}
+
+/// One pre-DNS request rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRule {
+    id: String,
+    action: RuleAction,
+    selectors: Selectors,
+}
+
+impl AccessRule {
+    /// Stable rule identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Allow or deny.
+    pub fn action(&self) -> RuleAction {
+        self.action
+    }
+
+    /// Rule selectors.
+    pub fn selectors(&self) -> &Selectors {
+        &self.selectors
+    }
+}
+
+/// One destination IP rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRule {
+    id: String,
+    action: RuleAction,
+    networks: Vec<IpNet>,
+    allow_special: bool,
+}
+
+impl IpRule {
+    /// Stable rule identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Allow or deny.
+    pub fn action(&self) -> RuleAction {
+        self.action
+    }
+
+    /// CIDRs matched by this rule.
+    pub fn networks(&self) -> &[IpNet] {
+        &self.networks
+    }
+
+    /// Whether an allow rule may permit a special-purpose address.
+    pub fn allow_special(&self) -> bool {
+        self.allow_special
+    }
+}
+
+/// Selectors shared by request ACL and routing rules.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Selectors {
+    listeners: Option<Vec<String>>,
+    sources: Option<Vec<IpNet>>,
+    methods: Option<Vec<Method>>,
+    ports: Option<Vec<u16>>,
+    hosts: HostSelectors,
+}
+
+impl Selectors {
+    /// Listener IDs when the selector is present.
+    pub fn listeners(&self) -> Option<&[String]> {
+        self.listeners.as_deref()
+    }
+
+    /// Source CIDRs when the selector is present.
+    pub fn sources(&self) -> Option<&[IpNet]> {
+        self.sources.as_deref()
+    }
+
+    /// Methods when the selector is present.
+    pub fn methods(&self) -> Option<&[Method]> {
+        self.methods.as_deref()
+    }
+
+    /// Ports when the selector is present.
+    pub fn ports(&self) -> Option<&[u16]> {
+        self.ports.as_deref()
+    }
+
+    /// Host selectors.
+    pub fn hosts(&self) -> &HostSelectors {
+        &self.hosts
+    }
+}
+
+/// Host part of selectors.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HostSelectors {
+    /// Any host.
+    #[default]
+    Any,
+    /// Exact normalized domains.
+    Exact(Vec<DomainName>),
+    /// Normalized domain suffixes, including the domain itself.
+    Suffix(Vec<DomainName>),
+}
+
+/// One outbound egress profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressProfile {
+    id: String,
+    mode: EgressMode,
+}
+
+impl EgressProfile {
+    /// Stable egress identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Egress mode.
+    pub fn mode(&self) -> &EgressMode {
+        &self.mode
+    }
+}
+
+/// How an egress profile selects the outbound socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressMode {
+    /// Use the operating system's normal routing.
+    System,
+    /// Bind the outbound socket to this specific source IP.
+    BindIp(IpAddr),
+}
+
+/// Ordered egress routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingConfig {
+    default_egress: String,
+    rules: Vec<RoutingRule>,
+}
+
+impl RoutingConfig {
+    /// Egress used when no rule matches.
+    pub fn default_egress(&self) -> &str {
+        &self.default_egress
+    }
+
+    /// Ordered routing rules.
+    pub fn rules(&self) -> &[RoutingRule] {
+        &self.rules
+    }
+}
+
+/// One routing rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRule {
+    id: String,
+    egress_id: String,
+    selectors: Selectors,
+}
+
+impl RoutingRule {
+    /// Stable rule identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Selected egress identifier.
+    pub fn egress_id(&self) -> &str {
+        &self.egress_id
+    }
+
+    /// Rule selectors.
+    pub fn selectors(&self) -> &Selectors {
+        &self.selectors
+    }
+}
+
+/// System resolver limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsConfig {
+    timeout: Duration,
+    max_in_flight: usize,
+    max_answers: usize,
+}
+
+impl DnsConfig {
+    /// DNS timeout for one lookup.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Maximum number of actual blocking lookups in flight.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Maximum unique addresses accepted from one lookup.
+    pub fn max_answers(&self) -> usize {
+        self.max_answers
+    }
+}
+
+/// Outbound connect limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportConfig {
+    total_timeout: Duration,
+    connect_timeout: Duration,
+    max_connect_attempts: usize,
+    max_connecting: usize,
+}
+
+impl TransportConfig {
+    /// Total deadline for one `open_outbound` call.
+    pub fn total_timeout(&self) -> Duration {
+        self.total_timeout
+    }
+
+    /// Per-attempt connect timeout.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Maximum sequential connect attempts.
+    pub fn max_connect_attempts(&self) -> usize {
+        self.max_connect_attempts
+    }
+
+    /// Maximum simultaneous connect attempts.
+    pub fn max_connecting(&self) -> usize {
+        self.max_connecting
+    }
+}
+
 /// One listener definition.
 ///
-/// M01 supports only the `http` transport. An IPv6 listener is IPv6-only; the
-/// future socket bind must set `IPV6_V6ONLY` so that `[::]` does not capture
+/// This build supports only the `http` transport. An IPv6 listener is IPv6-only;
+/// the future socket bind must set `IPV6_V6ONLY` so that `[::]` does not capture
 /// IPv4 traffic. Consequently an IPv4 wildcard and an IPv6 wildcard on the same
 /// port are not a configuration conflict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +570,7 @@ impl Listener {
 /// Listener transports supported by this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// Plain HTTP listener (the only transport implemented in M01).
+    /// Plain HTTP listener (the only listener transport implemented here).
     Http,
 }
 
@@ -364,7 +708,7 @@ fn sanitize_message(message: &str) -> String {
         let future_feature = is_future_feature_field(field);
         let field = escape_control(field, MAX_UNKNOWN_FIELD_CHARS);
         if future_feature {
-            format!("field `{field}` is not supported in M01")
+            format!("field `{field}` is not supported by this build")
         } else {
             format!("unknown field `{field}`")
         }
@@ -450,14 +794,11 @@ fn is_future_feature_field(field: &str) -> bool {
             | "auth"
             | "cache"
             | "control"
-            | "dns"
-            | "egress"
             | "logging"
             | "logs"
             | "metrics"
             | "parent"
             | "policy"
-            | "routing"
             | "telemetry"
             | "tls"
             | "upstream"
@@ -478,6 +819,12 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
 
     let limits = validate_limits(raw.limits)?;
     let listeners = validate_listeners(raw.listeners)?;
+    let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
+
+    let access = validate_access(raw.access, &listener_ids)?;
+    let dns = validate_dns(raw.dns)?;
+    let transport = validate_transport(raw.transport, &limits)?;
+    let (egress, routing) = validate_egress_routing(raw.egress, raw.routing, &listener_ids)?;
 
     Ok(Config {
         schema_version: SCHEMA_VERSION,
@@ -486,6 +833,11 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         },
         limits,
         listeners,
+        access,
+        dns,
+        transport,
+        egress,
+        routing,
     })
 }
 
@@ -539,6 +891,531 @@ fn bounded(path: &str, value: i64, minimum: i64, maximum: i64) -> Result<i64, Co
             format!("must be in {minimum}..={maximum}"),
         ))
     }
+}
+
+fn bounded_optional(
+    path: &str,
+    value: Option<i64>,
+    minimum: i64,
+    maximum: i64,
+    default: i64,
+) -> Result<i64, ConfigError> {
+    bounded(path, value.unwrap_or(default), minimum, maximum)
+}
+
+fn validate_policy_id(value: &str, path: &str) -> Result<(), ConfigError> {
+    if value.is_empty() || value.len() > MAX_ID_BYTES {
+        return Err(validation(path, "must be 1..=64 ASCII characters"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(validation(
+            path,
+            "must contain only ASCII letters, digits, '-', '_' or '.'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_list_len<T>(items: &[T], path: &str) -> Result<(), ConfigError> {
+    if items.len() > MAX_POLICY_LIST_ITEMS {
+        return Err(validation(
+            path,
+            format!("at most {MAX_POLICY_LIST_ITEMS} entries are supported"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_cidr(value: &str, path: &str) -> Result<IpNet, ConfigError> {
+    let network = value
+        .parse::<IpNet>()
+        .map_err(|_| validation(path, "must be a valid CIDR"))?;
+    if network.addr() != network.network() {
+        return Err(validation(path, "CIDR must have zero host bits"));
+    }
+
+    // IPv4-mapped IPv6 destinations are normalized to IPv4 before policy
+    // matching. Normalize the corresponding CIDR too; otherwise a deny rule
+    // written in mapped form would be accepted but never match.
+    if let IpNet::V6(network) = network
+        && let Some(ipv4) = network.addr().to_ipv4_mapped()
+    {
+        if network.prefix_len() < 96 {
+            return Err(validation(
+                path,
+                "IPv4-mapped IPv6 CIDR must have a prefix of at least 96; use the IPv4 form",
+            ));
+        }
+        let prefix = network.prefix_len() - 96;
+        let network = Ipv4Net::new(ipv4, prefix)
+            .map_err(|_| validation(path, "CIDR must have zero host bits"))?;
+        return Ok(IpNet::V4(network));
+    }
+
+    Ok(network)
+}
+
+fn parse_cidr_list(
+    values: &[String],
+    path: &str,
+    allow_empty: bool,
+) -> Result<Vec<IpNet>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() && !allow_empty {
+        return Err(validation(path, "must not be empty"));
+    }
+
+    let mut networks = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        networks.push(parse_cidr(value, &format!("{path}[{index}]"))?);
+    }
+    Ok(networks)
+}
+
+fn parse_domain_list(values: &[String], path: &str) -> Result<Vec<DomainName>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() {
+        return Err(validation(path, "must not be empty"));
+    }
+
+    let mut domains = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        domains.push(
+            DomainName::parse(value).map_err(|_| {
+                validation(format!("{path}[{index}]"), "must be a valid domain name")
+            })?,
+        );
+    }
+    Ok(domains)
+}
+
+fn parse_method_list(values: &[String], path: &str) -> Result<Vec<Method>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() {
+        return Err(validation(path, "must not be empty"));
+    }
+
+    let mut methods = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        methods.push(parse_method(value).map_err(|_| {
+            validation(
+                format!("{path}[{index}]"),
+                "must be a valid HTTP method token",
+            )
+        })?);
+    }
+    Ok(methods)
+}
+
+fn parse_port_list(values: &[i64], path: &str) -> Result<Vec<u16>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() {
+        return Err(validation(path, "must not be empty"));
+    }
+
+    let mut ports = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        if !(1..=i64::from(u16::MAX)).contains(value) {
+            return Err(validation(
+                format!("{path}[{index}]"),
+                "port must be in 1..=65535",
+            ));
+        }
+        ports.push(*value as u16);
+    }
+    Ok(ports)
+}
+
+fn parse_listener_refs(
+    values: &[String],
+    path: &str,
+    listener_ids: &[&str],
+) -> Result<Vec<String>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() {
+        return Err(validation(path, "must not be empty"));
+    }
+
+    for (index, value) in values.iter().enumerate() {
+        validate_policy_id(value, &format!("{path}[{index}]"))?;
+        if !listener_ids.contains(&value.as_str()) {
+            return Err(validation(
+                format!("{path}[{index}]"),
+                "unknown listener id",
+            ));
+        }
+    }
+    Ok(values.to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_selectors(
+    path: &str,
+    listeners: Option<Vec<String>>,
+    sources: Option<Vec<String>>,
+    methods: Option<Vec<String>>,
+    ports: Option<Vec<i64>>,
+    host_exact: Option<Vec<String>>,
+    host_suffix: Option<Vec<String>>,
+    listener_ids: &[&str],
+) -> Result<Selectors, ConfigError> {
+    if host_exact.is_some() && host_suffix.is_some() {
+        return Err(validation(
+            format!("{path}.host_suffix"),
+            "host_exact and host_suffix are mutually exclusive",
+        ));
+    }
+
+    let listeners = listeners
+        .map(|values| parse_listener_refs(&values, &format!("{path}.listeners"), listener_ids))
+        .transpose()?;
+    let sources = sources
+        .map(|values| parse_cidr_list(&values, &format!("{path}.sources"), false))
+        .transpose()?;
+    let methods = methods
+        .map(|values| parse_method_list(&values, &format!("{path}.methods")))
+        .transpose()?;
+    let ports = ports
+        .map(|values| parse_port_list(&values, &format!("{path}.ports")))
+        .transpose()?;
+    let hosts = if let Some(values) = host_exact {
+        HostSelectors::Exact(parse_domain_list(&values, &format!("{path}.host_exact"))?)
+    } else if let Some(values) = host_suffix {
+        HostSelectors::Suffix(parse_domain_list(&values, &format!("{path}.host_suffix"))?)
+    } else {
+        HostSelectors::Any
+    };
+
+    Ok(Selectors {
+        listeners,
+        sources,
+        methods,
+        ports,
+        hosts,
+    })
+}
+
+fn validate_action(value: &str, path: &str) -> Result<RuleAction, ConfigError> {
+    match value {
+        "allow" => Ok(RuleAction::Allow),
+        "deny" => Ok(RuleAction::Deny),
+        _ => Err(validation(path, "must be `allow` or `deny`")),
+    }
+}
+
+fn validate_access(
+    raw: Option<RawAccess>,
+    listener_ids: &[&str],
+) -> Result<AccessConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let source_allow = parse_cidr_list(&raw.source_allow, "access.source_allow", true)?;
+    let ip_default = match raw.ip_default.as_deref() {
+        None | Some("public_only") => IpDefault::PublicOnly,
+        Some("deny") => IpDefault::Deny,
+        Some(_) => {
+            return Err(validation(
+                "access.ip_default",
+                "must be `public_only` or `deny`",
+            ));
+        }
+    };
+
+    validate_list_len(&raw.rules, "access.rules")?;
+    validate_list_len(&raw.ip_rules, "access.ip_rules")?;
+
+    let mut rules = Vec::with_capacity(raw.rules.len());
+    for (index, rule) in raw.rules.into_iter().enumerate() {
+        let path = format!("access.rules[{index}]");
+        validate_policy_id(&rule.id, &format!("{path}.id"))?;
+        let action = validate_action(&rule.action, &format!("{path}.action"))?;
+        let selectors = validate_selectors(
+            &path,
+            rule.listeners,
+            rule.sources,
+            rule.methods,
+            rule.ports,
+            rule.host_exact,
+            rule.host_suffix,
+            listener_ids,
+        )?;
+        rules.push(AccessRule {
+            id: rule.id,
+            action,
+            selectors,
+        });
+    }
+    for first in 0..rules.len() {
+        for second in (first + 1)..rules.len() {
+            if rules[first].id == rules[second].id {
+                return Err(validation(
+                    format!("access.rules[{second}].id"),
+                    format!("access.rules[{second}].id duplicates access.rules[{first}].id"),
+                ));
+            }
+        }
+    }
+
+    let mut ip_rules = Vec::with_capacity(raw.ip_rules.len());
+    for (index, rule) in raw.ip_rules.into_iter().enumerate() {
+        let path = format!("access.ip_rules[{index}]");
+        validate_policy_id(&rule.id, &format!("{path}.id"))?;
+        let action = validate_action(&rule.action, &format!("{path}.action"))?;
+        if action == RuleAction::Deny && rule.allow_special {
+            return Err(validation(
+                format!("{path}.allow_special"),
+                "only allow rules may set allow_special",
+            ));
+        }
+        let networks = parse_cidr_list(&rule.networks, &format!("{path}.networks"), false)?;
+        ip_rules.push(IpRule {
+            id: rule.id,
+            action,
+            networks,
+            allow_special: rule.allow_special,
+        });
+    }
+    for first in 0..ip_rules.len() {
+        for second in (first + 1)..ip_rules.len() {
+            if ip_rules[first].id == ip_rules[second].id {
+                return Err(validation(
+                    format!("access.ip_rules[{second}].id"),
+                    format!("access.ip_rules[{second}].id duplicates access.ip_rules[{first}].id"),
+                ));
+            }
+        }
+    }
+
+    Ok(AccessConfig {
+        source_allow,
+        rules,
+        ip_rules,
+        ip_default,
+    })
+}
+
+fn validate_dns(raw: Option<RawDns>) -> Result<DnsConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let timeout = bounded_optional(
+        "dns.timeout_ms",
+        raw.timeout_ms,
+        MIN_DNS_TIMEOUT_MS,
+        MAX_DNS_TIMEOUT_MS,
+        DEFAULT_DNS_TIMEOUT_MS,
+    )?;
+    let max_in_flight = bounded_optional(
+        "dns.max_in_flight",
+        raw.max_in_flight,
+        MIN_DNS_MAX_IN_FLIGHT,
+        MAX_DNS_MAX_IN_FLIGHT,
+        DEFAULT_DNS_MAX_IN_FLIGHT,
+    )?;
+    let max_answers = bounded_optional(
+        "dns.max_answers",
+        raw.max_answers,
+        MIN_DNS_MAX_ANSWERS,
+        MAX_DNS_MAX_ANSWERS,
+        DEFAULT_DNS_MAX_ANSWERS,
+    )?;
+
+    Ok(DnsConfig {
+        timeout: Duration::from_millis(timeout as u64),
+        max_in_flight: max_in_flight as usize,
+        max_answers: max_answers as usize,
+    })
+}
+
+fn validate_transport(
+    raw: Option<RawTransport>,
+    limits: &Limits,
+) -> Result<TransportConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let total_timeout = bounded_optional(
+        "transport.total_timeout_ms",
+        raw.total_timeout_ms,
+        MIN_TOTAL_TIMEOUT_MS,
+        MAX_TOTAL_TIMEOUT_MS,
+        DEFAULT_TOTAL_TIMEOUT_MS,
+    )?;
+    let connect_timeout = bounded_optional(
+        "transport.connect_timeout_ms",
+        raw.connect_timeout_ms,
+        MIN_CONNECT_TIMEOUT_MS,
+        MAX_CONNECT_TIMEOUT_MS,
+        DEFAULT_CONNECT_TIMEOUT_MS,
+    )?;
+    if connect_timeout > total_timeout {
+        return Err(validation(
+            "transport.connect_timeout_ms",
+            "must not exceed transport.total_timeout_ms",
+        ));
+    }
+
+    let max_connect_attempts = bounded_optional(
+        "transport.max_connect_attempts",
+        raw.max_connect_attempts,
+        MIN_CONNECT_ATTEMPTS,
+        MAX_CONNECT_ATTEMPTS,
+        DEFAULT_CONNECT_ATTEMPTS,
+    )?;
+    let max_connections = i64::from(limits.max_connections());
+    let max_connecting_limit = MAX_CONNECTING.min(max_connections);
+    let default_connecting = DEFAULT_CONNECTING_CAP.min(max_connections);
+    let max_connecting = bounded_optional(
+        "transport.max_connecting",
+        raw.max_connecting,
+        MIN_CONNECTING,
+        max_connecting_limit,
+        default_connecting,
+    )?;
+
+    Ok(TransportConfig {
+        total_timeout: Duration::from_millis(total_timeout as u64),
+        connect_timeout: Duration::from_millis(connect_timeout as u64),
+        max_connect_attempts: max_connect_attempts as usize,
+        max_connecting: max_connecting as usize,
+    })
+}
+
+fn validate_egress_routing(
+    raw_egress: Option<Vec<RawEgress>>,
+    raw_routing: Option<RawRouting>,
+    listener_ids: &[&str],
+) -> Result<(Vec<EgressProfile>, RoutingConfig), ConfigError> {
+    let egress = if let Some(raw_egress) = raw_egress {
+        if raw_egress.is_empty() {
+            return Err(validation("egress", "must not be empty when present"));
+        }
+        validate_list_len(&raw_egress, "egress")?;
+
+        let mut profiles = Vec::with_capacity(raw_egress.len());
+        for (index, raw) in raw_egress.into_iter().enumerate() {
+            let path = format!("egress[{index}]");
+            validate_policy_id(&raw.id, &format!("{path}.id"))?;
+            let mode = match raw.mode.as_str() {
+                "system" => {
+                    if raw.bind_ip.is_some() {
+                        return Err(validation(
+                            format!("{path}.bind_ip"),
+                            "bind_ip is not allowed for system mode",
+                        ));
+                    }
+                    EgressMode::System
+                }
+                "bind_ip" => {
+                    let Some(bind_ip) = raw.bind_ip else {
+                        return Err(validation(
+                            format!("{path}.bind_ip"),
+                            "bind_ip is required for bind_ip mode",
+                        ));
+                    };
+                    let bind_ip = bind_ip.parse::<IpAddr>().map_err(|_| {
+                        validation(
+                            format!("{path}.bind_ip"),
+                            "must be a specific outgoing IP address",
+                        )
+                    })?;
+                    validate_bind_ip(bind_ip, &format!("{path}.bind_ip"))?;
+                    EgressMode::BindIp(bind_ip)
+                }
+                _ => {
+                    return Err(validation(
+                        format!("{path}.mode"),
+                        "must be `system` or `bind_ip`",
+                    ));
+                }
+            };
+            profiles.push(EgressProfile { id: raw.id, mode });
+        }
+        for first in 0..profiles.len() {
+            for second in (first + 1)..profiles.len() {
+                if profiles[first].id == profiles[second].id {
+                    return Err(validation(
+                        format!("egress[{second}].id"),
+                        format!("egress[{second}].id duplicates egress[{first}].id"),
+                    ));
+                }
+            }
+        }
+        profiles
+    } else {
+        vec![EgressProfile {
+            id: "system".to_owned(),
+            mode: EgressMode::System,
+        }]
+    };
+
+    let egress_ids = egress.iter().map(EgressProfile::id).collect::<Vec<&str>>();
+    let raw_routing = raw_routing.unwrap_or_default();
+    let default_egress = raw_routing
+        .default_egress
+        .unwrap_or_else(|| "system".to_owned());
+    validate_policy_id(&default_egress, "routing.default_egress")?;
+    if !egress_ids.contains(&default_egress.as_str()) {
+        return Err(validation("routing.default_egress", "unknown egress id"));
+    }
+
+    validate_list_len(&raw_routing.rules, "routing.rules")?;
+    let mut rules = Vec::with_capacity(raw_routing.rules.len());
+    for (index, raw) in raw_routing.rules.into_iter().enumerate() {
+        let path = format!("routing.rules[{index}]");
+        validate_policy_id(&raw.id, &format!("{path}.id"))?;
+        validate_policy_id(&raw.egress_id, &format!("{path}.egress_id"))?;
+        if !egress_ids.contains(&raw.egress_id.as_str()) {
+            return Err(validation(format!("{path}.egress_id"), "unknown egress id"));
+        }
+        let selectors = validate_selectors(
+            &path,
+            raw.listeners,
+            raw.sources,
+            raw.methods,
+            raw.ports,
+            raw.host_exact,
+            raw.host_suffix,
+            listener_ids,
+        )?;
+        rules.push(RoutingRule {
+            id: raw.id,
+            egress_id: raw.egress_id,
+            selectors,
+        });
+    }
+    for first in 0..rules.len() {
+        for second in (first + 1)..rules.len() {
+            if rules[first].id == rules[second].id {
+                return Err(validation(
+                    format!("routing.rules[{second}].id"),
+                    format!("routing.rules[{second}].id duplicates routing.rules[{first}].id"),
+                ));
+            }
+        }
+    }
+
+    Ok((
+        egress,
+        RoutingConfig {
+            default_egress,
+            rules,
+        },
+    ))
+}
+
+fn validate_bind_ip(ip: IpAddr, path: &str) -> Result<(), ConfigError> {
+    let invalid = match ip {
+        IpAddr::V4(ipv4) => ipv4.is_unspecified() || ipv4.is_multicast() || ipv4.is_broadcast(),
+        IpAddr::V6(ipv6) => {
+            ipv6.is_unspecified() || ipv6.is_multicast() || ipv6.to_ipv4_mapped().is_some()
+        }
+    };
+    if invalid {
+        return Err(validation(
+            path,
+            "must be a specific unicast outgoing IP address",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigError> {
@@ -649,6 +1526,16 @@ struct RawConfig {
     runtime: RawRuntime,
     limits: RawLimits,
     listeners: Vec<RawListener>,
+    #[serde(default)]
+    access: Option<RawAccess>,
+    #[serde(default)]
+    dns: Option<RawDns>,
+    #[serde(default)]
+    transport: Option<RawTransport>,
+    #[serde(default)]
+    egress: Option<Vec<RawEgress>>,
+    #[serde(default)]
+    routing: Option<RawRouting>,
 }
 
 #[derive(Deserialize)]
@@ -673,6 +1560,109 @@ struct RawListener {
     id: String,
     bind: ListenerAddress,
     transport: Transport,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawAccess {
+    #[serde(default)]
+    source_allow: Vec<String>,
+    #[serde(default)]
+    ip_default: Option<String>,
+    #[serde(default)]
+    rules: Vec<RawAccessRule>,
+    #[serde(default)]
+    ip_rules: Vec<RawIpRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccessRule {
+    id: String,
+    action: String,
+    #[serde(default)]
+    listeners: Option<Vec<String>>,
+    #[serde(default)]
+    sources: Option<Vec<String>>,
+    #[serde(default)]
+    methods: Option<Vec<String>>,
+    #[serde(default)]
+    ports: Option<Vec<i64>>,
+    #[serde(default)]
+    host_exact: Option<Vec<String>>,
+    #[serde(default)]
+    host_suffix: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIpRule {
+    id: String,
+    action: String,
+    networks: Vec<String>,
+    #[serde(default)]
+    allow_special: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawDns {
+    #[serde(default)]
+    timeout_ms: Option<i64>,
+    #[serde(default)]
+    max_in_flight: Option<i64>,
+    #[serde(default)]
+    max_answers: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawTransport {
+    #[serde(default)]
+    total_timeout_ms: Option<i64>,
+    #[serde(default)]
+    connect_timeout_ms: Option<i64>,
+    #[serde(default)]
+    max_connect_attempts: Option<i64>,
+    #[serde(default)]
+    max_connecting: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEgress {
+    id: String,
+    mode: String,
+    #[serde(default)]
+    bind_ip: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawRouting {
+    #[serde(default)]
+    default_egress: Option<String>,
+    #[serde(default)]
+    rules: Vec<RawRoutingRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoutingRule {
+    id: String,
+    egress_id: String,
+    #[serde(default)]
+    listeners: Option<Vec<String>>,
+    #[serde(default)]
+    sources: Option<Vec<String>>,
+    #[serde(default)]
+    methods: Option<Vec<String>>,
+    #[serde(default)]
+    ports: Option<Vec<i64>>,
+    #[serde(default)]
+    host_exact: Option<Vec<String>>,
+    #[serde(default)]
+    host_suffix: Option<Vec<String>>,
 }
 
 struct ListenerAddress(SocketAddr);

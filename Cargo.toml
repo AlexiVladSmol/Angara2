@@ -4,13 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
-description = "Angara proxy — M01 bootstrap: CLI, strict TOML configuration and multi-threaded runtime"
+description = "Angara proxy — M02: strict config, ACL, targets, bounded DNS and egress transport"
 repository = "https://github.com/AlexeiSmol/Angara"
 
 [dependencies]
+http = "1.5"
+idna = "1.1"
+ipnet = "2.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_path_to_error = "0.1"
-tokio = { version = "1.54", features = ["rt-multi-thread"] }
+tokio = { version = "1.54", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 toml = { version = "1.2", default-features = false, features = ["parse", "serde", "std"] }
 
 [lints.rust]

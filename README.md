@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M01 реализован в ветке `feat/3-m01-bootstrap` и передан на ревью; работающего proxy ещё нет.** Ревизия документов: 0.2. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `check` и `serve` проверяют конфигурацию, но HTTP forwarding, CONNECT, TLS, auth, ACL, egress, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия.
+**Статус: M02 реализован в ветке `feat/6-m02-network-policy` и передан на ревью; принимающего proxy ещё нет.** Ревизия документов: 0.3. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `check` и `serve` проверяют конфигурацию, но HTTP forwarding, CONNECT-туннель, TLS, auth, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия.
 
 ## Участники и работа
 
@@ -139,10 +139,10 @@ transport = "http"
 
 ### Зависимости и лицензии
 
-Прямые зависимости M01: `tokio` (только feature `rt-multi-thread`, без
-net/time/io-драйверов), `serde`, `toml` и `serde_path_to_error` для строгой
-схемы и безопасного пути поля в ошибках. `hyper`, `rustls`, CLI-фреймворк и
-dev-зависимости пока не подключены. Политика зависимостей проверяется
+Базовые зависимости M01: `tokio` (`rt-multi-thread`), `serde`, `toml` и
+`serde_path_to_error` для строгой схемы и безопасного пути поля в ошибках.
+M02 добавляет `http`, `ipnet`, `idna` и Tokio `net`/`time`/`sync`/`io-util`;
+`hyper`, `rustls`, CLI-фреймворк и dev-зависимости пока не подключены. Политика зависимостей проверяется
 [`deny.toml`](deny.toml): RustSec advisories, allow-list MIT/Apache-2.0/
 Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
 не выбрана и `LICENSE` не создаётся; `[licenses.private]` исключает только
@@ -156,7 +156,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 
 | Job | Проверки |
 | --- | --- |
-| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, проверка обоих примеров через `angara check` |
+| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, проверка четырёх примеров через `angara check` |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.
@@ -166,11 +166,87 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 (`3c6349835b2b7b196a839186cb8b78e02f7b5f25`). Фактические результаты для
 конкретного head SHA указываются в PR.
 
+## M02: исходящий путь, ACL, DNS и egress
+
+M02 добавляет библиотечный `OutboundService`: доверенный `RequestContext`
+(источник и listener) → каноническое назначение → source gate → ACL до DNS →
+один egress-профиль → системный DNS → проверка каждого IP → TCP connect только
+к разрешённому `SocketAddr`. Принимающего HTTP-сервера и forwarding ещё нет.
+
+### Назначение и ACL
+
+- HTTP принимается только в absolute-form со схемой `http`; CONNECT — только
+  `host:port` или `[IPv6]:port`. Отклоняются userinfo, fragment, path/query у
+  CONNECT, нестандартные числовые IPv4, scoped IPv6, управляющие символы,
+  backslash и превышение лимитов 8192/1024 байт.
+- Домены нормализуются IDNA/UTS #46 (`AsciiDenyList::URL`), ASCII lowercase и
+  удалением одной завершающей точки; проверяются метки ≤63 и имя ≤253 байт.
+  `host_exact` и `host_suffix` сравниваются по границе DNS-метки; IP literal
+  не совпадает с доменным правилом.
+- `access.source_allow` — CIDR реальных source; пустой/отсутствующий список
+  запрещает всех. `access.rules` — first-match allow/deny с AND между полями и
+  OR внутри списков: `listeners`, `sources`, `methods`, `ports`, `host_exact`
+  или `host_suffix`. Нет совпадения — deny.
+- `access.ip_rules` — отдельная first-match политика каждого DNS-кандидата;
+  `access.ip_default = "public_only"` (default) или `"deny"`. Специальные адреса
+  требуют `allow_special = true` в самом allow-правиле; unspecified, multicast
+  и limited broadcast не разрешаются никогда.
+- Консервативный снимок IANA special-purpose registries от 2026-11-09
+  (включая Globally Reachable записи), private, loopback, link-local/metadata,
+  CGNAT, документационные сети, multicast, IPv4 240.0.0.0/4 и IPv6 вне
+  2000::/3 закрыт по умолчанию. IPv4-mapped IPv6 нормализуется до IPv4;
+  IPv4-mapped CIDR в правилах также пересчитывается в IPv4 с сохранением
+  семантики префикса, а CIDR с ненулевыми host bits отвергается.
+  Прямой IP проходит ту же IP-политику без DNS.
+
+### DNS, egress и transport
+
+- `SystemResolver` использует системный resolver Ubuntu/Linux через
+  `spawn_blocking`; permit `dns.max_in_flight` перемещается внутрь blocking
+  closure и удерживается до фактического завершения lookup. Timeout или drop
+  ожидающего future не освобождает бюджет начатой blocking-работы; новый запрос
+  при исчерпании получает `DnsBusy` без очереди. Ответ дедуплицируется с
+  сохранением порядка; пустой — `DnsNoAddresses`, превышение `max_answers` —
+  `DnsTooManyAddresses`. Кэша DNS нет.
+- Egress: `system` либо `bind_ip` (конкретный исходящий IP, bind к `IP:0`).
+  Один профиль выбирается first-match `routing.rules` по
+  listener/source/method/port/domain, иначе `routing.default_egress`; маршрут
+  не расширяет ACL. Bind/connect failure не меняет профиль и не делает fallback.
+- Dial выполняется через `TcpSocket::connect` только с проверенным
+  `SocketAddr`; попытки последовательные, не более `max_connect_attempts` и
+  `max_connecting`, с общим deadline. `Connected` удерживает outbound permit до
+  закрытия и реализует `AsyncRead`/`AsyncWrite`; drop возвращает сокет и
+  разрешения.
+- `check`/`serve` по-прежнему не создают сетевой runtime и не выполняют DNS
+  или dial; это отдельно проверяет Linux netguard.
+
+Числовые defaults и диапазоны (все значения проверяются в config):
+`dns.timeout_ms` 3000 (100..=30000), `dns.max_in_flight` 4 (1..=64),
+`dns.max_answers` 16 (1..=64); `transport.total_timeout_ms` 10000
+(100..=120000), `transport.connect_timeout_ms` 3000 (100..=30000 и не больше
+total), `transport.max_connect_attempts` 3 (1..=8), `transport.max_connecting`
+min(32, limits.max_connections) (1..=256 и не больше max_connections).
+
+Примеры: [`examples/m02-policy.toml`](examples/m02-policy.toml) и
+[`examples/m02-egress-local.toml`](examples/m02-egress-local.toml). Второй —
+лабораторный: два egress bind_ip 127.0.0.1/127.0.0.2 и routing по listener;
+проверка двух физических NIC остаётся M08.
+
+### Зависимости M02
+
+Добавлены `http` (URI/authority/method), `ipnet` (CIDR) и `idna` (UTS #46);
+`tokio` получил `net`, `time`, `sync` и `io-util` для реального dial, deadlines
+и бюджетов. `hyper`/`rustls` и собственный DNS/HTTP parser не добавлены.
+Ограничение системного backend: уже выполняющийся `getaddrinfo` нельзя
+принудительно прервать; его permit и учёт сохраняются до завершения, а
+`SystemResolver::shutdown` ограниченно ждёт и сообщает, успели ли вернуться
+разрешения.
+
 ## Текущее состояние
 
-Документы M00 согласованы; M01 реализован в ветке `feat/3-m01-bootstrap` и
-направлен PR в `docs/m00-proposal`. Работающего proxy нет: `serve` возвращает
-код 3, listeners не открываются. Следующие шаги — ревью M01, затем M02 с
-моделью ACL, egress/routing и контрактами resolver/transport.
+M00 и M01 приняты и слиты. M02 реализован в ветке `feat/6-m02-network-policy`
+и направлен PR в `main`. Работающего proxy нет: `serve` возвращает код 3,
+listeners не открываются; M02 проверяется библиотечными и интеграционными
+тестами. Следующий этап — принимающий HTTP/1.1 proxy M03, затем CONNECT M04.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

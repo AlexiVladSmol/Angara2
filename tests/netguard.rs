@@ -140,6 +140,43 @@ fn cfg02_check_and_serve_make_no_network_calls() {
         network_calls(&serve_marker).is_empty(),
         "serve called network functions: {serve_marker_text}"
     );
+
+    for name in [
+        "minimal.toml",
+        "multi-listener.toml",
+        "m02-policy.toml",
+        "m02-egress-local.toml",
+    ] {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name);
+        let marker = dir.path().join(format!("{name}.marker"));
+        let output = run_with_guard(
+            Path::new(env!("CARGO_BIN_EXE_angara")),
+            &[
+                OsStr::new("check"),
+                OsStr::new("--config"),
+                example.as_os_str(),
+            ],
+            &guard,
+            &marker,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name} check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker_text = marker_contents(&marker);
+        assert!(
+            marker_text.contains("loaded"),
+            "{name}: netguard was not loaded; LD_PRELOAD proof is invalid"
+        );
+        assert!(
+            network_calls(&marker).is_empty(),
+            "{name} called network functions: {marker_text}"
+        );
+    }
 }
 
 #[test]

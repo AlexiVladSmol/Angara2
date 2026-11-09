@@ -1,0 +1,63 @@
+# Angara M02 — лабораторный пример двух исходящих loopback IP.
+# Лабораторный стенд Linux: 127.0.0.2 должен быть доступен на loopback.
+# `angara check` не выполняет DNS и не открывает сокеты.
+
+schema_version = 1
+
+[runtime]
+worker_threads = 2
+
+[limits]
+max_connections = 256
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[[listeners]]
+id = "lab-a"
+bind = "127.0.0.1:3128"
+transport = "http"
+
+[[listeners]]
+id = "lab-b"
+bind = "127.0.0.2:3128"
+transport = "http"
+
+[access]
+source_allow = ["127.0.0.0/8"]
+ip_default = "deny"
+
+[[access.rules]]
+id = "allow-local-lab"
+action = "allow"
+listeners = ["lab-a", "lab-b"]
+
+[[access.ip_rules]]
+id = "allow-loopback-target"
+action = "allow"
+networks = ["127.0.0.0/8"]
+allow_special = true
+
+[[egress]]
+id = "via-a"
+mode = "bind_ip"
+bind_ip = "127.0.0.1"
+
+[[egress]]
+id = "via-b"
+mode = "bind_ip"
+bind_ip = "127.0.0.2"
+
+[routing]
+default_egress = "via-a"
+
+[[routing.rules]]
+id = "route-a"
+listeners = ["lab-a"]
+egress_id = "via-a"
+
+[[routing.rules]]
+id = "route-b"
+listeners = ["lab-b"]
+egress_id = "via-b"

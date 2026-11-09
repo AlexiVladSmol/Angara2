@@ -124,16 +124,14 @@ fn cfg01_rejects_corrupted_toml_with_position() {
 
 #[test]
 fn cfg01_rejects_unknown_and_future_root_fields() {
-    for field in [
-        "tls", "auth", "acl", "egress", "cache", "admin", "routing", "users",
-    ] {
+    for field in ["tls", "auth", "acl", "cache", "admin", "users", "parent"] {
         let text = config("\"auto\"").replace(
             "[runtime]",
             &format!("[{field}]\nenabled = true\n\n[runtime]"),
         );
         let message = message(&text);
         assert!(
-            message.contains(&format!("field `{field}` is not supported in M01")),
+            message.contains(&format!("field `{field}` is not supported by this build")),
             "{field}: {message}"
         );
     }
@@ -155,7 +153,7 @@ fn cfg01_rejects_unknown_nested_fields() {
     let text = config_with(&text, "\"auto\"");
     let message = message(&text);
     assert!(
-        message.contains("field `tls` is not supported in M01"),
+        message.contains("field `tls` is not supported by this build"),
         "{message}"
     );
 }

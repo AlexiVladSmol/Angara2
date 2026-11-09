@@ -1,8 +1,8 @@
 //! Multi-threaded Tokio runtime setup and controlled shutdown.
 //!
-//! M01 intentionally builds the runtime without I/O or timer drivers. Network
-//! and time features are added by the milestones that actually use them; the
-//! absence here keeps the bootstrap runtime from opening any network resource.
+//! M02 adds network and timer drivers because the outbound library uses real
+//! DNS and TCP. The CLI `check`/`serve` paths do not build this runtime and
+//! therefore still perform no network work.
 
 use std::fmt;
 use std::future::Future;
@@ -49,6 +49,7 @@ impl AngaraRuntime {
         let runtime = Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .thread_name("angara-worker")
+            .enable_all()
             .build()
             .map_err(|source| RuntimeError { source })?;
 
