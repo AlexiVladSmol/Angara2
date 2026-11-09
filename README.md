@@ -148,7 +148,8 @@ Unicode-3.0, только crates.io, запрет wildcard-версий. Лиц�
 ### CI
 
 Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на
-`ubuntu-24.04` для PR и для push в `main`/`docs/m00-proposal`:
+`ubuntu-24.04` для PR и для push в `main`, `docs/m00-proposal`, `feat/**` и
+`fix/**`:
 
 | Job | Проверки |
 | --- | --- |

@@ -5,7 +5,10 @@ on:
     branches:
       - main
       - docs/m00-proposal
-      - feat/3-m01-bootstrap
+      # Development branches get CI even before the workflow exists on the
+      # base branch, for example when the workflow itself is introduced in a PR.
+      - "feat/**"
+      - "fix/**"
   pull_request:
 
 permissions:
