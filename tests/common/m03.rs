@@ -163,6 +163,25 @@ impl RawClient {
         })
     }
 
+    /// Connects with explicit socket buffers to make TCP backpressure
+    /// reproducible in wire-order regressions.
+    pub async fn connect_with_buffers(address: SocketAddr, size: u32) -> io::Result<Self> {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_recv_buffer_size(size)?;
+        socket.set_send_buffer_size(size)?;
+        let stream = tokio::time::timeout(IO_TIMEOUT, socket.connect(address))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+        Ok(Self {
+            stream,
+            buffer: Vec::new(),
+        })
+    }
+
     pub async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.stream.write_all(bytes).await
     }

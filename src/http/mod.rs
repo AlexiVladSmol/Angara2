@@ -4,7 +4,6 @@ use std::error::Error;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use http_body::{Body, Frame, SizeHint};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
@@ -250,17 +249,14 @@ impl OriginTasks {
         while set.try_join_next().is_some() {}
     }
 
-    /// Aborts all origin drivers and waits for their actual completion.
-    pub async fn shutdown(&self, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+    /// Aborts all origin drivers and waits until they are actually removed
+    /// from the runtime. Cancellation completion is not given a new timeout:
+    /// aborting is immediate, but the tasks must be joined before shutdown
+    /// returns so repeated shutdowns cannot accumulate live tasks.
+    pub async fn shutdown(&self) -> bool {
         let mut set = self.inner.lock().await;
         set.abort_all();
-        loop {
-            match tokio::time::timeout_at(deadline, set.join_next()).await {
-                Ok(Some(_)) => {}
-                Ok(None) => return true,
-                Err(_) => return set.is_empty(),
-            }
-        }
+        while set.join_next().await.is_some() {}
+        true
     }
 }

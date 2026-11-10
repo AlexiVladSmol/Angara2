@@ -160,14 +160,18 @@ impl HttpServer {
     /// Stops accepting, drains active work up to the configured deadline, then
     /// forces remaining tracked tasks closed.
     pub async fn shutdown(self) {
+        // One absolute deadline covers every graceful phase. Once it expires,
+        // the remaining tasks are aborted and awaited to actual completion;
+        // cancellation itself is not given a fresh fixed budget.
+        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
         self._proxy.begin_shutdown();
         let _ = self.drain.send(true);
-        if !self.tasks.wait(self.shutdown_timeout).await {
+        if !self.tasks.wait_until(deadline).await {
             let _ = self.force.send(true);
             self.tasks.abort_all();
-            let _ = self.tasks.wait(Duration::from_secs(1)).await;
+            self.tasks.reap_after_abort().await;
         }
-        let _ = self._proxy.shutdown_origins(Duration::from_secs(1)).await;
+        let _ = self._proxy.shutdown_origins().await;
     }
 }
 
@@ -275,7 +279,6 @@ async fn serve_client(
     let _client_permit = permit;
     let idle_timeout = config.limits().idle_timeout();
     let output = ConnectionOutput::new();
-    let release_task = tokio::spawn(Arc::clone(&output).release_loop());
     let (io, write_half, bridge_reader) = SplitIo::new(stream, idle_timeout, Arc::clone(&output));
     let (hub, interim_receiver) = InterimHub::new();
     let client = ClientInfo {
@@ -338,6 +341,7 @@ async fn serve_client(
                 graceful = true;
                 connection.as_mut().graceful_shutdown();
             }
+            _ = Arc::clone(&output).release_loop() => {}
             result = &mut connection => {
                 let _ = result;
                 // Dropping the connection closes the bridge writer; the writer
@@ -346,7 +350,6 @@ async fn serve_client(
                 let _ = &mut writer.await;
                 drop(hub);
                 output.close();
-                release_task.abort();
                 return;
             }
             result = &mut writer => {
@@ -354,7 +357,6 @@ async fn serve_client(
                 drop(connection);
                 drop(hub);
                 output.close();
-                release_task.abort();
                 return;
             }
         }
@@ -363,7 +365,6 @@ async fn serve_client(
     drop(writer);
     drop(hub);
     output.close();
-    release_task.abort();
 }
 
 #[derive(Clone)]
@@ -396,8 +397,8 @@ impl TaskTracker {
     {
         let notify = Arc::clone(&self.notify);
         let handle = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(notify);
             future.await;
-            notify.notify_one();
         });
         let Ok(mut registry) = self.inner.lock() else {
             handle.abort();
@@ -429,8 +430,7 @@ impl TaskTracker {
         self.notify.notify_one();
     }
 
-    async fn wait(&self, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+    async fn wait_until(&self, deadline: tokio::time::Instant) -> bool {
         loop {
             self.reap();
             let empty = self
@@ -451,5 +451,36 @@ impl TaskTracker {
                     .unwrap_or(true);
             }
         }
+    }
+
+    /// Takes ownership of all aborted tasks and waits until they are actually
+    /// dropped by the runtime. `abort` only schedules cancellation; awaiting
+    /// the handles removes the tasks before shutdown returns.
+    async fn reap_after_abort(&self) {
+        let handles = if let Ok(mut registry) = self.inner.lock() {
+            registry.stopped = true;
+            registry
+                .handles
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        } else {
+            return;
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Notifies the tracker when a tracked future finishes or is cancelled.
+///
+/// The previous wrapper notified only after `future.await` returned normally,
+/// so an aborted task could leave a waiter blocked until its deadline.
+struct NotifyOnDrop(Arc<Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
     }
 }

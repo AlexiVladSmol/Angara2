@@ -289,7 +289,9 @@ absolute URI.
   source/request ACL, выбирается один egress и выполняется свежий DNS lookup;
   pool ищет соединение только среди разрешённых сейчас endpoint. Обмены на
   одном клиентском соединении сериализованы, поэтому interim/final разных
-  pipelined-запросов не перепутываются.
+  pipelined-запросов не перепутываются. Барьер следующего обмена учитывает
+  только байты hyper-потока в bridge; interim heads не создают кредит на
+  неотправленный хвост предыдущего body.
 - Origin pool ограничен `http.pool_*`; ключ включает canonical host/port,
   endpoint IP:port, egress и generation. Lease удерживается до завершения
   request body и response body/trailers; ошибка, drop, timeout или shutdown
@@ -300,8 +302,10 @@ absolute URI.
   `transport.max_connecting` ограничивает одновременные connect attempts.
 - Остановка по SIGINT/SIGTERM сначала прекращает accept и новые обмены,
   закрывает idle pool, затем ждёт активные задачи в пределах
-  `limits.shutdown_timeout_ms`; после общего deadline оставшиеся задачи
-  отменяются. Порт освобождается до завершения процесса.
+  `limits.shutdown_timeout_ms`; после общего deadline оставшиеся client/origin
+  задачи отменяются, и shutdown ждёт их фактического завершения. Отдельных
+  секундных окон на фазы нет; release barrier poll-ится внутри client task и
+  не остаётся detached после abort. Порт освобождается до завершения процесса.
 - Буфер bridge ограничен 64 KiB на направление; внутренний read/write buffer
   hyper ограничен `max(64 KiB, limits.max_header_bytes + 16 KiB)`, поэтому
   head до 1 MiB разбирается без неограниченного роста.

@@ -54,7 +54,7 @@ jobs:
       - name: Resource evidence (Linux fd/RSS baseline)
         run: |
           cargo test --locked --test http_limits \
-            m03_res02_fd_baseline_after_two_hundred_exchanges \
+            m03_res02 \
             -- --ignored --test-threads=1 --nocapture
 
       - name: Validate example configurations

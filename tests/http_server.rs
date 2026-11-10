@@ -224,6 +224,97 @@ fn m03_srv02_shutdown_closes_active_origin_before_return() {
     origin_thread.join().expect("origin thread");
 }
 
+#[test]
+fn m03_srv02_repeated_forced_shutdown_reclaims_tasks_and_deadline() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    runtime.block_on(async {
+        let baseline = runtime.metrics().num_alive_tasks();
+        for cycle in 0..4 {
+            let drop_only = cycle == 3;
+            let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+            let origin_address = origin.local_addr().expect("origin address");
+            let (stream_tx, stream_rx) = mpsc::channel();
+            let (hold_tx, hold_rx) = mpsc::channel::<()>();
+            let origin_thread = thread::spawn(move || {
+                let (mut stream, _) = origin.accept().expect("accept proxy");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("origin read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read proxy request");
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n")
+                    .expect("write first chunk");
+                stream.flush().expect("flush first chunk");
+                stream_tx
+                    .send(stream.try_clone().expect("clone origin stream"))
+                    .expect("send origin stream");
+                let _ = hold_rx.recv_timeout(Duration::from_secs(5));
+            });
+
+            let text = config("127.0.0.1:3128")
+                .replace("shutdown_timeout_ms = 2000", "shutdown_timeout_ms = 1");
+            let (server, proxy) = start_proxy(&text).await;
+            let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+            client
+                .send(&request("GET", origin_address, "/active", &[], b""))
+                .await
+                .expect("send request");
+            assert_eq!(
+                client.read_head().await.expect("read response head").status,
+                200
+            );
+            let origin_stream = stream_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("origin accepted request");
+
+            let started = Instant::now();
+            if drop_only {
+                drop(server);
+            } else {
+                server.shutdown().await;
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "cycle {cycle}: forced shutdown used a fresh timeout: {elapsed:?}"
+            );
+
+            drop(client);
+            drop(origin_stream);
+            drop(hold_tx);
+            origin_thread.join().expect("origin thread");
+            let mut alive = runtime.metrics().num_alive_tasks();
+            for _ in 0..200 {
+                if alive == baseline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                alive = runtime.metrics().num_alive_tasks();
+            }
+            assert_eq!(
+                alive, baseline,
+                "cycle {cycle}: forced shutdown left {alive} live tasks (baseline {baseline})"
+            );
+        }
+    });
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn m03_srv01_ipv4_and_ipv6_wildcards_share_a_port_with_v6only() {

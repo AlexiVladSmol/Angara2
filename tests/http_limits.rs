@@ -70,6 +70,88 @@ async fn spawn_stream_origin(
     address
 }
 
+#[cfg(target_os = "linux")]
+struct LargeStreamOrigin {
+    address: SocketAddr,
+    active: Arc<AtomicUsize>,
+    written: Arc<AtomicUsize>,
+    max_written: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LargeStreamOrigin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_large_stream_origin(total: usize) -> LargeStreamOrigin {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind large stream origin");
+    let address = listener.local_addr().expect("large stream address");
+    let active = Arc::new(AtomicUsize::new(0));
+    let written = Arc::new(AtomicUsize::new(0));
+    let max_written = Arc::new(AtomicUsize::new(0));
+    let task_active = Arc::clone(&active);
+    let task_written = Arc::clone(&written);
+    let task_max = Arc::clone(&max_written);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            task_active.fetch_add(1, Ordering::AcqRel);
+            let active = Arc::clone(&task_active);
+            let written = Arc::clone(&task_written);
+            let max_written = Arc::clone(&task_max);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                if stream
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
+                let chunk = vec![b'Z'; 64 * 1024];
+                let mut sent = 0;
+                while sent < total {
+                    let take = chunk.len().min(total - sent);
+                    if stream.write_all(&chunk[..take]).await.is_err() {
+                        break;
+                    }
+                    sent += take;
+                    written.fetch_add(take, Ordering::AcqRel);
+                    max_written.fetch_max(sent, Ordering::AcqRel);
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    });
+    LargeStreamOrigin {
+        address,
+        active,
+        written,
+        max_written,
+        task,
+    }
+}
+
 #[test]
 fn m03_res01_request_header_count_is_bounded_before_origin() {
     runtime().block_on(async {
@@ -592,6 +674,144 @@ fn m03_res02_fd_baseline_after_two_hundred_exchanges() {
         );
         assert_eq!(origin.accepts.load(Ordering::Acquire), 1);
         server.shutdown().await;
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "resource/backpressure evidence: run on Linux with --ignored --test-threads=1"]
+fn m03_res02_slow_consumers_are_bounded_and_aborts_return_to_baseline() {
+    let runtime = runtime();
+    runtime.block_on(async {
+        fn fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("read /proc/self/fd")
+                .count()
+        }
+        fn rss_kib() -> u64 {
+            let status = std::fs::read_to_string("/proc/self/status").expect("read status");
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmRSS:")
+                        .and_then(|value| value.split_whitespace().next())
+                        .and_then(|value| value.parse().ok())
+                })
+                .expect("VmRSS")
+        }
+
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let large = spawn_large_stream_origin(TOTAL).await;
+        let small = spawn_origin(|_, _| response("200 OK", &[], b"ok"))
+            .await
+            .expect("start small origin");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let origin_tasks = runtime.metrics().num_alive_tasks();
+
+        let text =
+            proxy_config().replace("pool_idle_timeout_ms = 2000", "pool_idle_timeout_ms = 300");
+        let (server, proxy) = start_proxy(&text).await;
+
+        let mut warm = RawClient::connect(proxy).await.expect("connect proxy");
+        warm.send(&request("GET", small.address, "/warmup", &[], b""))
+            .await
+            .expect("send warmup");
+        assert_eq!(
+            warm.read_response().await.expect("read warmup").head.status,
+            200
+        );
+        drop(warm);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let baseline_fd = fd_count();
+        let baseline_rss = rss_kib();
+
+        for round in 0..3 {
+            let mut clients = Vec::new();
+            for index in 0..6 {
+                let mut client = RawClient::connect_with_buffers(proxy, 4096)
+                    .await
+                    .expect("connect slow consumer");
+                client
+                    .send(&request(
+                        "GET",
+                        large.address,
+                        &format!("/round-{round}-{index}"),
+                        &[],
+                        b"",
+                    ))
+                    .await
+                    .expect("send large request");
+                assert_eq!(
+                    client.read_head().await.expect("read large head").status,
+                    200,
+                    "round {round}"
+                );
+                clients.push(client);
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let max_written = large.max_written.load(Ordering::Acquire);
+            let total_written = large.written.load(Ordering::Acquire);
+            assert!(
+                max_written < 16 * 1024 * 1024,
+                "round {round}: one slow consumer accumulated {max_written} bytes"
+            );
+            assert!(
+                total_written < 128 * 1024 * 1024,
+                "round {round}: six slow consumers accumulated {total_written} bytes"
+            );
+
+            drop(clients);
+            for _ in 0..200 {
+                if large.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                large.active.load(Ordering::Acquire),
+                0,
+                "round {round}: origin connections were not reclaimed after aborts"
+            );
+        }
+
+        for _ in 0..8 {
+            let mut client = RawClient::connect(proxy).await.expect("connect healthy");
+            client
+                .send(&request("GET", small.address, "/healthy", &[], b""))
+                .await
+                .expect("send healthy");
+            assert_eq!(
+                client.read_response().await.expect("read healthy").text(),
+                "ok"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(large.active.load(Ordering::Acquire), 0);
+        assert_eq!(small.requests.lock().unwrap().len(), 9);
+
+        server.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_fd = fd_count();
+        let after_rss = rss_kib();
+        let after_tasks = runtime.metrics().num_alive_tasks();
+        eprintln!(
+            "M03-RES-03 fd {baseline_fd}->{after_fd}, rss_kib {baseline_rss}->{after_rss}, \
+             tasks {origin_tasks}->{after_tasks}, max_origin_write={}",
+            large.max_written.load(Ordering::Acquire)
+        );
+        assert!(
+            after_fd <= baseline_fd + 8,
+            "FD baseline grew from {baseline_fd} to {after_fd}"
+        );
+        assert!(
+            after_rss <= baseline_rss + 128 * 1024,
+            "RSS grew from {baseline_rss} KiB to {after_rss} KiB"
+        );
+        assert!(
+            after_tasks <= origin_tasks,
+            "server tasks leaked: baseline {origin_tasks}, after shutdown {after_tasks}"
+        );
     });
 }
 

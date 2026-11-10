@@ -2,8 +2,15 @@
 
 mod common;
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use angara::config::{Config, EgressProfile};
+use angara::http::HttpServer;
+use angara::resolver::{ResolveFuture, Resolver};
+use angara::transport::{DialFuture, Dialer, TcpDialer};
 use common::m03::*;
 use tokio::runtime::{Builder, Runtime};
 
@@ -13,6 +20,49 @@ fn runtime() -> Runtime {
         .enable_all()
         .build()
         .expect("build test runtime")
+}
+
+struct LoopbackResolver;
+
+impl Resolver for LoopbackResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, _deadline: Instant) -> ResolveFuture<'a> {
+        Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+    }
+}
+
+struct WorkerRecordingDialer {
+    threads: Arc<Mutex<HashSet<std::thread::ThreadId>>>,
+}
+
+impl Dialer for WorkerRecordingDialer {
+    fn connect<'a>(
+        &'a self,
+        endpoint: SocketAddr,
+        egress: &'a EgressProfile,
+        deadline: Instant,
+    ) -> DialFuture<'a> {
+        Box::pin(async move {
+            self.threads
+                .lock()
+                .expect("record worker")
+                .insert(std::thread::current().id());
+            // Simulate CPU work in Angara's outbound path so concurrent
+            // exchanges are forced onto other runtime workers. The recorded id
+            // is the worker executing proxy code, not the test origin.
+            let until = Instant::now() + Duration::from_millis(30);
+            let mut spin = 0_u64;
+            while Instant::now() < until {
+                spin = spin.wrapping_add(1);
+            }
+            std::hint::black_box(spin);
+            let dialer = TcpDialer;
+            dialer.connect(endpoint, egress, deadline).await
+        })
+    }
+}
+
+fn domain_request(port: u16, host: &str, path: &str) -> Vec<u8> {
+    format!("GET http://{host}:{port}{path} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").into_bytes()
 }
 
 fn proxy_config() -> String {
@@ -222,6 +272,94 @@ fn m03_http02_pipelined_interim_cannot_split_previous_body() {
             second.interim.iter().all(|head| head.status != 100),
             "second request received a duplicate 100: {:?}",
             second.interim
+        );
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_http02_interim_credits_cannot_release_body_barrier() {
+    runtime().block_on(async {
+        const BODY: usize = 65_536;
+        let mut first = Vec::new();
+        for _ in 0..3 {
+            let pad = "p".repeat(20_000);
+            first.extend_from_slice(
+                format!("HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\nX-Pad: {pad}\r\n\r\n")
+                    .as_bytes(),
+            );
+        }
+        first.extend_from_slice(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n").as_bytes(),
+        );
+        first.extend(std::iter::repeat_n(b'X', BODY));
+        let second = b"HTTP/1.1 103 Early Hints\r\nLink: </second-only>\r\n\r\n\
+                       HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nTWO"
+            .to_vec();
+        let third = response("200 OK", &[], b"THREE");
+        let origin = spawn_origin(move |request, _| match request.target.as_str() {
+            "/first" => first.clone(),
+            "/second" => second.clone(),
+            "/third" => third.clone(),
+            other => panic!("unexpected origin target {other}"),
+        })
+        .await
+        .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect_with_buffers(proxy, 4096)
+            .await
+            .expect("connect proxy with small buffers");
+
+        let mut bytes = request("GET", origin.address, "/first", &[], b"");
+        bytes.extend_from_slice(&request("GET", origin.address, "/second", &[], b""));
+        bytes.extend_from_slice(&request("GET", origin.address, "/third", &[], b""));
+        client.send(&bytes).await.expect("send pipelined requests");
+
+        let first = client.read_response().await.expect("read first response");
+        assert_eq!(first.head.status, 200);
+        assert_eq!(
+            first.interim.len(),
+            3,
+            "first exchange interim heads: {:?}",
+            first.interim
+        );
+        assert!(first.interim.iter().all(|head| head.status == 103));
+        assert_eq!(
+            first.body.len(),
+            BODY,
+            "second interim was inserted into the first body"
+        );
+        assert!(
+            first.body.iter().all(|byte| *byte == b'X'),
+            "first body contains another message"
+        );
+
+        let second = client.read_response().await.expect("read second response");
+        assert_eq!(second.head.status, 200);
+        assert_eq!(second.text(), "TWO");
+        assert_eq!(
+            second
+                .interim
+                .iter()
+                .filter(|head| head.status == 103)
+                .count(),
+            1,
+            "second exchange interim heads: {:?}",
+            second.interim
+        );
+        assert_eq!(
+            second.interim[0].header("link"),
+            Some("</second-only>"),
+            "second interim was not kept in its own exchange"
+        );
+
+        let third = client.read_response().await.expect("read third response");
+        assert_eq!(third.head.status, 200);
+        assert_eq!(third.text(), "THREE");
+        assert!(
+            third.interim.is_empty(),
+            "third exchange received foreign interim: {:?}",
+            third.interim
         );
         server.shutdown().await;
     });
@@ -1085,37 +1223,42 @@ fn m03_http01_large_binary_upload_and_download_stream() {
 }
 
 #[test]
-fn m03_cpu01_http_work_uses_multiple_workers() {
+fn m03_cpu01_angara_outbound_path_uses_multiple_workers() {
     let runtime = Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("build four-worker runtime");
     runtime.block_on(async {
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handler_active = std::sync::Arc::clone(&active);
-        let handler_maximum = std::sync::Arc::clone(&maximum);
-        let origin = spawn_origin(move |_, _| {
-            let current = handler_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            handler_maximum.fetch_max(current, std::sync::atomic::Ordering::AcqRel);
-            std::thread::sleep(Duration::from_millis(150));
-            handler_active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            response("200 OK", &[], b"cpu")
-        })
+        let origin = spawn_origin(|_, _| response("200 OK", &[], b"cpu"))
+            .await
+            .expect("start origin");
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let config = Arc::new(Config::parse(&proxy_config()).expect("valid config"));
+        let server = HttpServer::bind_ephemeral_with_components(
+            config,
+            Arc::new(LoopbackResolver),
+            Arc::new(WorkerRecordingDialer {
+                threads: Arc::clone(&threads),
+            }),
+        )
         .await
-        .expect("start origin");
-        let text = proxy_config().replace("worker_threads = 2", "worker_threads = 4");
-        let (server, proxy) = start_proxy(&text).await;
+        .expect("bind proxy with recording dialer");
+        let proxy = server.addresses()[0].1;
+        let origin_port = origin.address.port();
 
         let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let mut client = RawClient::connect(proxy).await.expect("connect client");
-            client
-                .send(&request("GET", origin.address, "/cpu", &[], b""))
-                .await
-                .expect("send request");
+        for index in 0..8 {
             tasks.push(tokio::spawn(async move {
+                let mut client = RawClient::connect(proxy).await.expect("connect client");
+                client
+                    .send(&domain_request(
+                        origin_port,
+                        "cpu.test",
+                        &format!("/exchange-{index}"),
+                    ))
+                    .await
+                    .expect("send request");
                 client
                     .read_response()
                     .await
@@ -1127,10 +1270,12 @@ fn m03_cpu01_http_work_uses_multiple_workers() {
         for task in tasks {
             assert_eq!(task.await.expect("join client"), 200);
         }
+
+        let workers = threads.lock().expect("worker set").len();
+        eprintln!("M03-CPU-01 workers={workers}");
         assert!(
-            maximum.load(std::sync::atomic::Ordering::Acquire) >= 2,
-            "HTTP work did not overlap on more than one worker: max={}",
-            maximum.load(std::sync::atomic::Ordering::Acquire)
+            workers >= 2,
+            "Angara outbound HTTP work ran on only one runtime worker: {workers}"
         );
         server.shutdown().await;
     });

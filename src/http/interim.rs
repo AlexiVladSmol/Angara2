@@ -253,7 +253,6 @@ pub async fn writer_loop(
                 match maybe_interim {
                     Some(bytes) => {
                         write_all_bounded(&mut socket, &bytes, idle_timeout).await?;
-                        output.consumed(bytes.len());
                     }
                     None => interim_open = false,
                 }

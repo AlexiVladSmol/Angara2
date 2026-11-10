@@ -102,8 +102,8 @@ impl Proxy {
     }
 
     /// Aborts and awaits all origin drivers.
-    pub async fn shutdown_origins(&self, timeout: std::time::Duration) -> bool {
-        self.origin_tasks.shutdown(timeout).await
+    pub async fn shutdown_origins(&self) -> bool {
+        self.origin_tasks.shutdown().await
     }
 
     /// Whether new exchanges must be refused.
