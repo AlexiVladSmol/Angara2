@@ -312,17 +312,18 @@ allow_special = true
 fn cli_serve_startup_failure_releases_all_listeners() {
     use std::net::TcpListener;
 
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local address")
-            .port()
-    }
+    // Hold the conflicting port for the whole scenario: a closed probe port
+    // can be taken by another process before Angara starts.
+    let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupy second port");
+    let second = occupied.local_addr().expect("occupied address").port();
 
-    let first = free_port();
-    let second = free_port();
-    let occupied = TcpListener::bind(("127.0.0.1", second)).expect("occupy second port");
+    // The first listener must remain bindable by Angara. Reserve an ephemeral
+    // port distinct from the occupied one, then release it immediately before
+    // spawning the child.
+    let first_probe = TcpListener::bind(("127.0.0.1", 0)).expect("probe first port");
+    let first = first_probe.local_addr().expect("probe address").port();
+    assert_ne!(first, second);
+    drop(first_probe);
 
     let dir = TempDir::new("cli-serve-bind");
     let listeners = format!(

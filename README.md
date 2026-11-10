@@ -295,7 +295,10 @@ absolute URI.
 - Origin pool ограничен `http.pool_*`; ключ включает canonical host/port,
   endpoint IP:port, egress и generation. Lease удерживается до завершения
   request body и response body/trailers; ошибка, drop, timeout или shutdown
-  вытесняют соединение и возвращают permit.
+  вытесняют соединение и возвращают permit. Idle sender вытесняется только
+  при фактическом закрытии connection task, а не при временной
+  неготовности `is_ready`, поэтому успешный keep-alive обмен не создаёт
+  лишний origin accept.
 - `limits.max_client_connections` — общий входящий бюджет всех listeners;
   permit удерживается до закрытия клиентского socket, включая idle keep-alive.
 - `limits.max_connections` — общий бюджет исходящих sockets, включая idle;

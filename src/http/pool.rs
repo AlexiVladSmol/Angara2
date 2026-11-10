@@ -277,8 +277,14 @@ impl PooledSender {
         }
     }
 
+    /// Whether the origin connection task has ended.
+    ///
+    /// `SendRequest::is_ready` is only a transient poll hint: it can be false
+    /// until the connection task is polled after the previous response. Using
+    /// it here would evict healthy keep-alive sockets immediately after a
+    /// successful exchange. `send_request` already waits for readiness.
     pub(crate) fn is_closed(&self) -> bool {
-        self.sender.is_closed() || !self.sender.is_ready()
+        self.sender.is_closed()
     }
 
     pub(crate) async fn send_request(
