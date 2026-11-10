@@ -57,6 +57,12 @@ jobs:
             m03_res02 \
             -- --ignored --test-threads=1 --nocapture
 
+      - name: CPU evidence (multi-worker HTTP path)
+        run: |
+          cargo test --locked --test http_forward \
+            m03_cpu01_angara_outbound_path_uses_multiple_workers \
+            -- --nocapture
+
       - name: Validate example configurations
         run: |
           cargo run --locked -- check --config examples/minimal.toml
