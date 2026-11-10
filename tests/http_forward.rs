@@ -444,6 +444,182 @@ fn m03_http03_connection_nominations_filter_same_message_trailers() {
 }
 
 #[test]
+fn m03_http05_raw_target_survives_cl_bodies_and_pipelining() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| response("200 OK", &[], request.target.as_bytes()))
+            .await
+            .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+
+        let decoy = b"GET http://decoy.invalid/ HTTP/1.1\r\nHost: decoy.invalid\r\n\r\n";
+        let mut bytes = request("POST", origin.address, "/body", &[], decoy);
+        bytes.extend_from_slice(&request("GET", origin.address, "/after-body", &[], b""));
+        client
+            .send(&bytes)
+            .await
+            .expect("send body and next request");
+        assert_eq!(
+            client.read_response().await.expect("read body").text(),
+            "/body"
+        );
+        assert_eq!(
+            client
+                .read_response()
+                .await
+                .expect("read after-body")
+                .text(),
+            "/after-body"
+        );
+
+        let mut pipelined = request("GET", origin.address, "/p1", &[], b"");
+        pipelined.extend_from_slice(&request("GET", origin.address, "/p2", &[], b""));
+        client.send(&pipelined).await.expect("send pipelined");
+        assert_eq!(client.read_response().await.expect("read p1").text(), "/p1");
+        assert_eq!(client.read_response().await.expect("read p2").text(), "/p2");
+
+        let requests = origin.requests.lock().unwrap().clone();
+        let targets = requests
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["/body", "/after-body", "/p1", "/p2"]);
+        assert_eq!(requests[0].body, decoy);
+        assert_eq!(requests[1].body, b"");
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_http05_raw_target_survives_chunked_body_and_trailers() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| {
+            if request.target == "/chunked" {
+                assert_eq!(request.body, b"abc");
+                assert!(
+                    request
+                        .trailers
+                        .iter()
+                        .any(|(name, value)| name.eq_ignore_ascii_case("x-checksum") && value == "ok")
+                );
+            }
+            response("200 OK", &[], request.target.as_bytes())
+        })
+        .await
+        .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        let mut bytes = format!(
+            "POST http://{}/chunked HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n3\r\nabc\r\n0\r\nX-Checksum: ok\r\n\r\n",
+            origin.address, origin.address
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&request("GET", origin.address, "/ignored-after-chunked", &[], b""));
+        client.send(&bytes).await.expect("send chunked request");
+        assert_eq!(
+            client.read_response().await.expect("read chunked response").text(),
+            "/chunked"
+        );
+
+        let mut next = RawClient::connect(proxy).await.expect("connect new client");
+        next.send(&request("GET", origin.address, "/after-chunked", &[], b""))
+            .await
+            .expect("send after-chunked");
+        assert_eq!(
+            next.read_response().await.expect("read after-chunked").text(),
+            "/after-chunked"
+        );
+
+        let requests = origin.requests.lock().unwrap().clone();
+        let targets = requests
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["/chunked", "/after-chunked"]);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_http05_fragment_is_rejected_on_later_and_pipelined_requests() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| response("200 OK", &[], request.target.as_bytes()))
+            .await
+            .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+
+        let mut keepalive = RawClient::connect(proxy).await.expect("connect proxy");
+        keepalive
+            .send(&request("GET", origin.address, "/first", &[], b""))
+            .await
+            .expect("send first");
+        assert_eq!(
+            keepalive.read_response().await.expect("read first").text(),
+            "/first"
+        );
+        let fragment = format!(
+            "GET http://{}/later#fragment HTTP/1.1\r\nHost: {}\r\n\r\n",
+            origin.address, origin.address
+        );
+        keepalive
+            .send(fragment.as_bytes())
+            .await
+            .expect("send later fragment");
+        assert_eq!(
+            keepalive
+                .read_response()
+                .await
+                .expect("read fragment reject")
+                .head
+                .status,
+            400
+        );
+
+        let mut pipelined = RawClient::connect(proxy).await.expect("connect proxy");
+        let mut bytes = request("GET", origin.address, "/pipelined", &[], b"");
+        bytes.extend_from_slice(
+            format!(
+                "GET http://{}/pipelined-fragment#fragment HTTP/1.1\r\nHost: {}\r\n\r\n",
+                origin.address, origin.address
+            )
+            .as_bytes(),
+        );
+        pipelined
+            .send(&bytes)
+            .await
+            .expect("send pipelined fragment");
+        assert_eq!(
+            pipelined
+                .read_response()
+                .await
+                .expect("read pipelined first")
+                .head
+                .status,
+            200
+        );
+        assert_eq!(
+            pipelined
+                .read_response()
+                .await
+                .expect("read pipelined fragment")
+                .head
+                .status,
+            400
+        );
+
+        let targets = origin
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.target.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec!["/first", "/pipelined"]);
+        server.shutdown().await;
+    });
+}
+
+#[test]
 fn m03_http04_expect_continue_is_local_and_ordered() {
     runtime().block_on(async {
         let origin = spawn_origin(|request, _| {

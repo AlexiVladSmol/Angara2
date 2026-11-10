@@ -10,6 +10,7 @@ use http_body::Body as _;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1 as client_http1;
+use hyper::ext::OriginalRequestTarget;
 use hyper_util::rt::TokioIo;
 
 use crate::config::Config;
@@ -142,9 +143,17 @@ impl Proxy {
 
         let method = request.method().clone();
         let uri = request.uri().clone();
+        let target_text = request
+            .extensions()
+            .get::<OriginalRequestTarget>()
+            .map(|target| target.as_str().to_owned())
+            .unwrap_or_else(|| uri.to_string());
+        if target_text.contains('#') {
+            return headers::error_response(StatusCode::BAD_REQUEST, true);
+        }
 
         if method == Method::CONNECT {
-            return match CanonicalTarget::parse(&method, &uri.to_string()) {
+            return match CanonicalTarget::parse(&method, &target_text) {
                 Ok(_) => headers::error_response(StatusCode::NOT_IMPLEMENTED, true),
                 Err(_) => headers::error_response(StatusCode::BAD_REQUEST, true),
             };
@@ -167,7 +176,6 @@ impl Proxy {
             .headers()
             .get(HOST)
             .and_then(|value| value.to_str().ok());
-        let target_text = uri.to_string();
         let target = match CanonicalTarget::parse(&method, &target_text) {
             Ok(target) => target,
             Err(error) => return headers::error_response(target_status(error), true),
@@ -277,8 +285,7 @@ impl Proxy {
             headers::set_content_length(&mut request_headers, length);
         }
         let request_body = LeaseRequestBody::new(body, lease.clone(), request_nominations).boxed();
-        let origin_form = if method == Method::OPTIONS && uri.path() == "/" && uri.query().is_none()
-        {
+        let origin_form = if method == Method::OPTIONS && options_without_path(&target_text) {
             "*"
         } else {
             headers::origin_form(&target)
@@ -411,6 +418,17 @@ impl Proxy {
             .pool
             .new_lease(plan, endpoint, PooledSender::new(sender, task)))
     }
+}
+
+fn options_without_path(target: &str) -> bool {
+    let Some(rest) = target.get(7..) else {
+        return false;
+    };
+    target
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        && !rest.contains('/')
+        && !rest.contains('?')
 }
 
 fn target_status(error: TargetError) -> StatusCode {

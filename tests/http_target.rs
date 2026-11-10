@@ -85,6 +85,11 @@ fn m03_http01_invalid_absolute_forms_are_rejected_before_origin() {
                 Some(&format!("127.0.0.1:{port}")),
                 "GET",
             ),
+            raw_request(
+                &format!("http://127.0.0.1:{port}/#fragment"),
+                Some(&format!("127.0.0.1:{port}")),
+                "GET",
+            ),
             raw_request("http://127.0.0.1:0/zero", Some("127.0.0.1:0"), "GET"),
             raw_request(
                 &format!("http://2130706433:{port}/numeric"),
@@ -289,22 +294,31 @@ fn m03_http02_head_204_304_and_eof_responses() {
 #[test]
 fn m03_http07_options_empty_path_is_sent_as_asterisk() {
     runtime().block_on(async {
-        let origin = spawn_origin(|request, _| {
-            assert_eq!(request.target, "*");
-            response("204 No Content", &[], b"")
-        })
-        .await
-        .expect("start origin");
-        let (server, proxy) = start_proxy(&proxy_config()).await;
-        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
-        let target = format!("http://{}", origin.address);
-        client
-            .send(raw_request(&target, Some(&origin.address.to_string()), "OPTIONS").as_slice())
+        let origin = spawn_origin(|_, _| response("204 No Content", &[], b""))
             .await
-            .expect("send options");
-        let response = client.read_response().await.expect("read options");
-        assert_eq!(response.head.status, 204);
-        assert_eq!(origin.requests.lock().unwrap()[0].target, "*");
+            .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+
+        let cases = [
+            (format!("http://{}", origin.address), "*"),
+            (format!("http://{}/", origin.address), "/"),
+            (format!("http://{}/?q=1", origin.address), "/?q=1"),
+        ];
+        for (target, expected) in cases {
+            let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+            client
+                .send(raw_request(&target, Some(&origin.address.to_string()), "OPTIONS").as_slice())
+                .await
+                .expect("send options");
+            let response = client.read_response().await.expect("read options");
+            assert_eq!(response.head.status, 204);
+            let requests = origin.requests.lock().unwrap();
+            assert_eq!(
+                requests.last().expect("origin request").target,
+                expected,
+                "target {target}"
+            );
+        }
         server.shutdown().await;
     });
 }

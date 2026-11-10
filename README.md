@@ -167,8 +167,11 @@ transport = "http"
 M02 добавляет `http`, `ipnet`, `idna` и Tokio `net`/`time`/`sync`/`io-util`.
 M03 добавляет `hyper` 1.12 (`client`, `http1`, `server`), `hyper-util`
 (`TokioIo`, таймер), `http-body`, `http-body-util`, `bytes`, `socket2` и
-Tokio `macros`/`signal`. `rustls`, CLI-фреймворк и dev-зависимости пока не
-подключены. Политика зависимостей проверяется
+Tokio `macros`/`signal`. Hyper 1.12.0 закреплён с минимальным локальным
+patch для `OriginalRequestTarget`; см. раздел M03 и
+[`vendor/hyper-1.12.0/ANGARA_PATCH.md`](vendor/hyper-1.12.0/ANGARA_PATCH.md).
+`rustls`, CLI-фреймворк и dev-зависимости пока не подключены. Политика
+зависимостей проверяется
 [`deny.toml`](deny.toml): RustSec advisories, allow-list MIT/Apache-2.0/
 Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
 не выбрана и `LICENSE` не создаётся; `[licenses.private]` исключает только
@@ -307,12 +310,26 @@ absolute URI.
 Ограничения текущего этапа: 1xx передаются узким bounded writer-adapter
 (не более 16 heads/64 KiB на обмен); hyper 1.12 нормализует CL+TE до TE до
 вызова service, поэтому такой запрос обслуживается по TE и клиентское
-соединение принудительно закрывается после ответа. Hyper также удаляет
-фрагмент из request-target до вызова service и нормализует пустой path в `/`;
-поэтому OPTIONS с пустым path и OPTIONS с явным `/` отправляются origin как
-`*`. M02-парсер отвергает фрагмент, но HTTP-ingress не может наблюдать уже
-удалённую часть. CONNECT и TLS — M04/M06, локальная auth — M05, reload и
-control service — M07.
+соединение принудительно закрывается после ответа. CONNECT и TLS — M04/M06,
+локальная auth — M05, reload и control service — M07.
+
+### Patch hyper 1.12 для исходного request-target
+
+Hyper 1.12 удаляет fragment и нормализует пустой path при преобразовании в
+`http::Uri` до вызова service. По отдельному решению владельца добавлен
+минимальный patch: до нормализации сохраняются исходные байты request-target
+и публикуются в `hyper::ext::OriginalRequestTarget` через
+`Request::extensions`. Parser, CL/TE, chunked decoder, body и keep-alive не
+изменены. Исходный target используется Angara для fragment → 400/close и для
+различения `OPTIONS http://host` (→ `*`) от `OPTIONS http://host/` (→ `/`);
+проверки выполняются на всех keep-alive/pipelined запросах, включая запросы
+после CL/chunked body и trailers.
+
+Патч закреплён на hyper 1.12.0 в `vendor/hyper-1.12.0`, подключается через
+`[patch.crates-io]`, поэтому чистая сборка не зависит от локального Cargo
+cache. Точный diff и границы изменения — в
+[`vendor/hyper-1.12.0/ANGARA_PATCH.md`](vendor/hyper-1.12.0/ANGARA_PATCH.md).
+При обновлении hyper патч нужно перенести и повторно проверить.
 
 ### Ручной локальный стенд
 
