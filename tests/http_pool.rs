@@ -310,8 +310,7 @@ fn m03_net01_two_listeners_and_egress_bind_ips_are_preserved() {
         let origin = spawn_origin(|_, _| response("200 OK", &[], b"ok"))
             .await
             .expect("start origin");
-        let text = format!(
-            r#"
+        let text = r#"
 schema_version = 1
 
 [runtime]
@@ -384,9 +383,8 @@ egress_id = "via-a"
 id = "route-b"
 listeners = ["via-b"]
 egress_id = "via-b"
-"#
-        );
-        let config = Arc::new(Config::parse(&text).expect("valid egress config"));
+"#;
+        let config = Arc::new(Config::parse(text).expect("valid egress config"));
         let server = HttpServer::bind_ephemeral(config)
             .await
             .expect("bind proxy");
