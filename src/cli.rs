@@ -7,8 +7,11 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::Config;
+use crate::http::HttpServer;
+use crate::runtime::AngaraRuntime;
 
 /// Successful command.
 pub const EXIT_OK: u8 = 0;
@@ -16,12 +19,8 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_CONFIG_ERROR: u8 = 1;
 /// Command-line usage error.
 pub const EXIT_USAGE: u8 = 2;
-/// The proxy itself is not implemented yet.
-pub const EXIT_PROXY_NOT_IMPLEMENTED: u8 = 3;
-
-/// Message returned by `serve` until the proxy exists.
-pub const PROXY_NOT_IMPLEMENTED_MESSAGE: &str =
-    "proxy ещё не реализован; сетевые listeners не открыты (M03)";
+/// Server startup or unexpected server failure.
+pub const EXIT_SERVER_ERROR: u8 = 3;
 
 const USAGE: &str = "\
 Usage:
@@ -41,7 +40,7 @@ Usage:
 
 Commands:
   check --config <path>   Validate the configuration without network access.
-  serve --config <path>   Validate the configuration and stop with code 3.
+  serve --config <path>   Bind all listeners and run the HTTP/1.1 proxy.
   --version               Print the version and stop.
   --help                  Print this help and stop.
 
@@ -49,7 +48,7 @@ Exit codes:
   0  success
   1  configuration error
   2  command-line usage error
-  3  proxy is not implemented (M03)";
+  3  server startup or unexpected server failure";
 
 /// Runs the CLI and returns the process exit code.
 pub fn run<I>(args: I) -> u8
@@ -160,9 +159,76 @@ where
             EXIT_OK
         }
         Mode::Serve => {
-            eprintln!("error: {PROXY_NOT_IMPLEMENTED_MESSAGE}");
-            EXIT_PROXY_NOT_IMPLEMENTED
+            let runtime = match AngaraRuntime::build(&config) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return EXIT_SERVER_ERROR;
+                }
+            };
+            let config = Arc::new(config);
+            let result = runtime.block_on(async move {
+                let signals = match ShutdownSignals::install() {
+                    Ok(signals) => signals,
+                    Err(_) => {
+                        return Err(crate::http::ServerError::new(
+                            "cannot install shutdown signal handlers",
+                        ));
+                    }
+                };
+                let server = HttpServer::bind(config).await?;
+                for (id, address) in server.addresses() {
+                    eprintln!("listening: {id} {address}");
+                }
+                signals.wait().await;
+                server.shutdown().await;
+                Ok::<(), crate::http::ServerError>(())
+            });
+            match result {
+                Ok(()) => EXIT_OK,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    EXIT_SERVER_ERROR
+                }
+            }
         }
+    }
+}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(self) {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

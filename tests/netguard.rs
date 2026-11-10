@@ -1,9 +1,10 @@
 #![cfg(target_os = "linux")]
 
-//! CFG-02: prove that `check` and `serve` never call socket/bind/connect or a
-//! resolver. An LD_PRELOAD guard records network entry points, and a positive
-//! control proves that the guard is actually loaded and detects a real socket
-//! call. This is stronger than probing one free port.
+//! CFG-02: prove that `check`, `help`/`version` and invalid `serve` never call
+//! socket/bind/connect or a resolver. A valid `serve` is allowed to use the
+//! network by M03 and is covered by process-level tests instead. An LD_PRELOAD
+//! guard records network entry points, and a positive control proves that the
+//! guard is actually loaded and detects a real socket call.
 
 mod common;
 
@@ -79,7 +80,7 @@ fn network_calls(marker: &Path) -> Vec<String> {
 }
 
 #[test]
-fn cfg02_check_and_serve_make_no_network_calls() {
+fn cfg02_check_help_version_and_invalid_serve_make_no_network_calls() {
     let dir = TempDir::new("netguard");
     let guard = compile(dir.path(), "netguard.so", NETGUARD_C, true);
 
@@ -114,20 +115,47 @@ fn cfg02_check_and_serve_make_no_network_calls() {
         "check called network functions: {check_marker_text}"
     );
 
+    for (name, argument) in [("help", "--help"), ("version", "--version")] {
+        let marker = dir.path().join(format!("{name}.marker"));
+        let arguments = [OsStr::new(argument)];
+        let output = run_with_guard(
+            Path::new(env!("CARGO_BIN_EXE_angara")),
+            &arguments,
+            &guard,
+            &marker,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker_text = marker_contents(&marker);
+        assert!(
+            marker_text.contains("loaded"),
+            "{name}: netguard was not loaded; LD_PRELOAD proof is invalid"
+        );
+        assert!(
+            network_calls(&marker).is_empty(),
+            "{name} called network functions: {marker_text}"
+        );
+    }
+
+    let invalid = dir.write("invalid.toml", "schema_version = 2");
     let serve = run_with_guard(
         Path::new(env!("CARGO_BIN_EXE_angara")),
         &[
             OsStr::new("serve"),
             OsStr::new("--config"),
-            config.as_os_str(),
+            invalid.as_os_str(),
         ],
         &guard,
         &serve_marker,
     );
     assert_eq!(
         serve.status.code(),
-        Some(3),
-        "serve failed: {}",
+        Some(1),
+        "invalid serve failed: {}",
         String::from_utf8_lossy(&serve.stderr)
     );
 
@@ -138,7 +166,7 @@ fn cfg02_check_and_serve_make_no_network_calls() {
     );
     assert!(
         network_calls(&serve_marker).is_empty(),
-        "serve called network functions: {serve_marker_text}"
+        "invalid serve called network functions: {serve_marker_text}"
     );
 
     for name in [
@@ -146,6 +174,7 @@ fn cfg02_check_and_serve_make_no_network_calls() {
         "multi-listener.toml",
         "m02-policy.toml",
         "m02-egress-local.toml",
+        "m03-http-local.toml",
     ] {
         let example = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")

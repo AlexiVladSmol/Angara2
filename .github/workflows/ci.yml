@@ -51,12 +51,70 @@ jobs:
       - name: Tests (unit, integration, CLI, Linux network guard)
         run: cargo test --locked
 
+      - name: Resource evidence (Linux fd/RSS baseline)
+        run: |
+          cargo test --locked --test http_limits \
+            m03_res02 \
+            -- --ignored --test-threads=1 --nocapture
+
+      - name: CPU evidence (multi-worker HTTP path)
+        run: |
+          cargo test --locked --test http_forward \
+            m03_cpu01_angara_outbound_path_uses_multiple_workers \
+            -- --nocapture
+
       - name: Validate example configurations
         run: |
           cargo run --locked -- check --config examples/minimal.toml
           cargo run --locked -- check --config examples/multi-listener.toml
           cargo run --locked -- check --config examples/m02-policy.toml
           cargo run --locked -- check --config examples/m02-egress-local.toml
+          cargo run --locked -- check --config examples/m03-http-local.toml
+
+      - name: Curl smoke through the real proxy
+        run: |
+          set -euo pipefail
+          python3 examples/m03-local-origin.py --port 18080 &
+          ORIGIN_PID=$!
+          ./target/debug/angara serve --config examples/m03-http-local.toml 2>proxy.log &
+          PROXY_PID=$!
+          cleanup() {
+            kill -TERM "$PROXY_PID" 2>/dev/null || true
+            kill "$ORIGIN_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+              http://127.0.0.1:18080/ >/tmp/angara-root.txt 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep -q 'angara m03 local origin' /tmp/angara-root.txt
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            -I http://127.0.0.1:18080/binary -o /tmp/angara-head.txt
+          grep -q '200' /tmp/angara-head.txt
+          head -c 65536 /dev/urandom >/tmp/angara-upload.bin
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --data-binary @/tmp/angara-upload.bin http://127.0.0.1:18080/echo \
+            -o /tmp/angara-echo.txt
+          grep -q 'received 65536 bytes' /tmp/angara-echo.txt
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            -H 'Transfer-Encoding: chunked' \
+            --data-binary @/tmp/angara-upload.bin http://127.0.0.1:18080/echo \
+            -o /tmp/angara-chunked-echo.txt
+          grep -q 'received 65536 bytes' /tmp/angara-chunked-echo.txt
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            -H 'Range: bytes=0-15' http://127.0.0.1:18080/range \
+            -o /tmp/angara-range.bin
+          test "$(wc -c </tmp/angara-range.bin)" -eq 16
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 -N \
+            http://127.0.0.1:18080/sse -o /tmp/angara-sse.txt
+          grep -q 'data: event 7' /tmp/angara-sse.txt
+          kill -TERM "$PROXY_PID"
+          wait "$PROXY_PID"
+          kill "$ORIGIN_PID"
+          trap - EXIT
 
   deny:
     name: Dependency policy (advisories, licenses, sources)
