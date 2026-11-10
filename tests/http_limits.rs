@@ -219,6 +219,69 @@ fn m03_res02_first_chunk_reaches_client_before_body_end() {
     });
 }
 
+async fn spawn_fixed_stream_origin(total: usize, chunk: usize, delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixed stream origin");
+    let address = listener.local_addr().expect("fixed stream address");
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = [0_u8; 4096];
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        if stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {total}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let payload = vec![b'd'; chunk];
+        let mut sent = 0;
+        while sent < total {
+            tokio::time::sleep(delay).await;
+            let take = chunk.min(total - sent);
+            if stream.write_all(&payload[..take]).await.is_err() {
+                return;
+            }
+            sent += take;
+        }
+    });
+    address
+}
+
+#[test]
+fn m03_res01_slow_download_with_progress_survives_idle_timeout() {
+    runtime().block_on(async {
+        let origin = spawn_fixed_stream_origin(20_000, 1_000, Duration::from_millis(120)).await;
+        let text = proxy_config().replace("idle_timeout_ms = 5000", "idle_timeout_ms = 1000");
+        let (server, proxy) = start_proxy(&text).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(&request("GET", origin, "/slow-download", &[], b""))
+            .await
+            .expect("send request");
+        let response = client.read_response().await.expect("read slow download");
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.body.len(), 20_000);
+        assert!(response.body.iter().all(|byte| *byte == b'd'));
+        server.shutdown().await;
+    });
+}
+
 #[test]
 fn m03_res01_regular_sse_progress_beats_idle_timeout() {
     runtime().block_on(async {
