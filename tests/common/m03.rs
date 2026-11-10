@@ -193,6 +193,33 @@ impl RawClient {
         self.read_response_for(true).await
     }
 
+    /// Reads one chunked data chunk; `None` means the final chunk/trailers.
+    pub async fn read_chunked_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let line = self.read_line().await?;
+        let size = line
+            .split(';')
+            .next()
+            .and_then(|value| usize::from_str_radix(value.trim(), 16).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        if size == 0 {
+            loop {
+                let line = self.read_line().await?;
+                if line.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
+        let chunk = self.read_exact(size).await?;
+        let ending = self.read_exact(2).await?;
+        if ending != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad chunk ending",
+            ));
+        }
+        Ok(Some(chunk))
+    }
+
     async fn read_response_for(&mut self, body_forbidden: bool) -> io::Result<RawResponse> {
         let mut interim = Vec::new();
         let head = loop {

@@ -9,11 +9,12 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use http::Response;
+use http::header::HeaderName;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 use crate::config::Config;
 use crate::outbound::OutboundPlan;
@@ -269,7 +270,7 @@ pub struct PooledSender {
 
 impl PooledSender {
     /// Creates a sender wrapper from a completed handshake.
-    pub fn new(sender: SendRequest<PoolBody>, task: JoinHandle<()>) -> Self {
+    pub fn new(sender: SendRequest<PoolBody>, task: AbortHandle) -> Self {
         Self {
             sender,
             _task: AbortOnDrop(task),
@@ -288,7 +289,7 @@ impl PooledSender {
     }
 }
 
-struct AbortOnDrop(JoinHandle<()>);
+struct AbortOnDrop(AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -300,15 +301,17 @@ impl Drop for AbortOnDrop {
 pub struct LeaseRequestBody {
     inner: Pin<Box<Incoming>>,
     lease: Lease,
+    nominations: Vec<HeaderName>,
     done: bool,
 }
 
 impl LeaseRequestBody {
-    pub(crate) fn new(inner: Incoming, lease: Lease) -> Self {
+    pub(crate) fn new(inner: Incoming, lease: Lease, nominations: Vec<HeaderName>) -> Self {
         let empty = inner.is_end_stream();
         let body = Self {
             inner: Box::pin(inner),
             lease,
+            nominations,
             done: empty,
         };
         if empty {
@@ -329,7 +332,7 @@ impl Body for LeaseRequestBody {
         match self.inner.as_mut().poll_frame(context) {
             Poll::Ready(Some(Ok(mut frame))) => {
                 if let Some(trailers) = frame.trailers_mut() {
-                    if crate::http::headers::filter_trailers(trailers).is_err() {
+                    if crate::http::headers::filter_trailers(trailers, &self.nominations).is_err() {
                         self.lease.abort();
                         self.done = true;
                         return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
@@ -385,15 +388,17 @@ impl Drop for LeaseRequestBody {
 pub struct LeaseResponseBody {
     inner: Pin<Box<Incoming>>,
     lease: Lease,
+    nominations: Vec<HeaderName>,
     done: bool,
 }
 
 impl LeaseResponseBody {
-    pub(crate) fn new(inner: Incoming, lease: Lease) -> Self {
+    pub(crate) fn new(inner: Incoming, lease: Lease, nominations: Vec<HeaderName>) -> Self {
         let empty = inner.is_end_stream();
         let body = Self {
             inner: Box::pin(inner),
             lease,
+            nominations,
             done: empty,
         };
         if empty {
@@ -421,7 +426,7 @@ impl Body for LeaseResponseBody {
             Poll::Ready(Some(Ok(frame))) => {
                 let mut frame = frame;
                 if let Some(trailers) = frame.trailers_mut() {
-                    if crate::http::headers::filter_trailers(trailers).is_err() {
+                    if crate::http::headers::filter_trailers(trailers, &self.nominations).is_err() {
                         self.lease.abort();
                         self.done = true;
                         return Poll::Ready(Some(Err(Box::new(std::io::Error::other(

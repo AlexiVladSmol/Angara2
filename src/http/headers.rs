@@ -25,7 +25,7 @@ const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection")
 const PROXY_AUTHENTICATION_INFO: HeaderName = HeaderName::from_static("proxy-authentication-info");
 
 /// Parses all Connection/Proxy-Connection nominations and removes hop-by-hop fields.
-pub fn filter_hop_by_hop(headers: &mut HeaderMap, request: bool) -> Result<(), ()> {
+pub fn filter_hop_by_hop(headers: &mut HeaderMap, request: bool) -> Result<Vec<HeaderName>, ()> {
     let mut nominated = Vec::new();
     for name in [CONNECTION, PROXY_CONNECTION] {
         for value in headers.get_all(name) {
@@ -40,7 +40,7 @@ pub fn filter_hop_by_hop(headers: &mut HeaderMap, request: bool) -> Result<(), (
         }
     }
 
-    for name in nominated {
+    for name in &nominated {
         headers.remove(name);
     }
     for name in [
@@ -62,7 +62,7 @@ pub fn filter_hop_by_hop(headers: &mut HeaderMap, request: bool) -> Result<(), (
         headers.remove(PROXY_AUTHENTICATE);
         headers.remove(PROXY_AUTHENTICATION_INFO);
     }
-    Ok(())
+    Ok(nominated)
 }
 
 /// Validates request/response framing before hyper's normalized body is used.
@@ -108,22 +108,9 @@ pub fn validate_framing(headers: &HeaderMap) -> Result<(), ()> {
     Ok(())
 }
 
-/// Returns true when a field name is nominated by Connection/Proxy-Connection.
-pub fn is_nominated(headers: &HeaderMap, name: &str) -> bool {
-    [CONNECTION, PROXY_CONNECTION].iter().any(|header| {
-        headers.get_all(header).iter().any(|value| {
-            value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case(name))
-            })
-        })
-    })
-}
-
 /// Removes fields that must not appear in trailers.
-pub fn filter_trailers(headers: &mut HeaderMap) -> Result<(), ()> {
-    let mut nominated = Vec::new();
+pub fn filter_trailers(headers: &mut HeaderMap, nominated: &[HeaderName]) -> Result<(), ()> {
+    let mut all_nominated = nominated.to_vec();
     for value in headers.get_all(CONNECTION) {
         let value = value.to_str().map_err(|_| ())?;
         for token in value.split(',') {
@@ -131,15 +118,16 @@ pub fn filter_trailers(headers: &mut HeaderMap) -> Result<(), ()> {
             if token.is_empty() {
                 return Err(());
             }
-            nominated.push(HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?);
+            all_nominated.push(HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?);
         }
     }
-    for name in nominated {
+    for name in all_nominated {
         headers.remove(name);
     }
     for name in [
         CONNECTION,
         CONTENT_LENGTH,
+        EXPECT,
         HOST,
         TE,
         TRAILER,
@@ -149,8 +137,11 @@ pub fn filter_trailers(headers: &mut HeaderMap) -> Result<(), ()> {
         PROXY_AUTHORIZATION,
         PROXY_AUTHENTICATE,
         PROXY_AUTHENTICATION_INFO,
+        WWW_AUTHENTICATE,
         VIA,
         MAX_FORWARDS,
+        KEEP_ALIVE,
+        PROXY_CONNECTION,
     ] {
         headers.remove(name);
     }
@@ -286,7 +277,7 @@ pub fn response_has_body(method: &Method, status: StatusCode) -> bool {
 ///
 /// Forbidden framing, routing, authentication and control fields are removed;
 /// a malformed token list is rejected.
-pub fn trailer_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, ()> {
+pub fn trailer_names(headers: &HeaderMap, nominated: &[HeaderName]) -> Result<Vec<HeaderName>, ()> {
     let mut names = Vec::new();
     for value in headers.get_all(TRAILER) {
         let value = value.to_str().map_err(|_| ())?;
@@ -296,7 +287,8 @@ pub fn trailer_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, ()> {
                 return Err(());
             }
             let name = HeaderName::from_bytes(token.as_bytes()).map_err(|_| ())?;
-            if !is_forbidden_trailer(&name) && !names.contains(&name) {
+            if !is_forbidden_trailer(&name) && !nominated.contains(&name) && !names.contains(&name)
+            {
                 names.push(name);
             }
         }

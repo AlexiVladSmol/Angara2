@@ -172,6 +172,62 @@ fn m03_http02_keepalive_sequential_and_pipelined_are_ordered() {
 }
 
 #[test]
+fn m03_http02_pipelined_interim_cannot_split_previous_body() {
+    runtime().block_on(async {
+        const FIRST_BODY: usize = 128 * 1024;
+        let origin = spawn_origin(|request, _| {
+            if request.target == "/first/large" {
+                response("200 OK", &[("X-Part", "first")], &vec![b'X'; FIRST_BODY])
+            } else {
+                assert_eq!(request.body, b"abc");
+                response("200 OK", &[("X-Part", "second")], b"second")
+            }
+        })
+        .await
+        .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+
+        let mut bytes = format!(
+            "GET http://{}/first/large HTTP/1.1\r\nHost: {}\r\n\r\n",
+            origin.address, origin.address
+        )
+        .into_bytes();
+        bytes.extend_from_slice(
+            format!(
+                "POST http://{}/second HTTP/1.1\r\nHost: {}\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+                origin.address, origin.address
+            )
+            .as_bytes(),
+        );
+        client.send(&bytes).await.expect("send pipelined requests");
+
+        let first = client.read_response().await.expect("read first response");
+        assert_eq!(first.head.status, 200);
+        assert!(
+            first.interim.is_empty(),
+            "second request interim appeared before the first final body: {:?}",
+            first.interim
+        );
+        assert_eq!(first.body.len(), FIRST_BODY);
+        assert!(first.body.iter().all(|byte| *byte == b'X'));
+
+        let continue_head = client.read_head().await.expect("read second 100");
+        assert_eq!(continue_head.status, 100);
+        client.send(b"abc").await.expect("send second body");
+        let second = client.read_response().await.expect("read second response");
+        assert_eq!(second.head.status, 200);
+        assert_eq!(second.text(), "second");
+        assert!(
+            second.interim.iter().all(|head| head.status != 100),
+            "second request received a duplicate 100: {:?}",
+            second.interim
+        );
+        server.shutdown().await;
+    });
+}
+
+#[test]
 fn m03_http02_trailers_are_forwarded_and_filtered() {
     runtime().block_on(async {
         let origin = spawn_origin(|request, _| {
@@ -315,6 +371,79 @@ fn m03_http03_hop_by_hop_and_proxy_credentials_are_removed() {
 }
 
 #[test]
+fn m03_http03_connection_nominations_filter_same_message_trailers() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| {
+            assert!(
+                request.header("x-local").is_none(),
+                "nominated request header reached origin"
+            );
+            assert!(
+                request
+                    .trailers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("x-local")),
+                "nominated request trailer reached origin: {:?}",
+                request.trailers
+            );
+            assert!(
+                request
+                    .trailers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("x-checksum") && value == "upload-ok")
+            );
+            chunked_response(
+                "200 OK",
+                &[
+                    ("Connection", "X-Local"),
+                    ("Trailer", "X-Local, X-Checksum"),
+                ],
+                &[b"ok"],
+                &[("X-Local", "hop-only-secret"), ("X-Checksum", "download-ok")],
+            )
+        })
+        .await
+        .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        let mut bytes = format!(
+            "POST http://{}/nominations HTTP/1.1\r\nHost: {}\r\nConnection: X-Local\r\nTrailer: X-Local, X-Checksum\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\n\r\n",
+            origin.address, origin.address
+        )
+        .into_bytes();
+        bytes.extend_from_slice(
+            b"2\r\nok\r\n0\r\nX-Local: hop-only-secret\r\nX-Checksum: upload-ok\r\n\r\n",
+        );
+        client.send(&bytes).await.expect("send chunked request");
+        let response = client.read_response().await.expect("read response");
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.text(), "ok");
+        assert!(
+            response
+                .trailers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("x-local")),
+            "nominated response trailer leaked: {:?}",
+            response.trailers
+        );
+        assert!(
+            response
+                .trailers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-checksum") && value == "download-ok")
+        );
+        assert!(
+            response
+                .header("trailer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("x-checksum")),
+            "Trailer announcement was not sanitized: {:?}",
+            response.header("trailer")
+        );
+        server.shutdown().await;
+    });
+}
+
+#[test]
 fn m03_http04_expect_continue_is_local_and_ordered() {
     runtime().block_on(async {
         let origin = spawn_origin(|request, _| {
@@ -338,8 +467,50 @@ fn m03_http04_expect_continue_is_local_and_ordered() {
         let response = client.read_response().await.expect("read final");
         assert_eq!(response.head.status, 200);
         assert_eq!(response.text(), "received");
+        assert!(
+            response
+                .interim
+                .iter()
+                .all(|head| head.status != 100),
+            "a second 100 Continue was forwarded: {:?}",
+            response.interim
+        );
         assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::Acquire), 1);
 
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_http04_expect_with_immediate_body_has_one_hundred() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| {
+            assert_eq!(request.body, b"abc");
+            response("200 OK", &[], b"ok")
+        })
+        .await
+        .expect("start origin");
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        let mut bytes = format!(
+            "POST http://{}/expect-immediate HTTP/1.1\r\nHost: {}\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+            origin.address, origin.address
+        )
+        .into_bytes();
+        bytes.extend_from_slice(b"abc");
+        client.send(&bytes).await.expect("send request and body");
+        let response = client.read_response().await.expect("read response");
+        assert_eq!(response.head.status, 200);
+        assert_eq!(
+            response
+                .interim
+                .iter()
+                .filter(|head| head.status == 100)
+                .count(),
+            1,
+            "immediate body must receive exactly one 100, got {:?}",
+            response.interim
+        );
         server.shutdown().await;
     });
 }
@@ -733,6 +904,58 @@ fn m03_http01_large_binary_upload_and_download_stream() {
         let mut expected = upload;
         expected.reverse();
         assert_eq!(response.body, expected);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_cpu01_http_work_uses_multiple_workers() {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build four-worker runtime");
+    runtime.block_on(async {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_active = std::sync::Arc::clone(&active);
+        let handler_maximum = std::sync::Arc::clone(&maximum);
+        let origin = spawn_origin(move |_, _| {
+            let current = handler_active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            handler_maximum.fetch_max(current, std::sync::atomic::Ordering::AcqRel);
+            std::thread::sleep(Duration::from_millis(150));
+            handler_active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            response("200 OK", &[], b"cpu")
+        })
+        .await
+        .expect("start origin");
+        let text = proxy_config().replace("worker_threads = 2", "worker_threads = 4");
+        let (server, proxy) = start_proxy(&text).await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let mut client = RawClient::connect(proxy).await.expect("connect client");
+            client
+                .send(&request("GET", origin.address, "/cpu", &[], b""))
+                .await
+                .expect("send request");
+            tasks.push(tokio::spawn(async move {
+                client
+                    .read_response()
+                    .await
+                    .expect("read response")
+                    .head
+                    .status
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.expect("join client"), 200);
+        }
+        assert!(
+            maximum.load(std::sync::atomic::Ordering::Acquire) >= 2,
+            "HTTP work did not overlap on more than one worker: max={}",
+            maximum.load(std::sync::atomic::Ordering::Acquire)
+        );
         server.shutdown().await;
     });
 }

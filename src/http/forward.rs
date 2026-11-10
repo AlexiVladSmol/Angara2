@@ -46,6 +46,7 @@ pub struct Proxy {
     config: Arc<Config>,
     outbound: OutboundService,
     pool: Arc<OriginPool>,
+    origin_tasks: Arc<crate::http::OriginTasks>,
     draining: Arc<AtomicBool>,
 }
 
@@ -58,6 +59,7 @@ impl Proxy {
             config,
             outbound,
             pool,
+            origin_tasks: crate::http::OriginTasks::new(),
             draining: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -75,6 +77,7 @@ impl Proxy {
             config,
             outbound,
             pool,
+            origin_tasks: crate::http::OriginTasks::new(),
             draining: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -90,6 +93,16 @@ impl Proxy {
     /// Removes expired idle origin sockets.
     pub fn purge_pool(&self) {
         self.pool.purge_expired();
+    }
+
+    /// Reaps finished origin driver tasks.
+    pub async fn reap_origin_tasks(&self) {
+        self.origin_tasks.reap().await;
+    }
+
+    /// Aborts and awaits all origin drivers.
+    pub async fn shutdown_origins(&self, timeout: std::time::Duration) -> bool {
+        self.origin_tasks.shutdown(timeout).await
     }
 
     /// Whether new exchanges must be refused.
@@ -163,18 +176,13 @@ impl Proxy {
             return headers::error_response(StatusCode::BAD_REQUEST, true);
         }
 
-        let expect_continue = match headers::expect_continue(request.headers()) {
+        let _expect_continue = match headers::expect_continue(request.headers()) {
             Ok(value) => value,
             Err(()) => return headers::error_response(StatusCode::EXPECTATION_FAILED, true),
         };
         let request_had_content_length = request.headers().contains_key(CONTENT_LENGTH);
-        let request_trailer_names = match headers::trailer_names(request.headers()) {
-            Ok(names) => names,
-            Err(()) => return headers::error_response(StatusCode::BAD_REQUEST, true),
-        };
         let request_accepts_trailers = headers::accepts_trailers(request.headers());
-        let request_trailer_nominated = headers::is_nominated(request.headers(), "trailer");
-        let request_te_nominated = headers::is_nominated(request.headers(), "te");
+        let original_request_headers = request.headers().clone();
         let max_forwards = if method == Method::OPTIONS {
             match headers::max_forwards(request.headers()) {
                 Ok(value) => value,
@@ -212,9 +220,17 @@ impl Proxy {
         }
 
         let mut request_headers = request.headers().clone();
-        if headers::filter_hop_by_hop(&mut request_headers, true).is_err() {
-            return headers::error_response(StatusCode::BAD_REQUEST, true);
-        }
+        let request_nominations = match headers::filter_hop_by_hop(&mut request_headers, true) {
+            Ok(names) => names,
+            Err(()) => return headers::error_response(StatusCode::BAD_REQUEST, true),
+        };
+        let request_trailer_names =
+            match headers::trailer_names(&original_request_headers, &request_nominations) {
+                Ok(names) => names,
+                Err(()) => return headers::error_response(StatusCode::BAD_REQUEST, true),
+            };
+        let request_trailer_nominated = request_nominations.contains(&http::header::TRAILER);
+        let request_te_nominated = request_nominations.contains(&http::header::TE);
         headers::set_canonical_host(&mut request_headers, &target);
         headers::remove_expect(&mut request_headers);
         if !request_trailer_nominated {
@@ -255,17 +271,12 @@ impl Proxy {
             return headers::error_response(StatusCode::GATEWAY_TIMEOUT, true);
         }
 
-        if expect_continue && !interim.send_continue() {
-            lease.abort();
-            return headers::error_response(StatusCode::BAD_GATEWAY, true);
-        }
-
         let body = request.into_body();
         let body_length = body.size_hint().exact();
         if request_had_content_length && let Some(length) = body_length {
             headers::set_content_length(&mut request_headers, length);
         }
-        let request_body = LeaseRequestBody::new(body, lease.clone()).boxed();
+        let request_body = LeaseRequestBody::new(body, lease.clone(), request_nominations).boxed();
         let origin_form = if method == Method::OPTIONS && uri.path() == "/" && uri.query().is_none()
         {
             "*"
@@ -313,20 +324,25 @@ impl Proxy {
                     return headers::error_response(StatusCode::BAD_GATEWAY, true);
                 }
                 let original_headers = response.headers().clone();
-                let response_trailer_names = match headers::trailer_names(&original_headers) {
-                    Ok(names) => names,
-                    Err(()) => {
-                        lease.abort();
-                        return headers::error_response(StatusCode::BAD_GATEWAY, true);
-                    }
-                };
-                let response_trailer_nominated =
-                    headers::is_nominated(&original_headers, "trailer");
                 let mut response_headers = original_headers.clone();
-                if headers::filter_hop_by_hop(&mut response_headers, false).is_err() {
-                    lease.abort();
-                    return headers::error_response(StatusCode::BAD_GATEWAY, true);
-                }
+                let response_nominations =
+                    match headers::filter_hop_by_hop(&mut response_headers, false) {
+                        Ok(names) => names,
+                        Err(()) => {
+                            lease.abort();
+                            return headers::error_response(StatusCode::BAD_GATEWAY, true);
+                        }
+                    };
+                let response_trailer_names =
+                    match headers::trailer_names(&original_headers, &response_nominations) {
+                        Ok(names) => names,
+                        Err(()) => {
+                            lease.abort();
+                            return headers::error_response(StatusCode::BAD_GATEWAY, true);
+                        }
+                    };
+                let response_trailer_nominated =
+                    response_nominations.contains(&http::header::TRAILER);
                 headers::append_via(&mut response_headers);
                 if request_chunked {
                     // Hyper normalizes CL+TE to TE before the service runs.
@@ -349,7 +365,8 @@ impl Proxy {
                 } else if status != StatusCode::NO_CONTENT {
                     headers::keep_representation_length(&mut response_headers, &original_headers);
                 }
-                let body = LeaseResponseBody::new(response_body, lease).boxed();
+                let body =
+                    LeaseResponseBody::new(response_body, lease, response_nominations).boxed();
                 let mut local = Response::new(body);
                 *local.status_mut() = status;
                 *local.version_mut() = Version::HTTP_11;
@@ -384,9 +401,12 @@ impl Proxy {
             Ok(pair) => pair,
             Err(_) => return Err(OutboundError::ConnectFailed),
         };
-        let task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let task = self
+            .origin_tasks
+            .spawn(async move {
+                let _ = connection.await;
+            })
+            .await;
         Ok(self
             .pool
             .new_lease(plan, endpoint, PooledSender::new(sender, task)))

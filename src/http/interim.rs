@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use crate::http::ConnectionOutput;
 use crate::http::headers;
 use crate::http::idle::IdleState;
 
@@ -76,11 +77,6 @@ impl InterimSender {
         self.send_head(status, &headers)
     }
 
-    /// Sends the local 100 Continue head.
-    pub fn send_continue(&self) -> bool {
-        self.send_head(StatusCode::CONTINUE, &HeaderMap::new())
-    }
-
     /// Whether an interim send failed or an unsupported interim was seen.
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
@@ -127,6 +123,7 @@ pub struct SplitIo {
     read: OwnedReadHalf,
     write: DuplexStream,
     idle: IdleState,
+    output: Arc<ConnectionOutput>,
 }
 
 impl SplitIo {
@@ -134,6 +131,7 @@ impl SplitIo {
     pub fn new(
         stream: tokio::net::TcpStream,
         idle_timeout: Duration,
+        output: Arc<ConnectionOutput>,
     ) -> (Self, OwnedWriteHalf, DuplexStream) {
         let (read, write) = stream.into_split();
         let (bridge_writer, bridge_reader) = tokio::io::duplex(64 * 1024);
@@ -142,6 +140,7 @@ impl SplitIo {
                 read,
                 write: bridge_writer,
                 idle: IdleState::new(idle_timeout),
+                output,
             },
             write,
             bridge_reader,
@@ -190,6 +189,7 @@ impl AsyncWrite for SplitIo {
             Poll::Ready(Ok(written)) => {
                 if written > 0 {
                     this.idle.progress();
+                    this.output.produced(written);
                 }
                 Poll::Ready(Ok(written))
             }
@@ -211,7 +211,7 @@ impl AsyncWrite for SplitIo {
         let this = self.get_mut();
         match Pin::new(&mut this.write).poll_flush(context) {
             Poll::Ready(Ok(())) => {
-                this.idle.progress();
+                this.output.flushed();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -242,6 +242,7 @@ pub async fn writer_loop(
     mut hyper_output: DuplexStream,
     mut interim: mpsc::Receiver<Bytes>,
     idle_timeout: Duration,
+    output: Arc<ConnectionOutput>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut interim_open = true;
@@ -252,6 +253,7 @@ pub async fn writer_loop(
                 match maybe_interim {
                     Some(bytes) => {
                         write_all_bounded(&mut socket, &bytes, idle_timeout).await?;
+                        output.consumed(bytes.len());
                     }
                     None => interim_open = false,
                 }
@@ -262,12 +264,7 @@ pub async fn writer_loop(
                     break;
                 }
                 write_all_bounded(&mut socket, &buffer[..read], idle_timeout).await?;
-            }
-            _ = tokio::time::sleep(idle_timeout) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "idle client connection",
-                ));
+                output.consumed(read);
             }
         }
     }
@@ -280,11 +277,24 @@ async fn write_all_bounded(
     bytes: &[u8],
     idle_timeout: Duration,
 ) -> io::Result<()> {
-    match tokio::time::timeout(idle_timeout, socket.write_all(bytes)).await {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "idle client write timeout",
-        )),
+    let mut written = 0;
+    while written < bytes.len() {
+        match tokio::time::timeout(idle_timeout, socket.write(&bytes[written..])).await {
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "client socket stopped accepting bytes",
+                ));
+            }
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "idle client write timeout",
+                ));
+            }
+        }
     }
+    Ok(())
 }

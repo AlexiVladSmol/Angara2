@@ -157,6 +157,69 @@ fn m03_res01_response_header_timeout_is_504() {
 }
 
 #[test]
+fn m03_res01_slow_upload_with_progress_survives_idle_timeout() {
+    runtime().block_on(async {
+        let origin = spawn_origin(|request, _| {
+            assert_eq!(request.body.len(), 20_000);
+            response("200 OK", &[], b"uploaded")
+        })
+        .await
+        .expect("start origin");
+        let text = proxy_config()
+            .replace("idle_timeout_ms = 5000", "idle_timeout_ms = 1000")
+            .replace(
+                "response_header_timeout_ms = 5000",
+                "response_header_timeout_ms = 10000",
+            );
+        let (server, proxy) = start_proxy(&text).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        let head = format!(
+            "POST http://{}/slow-upload HTTP/1.1\r\nHost: {}\r\nContent-Length: 20000\r\n\r\n",
+            origin.address, origin.address
+        );
+        client.send(head.as_bytes()).await.expect("send head");
+        let chunk = vec![b'u'; 1000];
+        for _ in 0..20 {
+            client.send(&chunk).await.expect("send chunk");
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        let response = client.read_response().await.expect("read upload response");
+        assert_eq!(response.head.status, 200);
+        assert_eq!(response.text(), "uploaded");
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m03_res02_first_chunk_reaches_client_before_body_end() {
+    runtime().block_on(async {
+        let origin = spawn_stream_origin(
+            vec![
+                (Duration::from_millis(10), b"first".to_vec()),
+                (Duration::from_millis(1000), b"second".to_vec()),
+            ],
+            None,
+        )
+        .await;
+        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(&request("GET", origin, "/stream", &[], b""))
+            .await
+            .expect("send request");
+        let head = client.read_head().await.expect("read stream head");
+        assert_eq!(head.status, 200);
+        let first = tokio::time::timeout(Duration::from_millis(800), client.read_chunked_chunk())
+            .await
+            .expect("first chunk did not arrive before the final body")
+            .expect("read first chunk")
+            .expect("first chunk missing");
+        assert_eq!(first, b"first");
+        server.shutdown().await;
+    });
+}
+
+#[test]
 fn m03_res01_regular_sse_progress_beats_idle_timeout() {
     runtime().block_on(async {
         let mut chunks = Vec::new();

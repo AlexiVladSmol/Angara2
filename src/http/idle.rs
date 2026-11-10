@@ -119,10 +119,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for IdleIo<T> {
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_flush(context) {
-            Poll::Ready(Ok(())) => {
-                this.idle.progress();
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => {
                 if this.idle.poll_expired(context).is_ready() {

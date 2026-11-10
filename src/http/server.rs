@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::http::forward::{ClientInfo, Proxy};
 use crate::http::headers;
 use crate::http::interim::{InterimHub, SplitIo, writer_loop};
-use crate::http::{ExchangeBody, ResponseBody};
+use crate::http::{ConnectionOutput, ExchangeBody, ResponseBody};
 use http_body_util::BodyExt;
 
 /// HTTP server startup error.
@@ -167,6 +167,7 @@ impl HttpServer {
             self.tasks.abort_all();
             let _ = self.tasks.wait(Duration::from_secs(1)).await;
         }
+        let _ = self._proxy.shutdown_origins(Duration::from_secs(1)).await;
     }
 }
 
@@ -194,7 +195,10 @@ async fn pool_maintenance(
             biased;
             _ = drain.changed() => break,
             _ = force.changed() => break,
-            _ = ticker.tick() => proxy.purge_pool(),
+            _ = ticker.tick() => {
+                proxy.purge_pool();
+                proxy.reap_origin_tasks().await;
+            }
         }
     }
 }
@@ -270,7 +274,9 @@ async fn serve_client(
 ) {
     let _client_permit = permit;
     let idle_timeout = config.limits().idle_timeout();
-    let (io, write_half, bridge_reader) = SplitIo::new(stream, idle_timeout);
+    let output = ConnectionOutput::new();
+    let release_task = tokio::spawn(Arc::clone(&output).release_loop());
+    let (io, write_half, bridge_reader) = SplitIo::new(stream, idle_timeout, Arc::clone(&output));
     let (hub, interim_receiver) = InterimHub::new();
     let client = ClientInfo {
         peer: peer.ip(),
@@ -278,11 +284,13 @@ async fn serve_client(
     };
     let service_hub = hub.clone();
     let exchange_gate = Arc::new(Semaphore::new(1));
+    let service_output = Arc::clone(&output);
     let service = service_fn(move |request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
         let interim = service_hub.begin();
         let exchange_gate = Arc::clone(&exchange_gate);
+        let service_output = Arc::clone(&service_output);
         async move {
             let Ok(permit) = exchange_gate.acquire_owned().await else {
                 return Ok::<_, Infallible>(headers::error_response(
@@ -292,7 +300,7 @@ async fn serve_client(
             };
             let response = proxy.handle(request, client, interim).await;
             let (parts, body) = response.into_parts();
-            let body: ResponseBody = ExchangeBody::new(body, permit).boxed();
+            let body: ResponseBody = ExchangeBody::new(body, permit, service_output).boxed();
             Ok(http::Response::from_parts(parts, body))
         }
     });
@@ -306,7 +314,13 @@ async fn serve_client(
         .max_buf_size(crate::http::forward::connection_buffer_size(&config))
         .timer(TokioTimer::new());
     let connection = builder.serve_connection(TokioIo::new(io), service);
-    let writer = writer_loop(write_half, bridge_reader, interim_receiver, idle_timeout);
+    let writer = writer_loop(
+        write_half,
+        bridge_reader,
+        interim_receiver,
+        idle_timeout,
+        Arc::clone(&output),
+    );
     let mut connection = Box::pin(connection);
     let mut writer = Box::pin(writer);
 
@@ -331,12 +345,16 @@ async fn serve_client(
                 drop(connection);
                 let _ = &mut writer.await;
                 drop(hub);
+                output.close();
+                release_task.abort();
                 return;
             }
             result = &mut writer => {
                 let _ = result;
                 drop(connection);
                 drop(hub);
+                output.close();
+                release_task.abort();
                 return;
             }
         }
@@ -344,6 +362,8 @@ async fn serve_client(
     drop(connection);
     drop(writer);
     drop(hub);
+    output.close();
+    release_task.abort();
 }
 
 #[derive(Clone)]
@@ -400,18 +420,11 @@ impl TaskTracker {
     }
 
     fn abort_all(&self) {
-        let handles = if let Ok(mut registry) = self.inner.lock() {
+        if let Ok(mut registry) = self.inner.lock() {
             registry.stopped = true;
-            registry
-                .handles
-                .drain()
-                .map(|(_, handle)| handle)
-                .collect::<Vec<_>>()
-        } else {
-            return;
-        };
-        for handle in handles {
-            handle.abort();
+            for handle in registry.handles.values() {
+                handle.abort();
+            }
         }
         self.notify.notify_one();
     }

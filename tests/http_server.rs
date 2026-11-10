@@ -144,6 +144,86 @@ fn m03_srv01_shutdown_is_bounded_and_releases_ports() {
     });
 }
 
+#[test]
+fn m03_srv02_shutdown_closes_active_origin_before_return() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let origin_address = origin.local_addr().expect("origin address");
+    let (stream_tx, stream_rx) = mpsc::channel();
+    let (hold_tx, hold_rx) = mpsc::channel::<()>();
+    let origin_thread = thread::spawn(move || {
+        let (mut stream, _) = origin.accept().expect("accept proxy");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("origin read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).expect("read proxy request");
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n")
+            .expect("write first chunk");
+        stream.flush().expect("flush first chunk");
+        stream_tx
+            .send(stream.try_clone().expect("clone origin stream"))
+            .expect("send origin stream");
+        let _ = hold_rx.recv_timeout(Duration::from_secs(5));
+    });
+
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    runtime.block_on(async {
+        let text = config("127.0.0.1:3128")
+            .replace("shutdown_timeout_ms = 2000", "shutdown_timeout_ms = 1");
+        let (server, proxy) = start_proxy(&text).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(&request("GET", origin_address, "/active", &[], b""))
+            .await
+            .expect("send request");
+        let head = client.read_head().await.expect("read response head");
+        assert_eq!(head.status, 200);
+        let origin_stream = stream_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("origin accepted request");
+
+        server.shutdown().await;
+
+        origin_stream
+            .set_nonblocking(true)
+            .expect("nonblocking origin stream");
+        let mut byte = [0_u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match origin_stream.try_clone().expect("clone").read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "shutdown returned before the origin socket closed"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("origin read failed: {error}"),
+            }
+        }
+    });
+    drop(hold_tx);
+    origin_thread.join().expect("origin thread");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn m03_srv01_ipv4_and_ipv6_wildcards_share_a_port_with_v6only() {
