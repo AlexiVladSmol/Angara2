@@ -205,6 +205,57 @@ impl fmt::Display for OutboundError {
 
 impl std::error::Error for OutboundError {}
 
+/// A fully authorized outbound plan created by the policy path.
+///
+/// The plan may be handed to the pool only after fresh ACL/DNS/IP checks. It
+/// contains no unchecked constructor for callers outside the crate path.
+#[derive(Clone, Debug)]
+pub struct OutboundPlan {
+    target: CanonicalTarget,
+    egress: crate::config::EgressProfile,
+    matched_rule_id: String,
+    endpoints: Vec<SocketAddr>,
+    generation: u64,
+    deadline: Instant,
+}
+
+impl OutboundPlan {
+    /// Canonical target for this request.
+    pub fn target(&self) -> &CanonicalTarget {
+        &self.target
+    }
+
+    /// Selected egress profile ID.
+    pub fn egress_id(&self) -> &str {
+        self.egress.id()
+    }
+
+    /// Matched pre-DNS rule ID.
+    pub fn matched_rule_id(&self) -> &str {
+        &self.matched_rule_id
+    }
+
+    /// Allowed endpoints in resolver order after IP and family checks.
+    pub fn endpoints(&self) -> &[SocketAddr] {
+        &self.endpoints
+    }
+
+    /// Configuration generation used for the whole request.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Absolute authorization/DNS/connect deadline.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether the authorization/DNS/connect deadline has elapsed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
 /// Composed target → source → ACL → routing → DNS → IP policy → dial pipeline.
 ///
 /// Clones share the same resolver, dialer and resource budgets.
@@ -257,6 +308,24 @@ impl OutboundService {
         request_target: &str,
         host_header: Option<&str>,
     ) -> Result<Connected, OutboundError> {
+        let plan = self
+            .prepare_outbound(context, method, request_target, host_header)
+            .await?;
+        self.open_plan(&plan).await
+    }
+
+    /// Performs target, source, request ACL, routing, DNS and IP policy checks.
+    ///
+    /// The returned plan contains only endpoints allowed for this request. It
+    /// does not consume an outbound connection permit; a pool hit may reuse an
+    /// existing permitted socket.
+    pub async fn prepare_outbound(
+        &self,
+        context: &RequestContext,
+        method: &Method,
+        request_target: &str,
+        host_header: Option<&str>,
+    ) -> Result<OutboundPlan, OutboundError> {
         let deadline = Instant::now() + self.config.transport().total_timeout();
 
         let target = CanonicalTarget::parse(method, request_target)
@@ -277,14 +346,10 @@ impl OutboundService {
         let matched_rule_id = matched_rule.id().to_owned();
 
         let egress = routing::select_egress(self.config.routing(), self.config.egress(), &meta)
-            .map_err(map_routing)?;
+            .map_err(map_routing)?
+            .clone();
 
         check_deadline(deadline)?;
-        let outbound_permit = self
-            .outbound_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| OutboundError::OutboundBusy)?;
 
         let addresses = match target.host() {
             Host::Ip(ip) => vec![*ip],
@@ -310,7 +375,7 @@ impl OutboundService {
             return Err(OutboundError::DestinationDenied);
         }
 
-        let compatible = allowed
+        let endpoints = allowed
             .into_iter()
             .filter_map(|ip| {
                 let compatible = match egress.mode() {
@@ -321,18 +386,38 @@ impl OutboundService {
             })
             .collect::<Vec<_>>();
         check_deadline(deadline)?;
-        if compatible.is_empty() {
+        if endpoints.is_empty() {
             return Err(OutboundError::NoCompatibleAddress);
         }
 
-        let attempts = compatible
+        Ok(OutboundPlan {
+            target,
+            egress,
+            matched_rule_id,
+            endpoints,
+            generation: self.generation,
+            deadline,
+        })
+    }
+
+    /// Opens a new checked connection for an authorized plan.
+    pub async fn open_plan(&self, plan: &OutboundPlan) -> Result<Connected, OutboundError> {
+        check_deadline(plan.deadline)?;
+        let outbound_permit = self
+            .outbound_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OutboundError::OutboundBusy)?;
+
+        let attempts = plan
+            .endpoints
             .len()
             .min(self.config.transport().max_connect_attempts());
         let mut last_error = None;
-        for endpoint in compatible.into_iter().take(attempts) {
-            check_deadline(deadline)?;
+        for endpoint in plan.endpoints.iter().copied().take(attempts) {
+            check_deadline(plan.deadline)?;
             let now = Instant::now();
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = plan.deadline.saturating_duration_since(now);
             if remaining.is_zero() {
                 return Err(OutboundError::TotalTimeout);
             }
@@ -345,12 +430,12 @@ impl OutboundService {
 
             match self
                 .dialer
-                .connect(endpoint, egress, attempt_deadline)
+                .connect(endpoint, &plan.egress, attempt_deadline)
                 .await
             {
                 Ok(stream) => {
                     drop(connecting_permit);
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= plan.deadline {
                         return Err(OutboundError::TotalTimeout);
                     }
                     return Ok(Connected {
@@ -358,27 +443,27 @@ impl OutboundService {
                         _permit: outbound_permit,
                         endpoint: AuthorizedEndpoint {
                             endpoint,
-                            target,
-                            egress_id: egress.id().to_owned(),
-                            matched_rule_id,
-                            generation: self.generation,
+                            target: plan.target.clone(),
+                            egress_id: plan.egress_id().to_owned(),
+                            matched_rule_id: plan.matched_rule_id.clone(),
+                            generation: plan.generation,
                         },
                     });
                 }
                 Err(DialError::BindFailed) => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= plan.deadline {
                         return Err(OutboundError::TotalTimeout);
                     }
                     return Err(OutboundError::BindFailed);
                 }
                 Err(DialError::ConnectTimeout) => {
                     last_error = Some(OutboundError::ConnectTimeout);
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= plan.deadline {
                         return Err(OutboundError::TotalTimeout);
                     }
                 }
                 Err(DialError::ConnectFailed) => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= plan.deadline {
                         return Err(OutboundError::TotalTimeout);
                     }
                     last_error = Some(OutboundError::ConnectFailed);
@@ -390,7 +475,7 @@ impl OutboundService {
             }
         }
 
-        check_deadline(deadline)?;
+        check_deadline(plan.deadline)?;
         Err(last_error.unwrap_or(OutboundError::ConnectFailed))
     }
 }

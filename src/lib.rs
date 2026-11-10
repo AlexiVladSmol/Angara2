@@ -1,11 +1,13 @@
 //! Angara proxy core library.
 //!
-//! M02 contains the CLI, strict configuration, canonical targets, source/ACL
-//! policy, bounded system DNS, egress routing and checked TCP connect. No HTTP
-//! forwarding, CONNECT tunnel, TLS or auth code exists yet.
+//! M03 adds the HTTP/1.1 forward proxy: listeners, strict HTTP framing and
+//! header conversion, streaming bodies, Expect/1xx, trailers, a bounded origin
+//! connection pool and controlled shutdown. CONNECT, TLS and auth are later
+//! stages.
 
 pub mod cli;
 pub mod config;
+pub mod http;
 pub mod outbound;
 pub mod policy;
 pub mod resolver;

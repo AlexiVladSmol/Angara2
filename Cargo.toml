@@ -4,16 +4,22 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
-description = "Angara proxy — M02: strict config, ACL, targets, bounded DNS and egress transport"
+description = "Angara proxy — HTTP/1.1 forward proxy, strict config, ACL, DNS and egress transport"
 repository = "https://github.com/AlexeiSmol/Angara"
 
 [dependencies]
+bytes = "1"
 http = "1.5"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1.12", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 idna = "1.1"
 ipnet = "2.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_path_to_error = "0.1"
-tokio = { version = "1.54", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+socket2 = "0.6"
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "1.2", default-features = false, features = ["parse", "serde", "std"] }
 
 [lints.rust]

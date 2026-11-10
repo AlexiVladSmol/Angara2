@@ -56,11 +56,22 @@ fn cli_help_prints_usage_and_succeeds() {
     let stdout = stdout(&output);
     assert!(stdout.contains("Usage:"), "{stdout}");
     assert!(stdout.contains("check --config <path>"), "{stdout}");
+    assert!(
+        stdout.contains("Bind all listeners and run the HTTP/1.1 proxy"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("not implemented"), "{stdout}");
 }
 
 #[test]
 fn cli_check_accepts_examples_without_network() {
-    for (name, listeners) in [("minimal.toml", 1), ("multi-listener.toml", 3)] {
+    for (name, listeners) in [
+        ("minimal.toml", 1),
+        ("multi-listener.toml", 3),
+        ("m02-policy.toml", 1),
+        ("m02-egress-local.toml", 2),
+        ("m03-http-local.toml", 1),
+    ] {
         let path = example(name);
         let output = angara()
             .arg("check")
@@ -148,8 +159,177 @@ fn cli_check_rejects_invalid_utf8_file() {
 }
 
 #[test]
-fn cli_serve_reports_unavailable_proxy_with_exit_code_3() {
-    let path = example("minimal.toml");
+fn cli_serve_proxies_a_request_and_shuts_down() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local address")
+            .port()
+    }
+
+    let proxy_port = free_port();
+    let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let origin_port = origin.local_addr().expect("origin address").port();
+    let origin = Arc::new(origin);
+    let origin_thread = {
+        let origin = Arc::clone(&origin);
+        thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accept origin request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read origin request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("write origin response");
+        })
+    };
+
+    let dir = TempDir::new("cli-serve");
+    let text = format!(
+        r#"
+schema_version = 1
+
+[runtime]
+worker_threads = 1
+
+[limits]
+max_connections = 16
+max_client_connections = 8
+max_header_bytes = 32768
+header_read_timeout_ms = 2000
+idle_timeout_ms = 5000
+shutdown_timeout_ms = 2000
+
+[[listeners]]
+id = "proxy"
+bind = "127.0.0.1:{proxy_port}"
+transport = "http"
+
+[access]
+source_allow = ["127.0.0.0/8"]
+ip_default = "deny"
+
+[[access.rules]]
+id = "allow"
+action = "allow"
+
+[[access.ip_rules]]
+id = "loopback"
+action = "allow"
+networks = ["127.0.0.0/8"]
+allow_special = true
+"#
+    );
+    let path = dir.write("serve.toml", &text);
+
+    let mut child = angara()
+        .arg("serve")
+        .arg("--config")
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn angara serve");
+
+    let stderr = child.stderr.take().expect("serve stderr");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("listening:") {
+                let _ = ready_tx.send(line);
+            }
+        }
+    });
+    assert!(
+        ready_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "serve did not report readiness"
+    );
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect proxy");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    write!(
+        client,
+        "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write proxy request");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("read proxy response");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill -TERM failed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for serve") {
+                assert_eq!(status.code(), Some(0), "serve did not exit cleanly");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("serve did not stop after SIGTERM");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    origin_thread.join().expect("origin thread");
+}
+
+#[test]
+fn cli_serve_startup_failure_releases_all_listeners() {
+    use std::net::TcpListener;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local address")
+            .port()
+    }
+
+    let first = free_port();
+    let second = free_port();
+    let occupied = TcpListener::bind(("127.0.0.1", second)).expect("occupy second port");
+
+    let dir = TempDir::new("cli-serve-bind");
+    let listeners = format!(
+        "\n[[listeners]]\nid = \"first\"\nbind = \"127.0.0.1:{first}\"\ntransport = \"http\"\n\
+         \n[[listeners]]\nid = \"second\"\nbind = \"127.0.0.1:{second}\"\ntransport = \"http\"\n"
+    );
+    let path = dir.write("conflict.toml", &config_with(&listeners, "1"));
     let output = angara()
         .arg("serve")
         .arg("--config")
@@ -158,9 +338,13 @@ fn cli_serve_reports_unavailable_proxy_with_exit_code_3() {
         .expect("run angara");
 
     assert_eq!(status(&output), 3);
-    assert!(stdout(&output).is_empty());
     let error = stderr(&output);
-    assert!(error.contains("proxy ещё не реализован"), "{error}");
+    assert!(!error.contains("listening:"), "{error}");
+    assert!(!error.contains(&first.to_string()), "{error}");
+    assert!(!error.contains(&second.to_string()), "{error}");
+    drop(occupied);
+    TcpListener::bind(("127.0.0.1", first))
+        .expect("first listener must be released after a failed bind");
 }
 
 #[test]

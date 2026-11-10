@@ -75,6 +75,15 @@ const DEFAULT_TOTAL_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 3_000;
 const DEFAULT_CONNECT_ATTEMPTS: i64 = 3;
 const DEFAULT_CONNECTING_CAP: i64 = 32;
+const DEFAULT_HTTP_MAX_HEADERS: i64 = 100;
+const DEFAULT_HTTP_RESPONSE_HEADER_TIMEOUT_MS: i64 = 30_000;
+const DEFAULT_HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 15_000;
+const MAX_HTTP_MAX_HEADERS: i64 = 256;
+const MIN_HTTP_RESPONSE_HEADER_TIMEOUT_MS: i64 = 100;
+const MAX_HTTP_RESPONSE_HEADER_TIMEOUT_MS: i64 = 300_000;
+const MAX_HTTP_POOL_IDLE: i64 = 1_024;
+const MIN_HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 100;
+const MAX_HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 300_000;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -93,6 +102,7 @@ pub struct Config {
     access: AccessConfig,
     dns: DnsConfig,
     transport: TransportConfig,
+    http: HttpConfig,
     egress: Vec<EgressProfile>,
     routing: RoutingConfig,
 }
@@ -152,6 +162,11 @@ impl Config {
     /// Outbound connect limits.
     pub fn transport(&self) -> &TransportConfig {
         &self.transport
+    }
+
+    /// HTTP ingress, pool, and header limits.
+    pub fn http(&self) -> &HttpConfig {
+        &self.http
     }
 
     /// Validated egress profiles.
@@ -222,6 +237,7 @@ impl fmt::Display for WorkerThreads {
 #[derive(Debug)]
 pub struct Limits {
     max_connections: u32,
+    max_client_connections: u32,
     max_header_bytes: u32,
     header_read_timeout: Duration,
     idle_timeout: Duration,
@@ -232,6 +248,11 @@ impl Limits {
     /// Maximum accepted connections across all listeners.
     pub fn max_connections(&self) -> u32 {
         self.max_connections
+    }
+
+    /// Maximum accepted client sockets across all listeners.
+    pub fn max_client_connections(&self) -> u32 {
+        self.max_client_connections
     }
 
     /// Maximum bytes accepted in one HTTP header block.
@@ -537,6 +558,43 @@ impl TransportConfig {
     }
 }
 
+/// HTTP ingress, response, and origin-pool limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    max_headers: usize,
+    response_header_timeout: Duration,
+    pool_max_idle: usize,
+    pool_max_idle_per_key: usize,
+    pool_idle_timeout: Duration,
+}
+
+impl HttpConfig {
+    /// Maximum fields in each request/response/interim/trailer section.
+    pub fn max_headers(&self) -> usize {
+        self.max_headers
+    }
+
+    /// Time from starting upstream request headers to final response headers.
+    pub fn response_header_timeout(&self) -> Duration {
+        self.response_header_timeout
+    }
+
+    /// Maximum idle origin connections across the pool.
+    pub fn pool_max_idle(&self) -> usize {
+        self.pool_max_idle
+    }
+
+    /// Maximum idle origin connections per pool key.
+    pub fn pool_max_idle_per_key(&self) -> usize {
+        self.pool_max_idle_per_key
+    }
+
+    /// Maximum time a socket may remain idle in the pool.
+    pub fn pool_idle_timeout(&self) -> Duration {
+        self.pool_idle_timeout
+    }
+}
+
 /// One listener definition.
 ///
 /// This build supports only the `http` transport. An IPv6 listener is IPv6-only;
@@ -824,6 +882,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let access = validate_access(raw.access, &listener_ids)?;
     let dns = validate_dns(raw.dns)?;
     let transport = validate_transport(raw.transport, &limits)?;
+    let http = validate_http(raw.http, &limits)?;
     let (egress, routing) = validate_egress_routing(raw.egress, raw.routing, &listener_ids)?;
 
     Ok(Config {
@@ -836,6 +895,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         access,
         dns,
         transport,
+        http,
         egress,
         routing,
     })
@@ -847,6 +907,13 @@ fn validate_limits(raw: RawLimits) -> Result<Limits, ConfigError> {
         raw.max_connections,
         MIN_MAX_CONNECTIONS,
         i64::from(MAX_CONNECTIONS_LIMIT),
+    )?;
+    let max_client_connections = bounded_optional(
+        "limits.max_client_connections",
+        raw.max_client_connections,
+        MIN_MAX_CONNECTIONS,
+        i64::from(MAX_CONNECTIONS_LIMIT),
+        max_connections,
     )?;
     let max_header_bytes = bounded(
         "limits.max_header_bytes",
@@ -875,6 +942,7 @@ fn validate_limits(raw: RawLimits) -> Result<Limits, ConfigError> {
 
     Ok(Limits {
         max_connections: max_connections as u32,
+        max_client_connections: max_client_connections as u32,
         max_header_bytes: max_header_bytes as u32,
         header_read_timeout: Duration::from_millis(header_read_timeout_ms as u64),
         idle_timeout: Duration::from_millis(idle_timeout_ms as u64),
@@ -1279,6 +1347,70 @@ fn validate_transport(
     })
 }
 
+fn validate_http(raw: Option<RawHttp>, limits: &Limits) -> Result<HttpConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let max_headers = bounded_optional(
+        "http.max_headers",
+        raw.max_headers,
+        1,
+        MAX_HTTP_MAX_HEADERS,
+        DEFAULT_HTTP_MAX_HEADERS,
+    )?;
+    let response_header_timeout_ms = bounded_optional(
+        "http.response_header_timeout_ms",
+        raw.response_header_timeout_ms,
+        MIN_HTTP_RESPONSE_HEADER_TIMEOUT_MS,
+        MAX_HTTP_RESPONSE_HEADER_TIMEOUT_MS,
+        DEFAULT_HTTP_RESPONSE_HEADER_TIMEOUT_MS,
+    )?;
+
+    let max_connections = i64::from(limits.max_connections());
+    let max_pool_idle_limit = MAX_HTTP_POOL_IDLE.min(max_connections);
+    let default_pool_idle = 16.min(max_connections);
+    let pool_max_idle = bounded_optional(
+        "http.pool_max_idle",
+        raw.pool_max_idle,
+        0,
+        max_pool_idle_limit,
+        default_pool_idle,
+    )?;
+    let pool_max_idle_per_key = match raw.pool_max_idle_per_key {
+        None => {
+            if pool_max_idle == 0 {
+                0
+            } else {
+                2.min(pool_max_idle)
+            }
+        }
+        Some(value) if pool_max_idle == 0 => {
+            if value == 0 {
+                0
+            } else {
+                return Err(validation(
+                    "http.pool_max_idle_per_key",
+                    "must be 0 when http.pool_max_idle is 0",
+                ));
+            }
+        }
+        Some(value) => bounded("http.pool_max_idle_per_key", value, 1, pool_max_idle)?,
+    };
+    let pool_idle_timeout_ms = bounded_optional(
+        "http.pool_idle_timeout_ms",
+        raw.pool_idle_timeout_ms,
+        MIN_HTTP_POOL_IDLE_TIMEOUT_MS,
+        MAX_HTTP_POOL_IDLE_TIMEOUT_MS,
+        DEFAULT_HTTP_POOL_IDLE_TIMEOUT_MS,
+    )?;
+
+    Ok(HttpConfig {
+        max_headers: max_headers as usize,
+        response_header_timeout: Duration::from_millis(response_header_timeout_ms as u64),
+        pool_max_idle: pool_max_idle as usize,
+        pool_max_idle_per_key: pool_max_idle_per_key as usize,
+        pool_idle_timeout: Duration::from_millis(pool_idle_timeout_ms as u64),
+    })
+}
+
 fn validate_egress_routing(
     raw_egress: Option<Vec<RawEgress>>,
     raw_routing: Option<RawRouting>,
@@ -1533,6 +1665,8 @@ struct RawConfig {
     #[serde(default)]
     transport: Option<RawTransport>,
     #[serde(default)]
+    http: Option<RawHttp>,
+    #[serde(default)]
     egress: Option<Vec<RawEgress>>,
     #[serde(default)]
     routing: Option<RawRouting>,
@@ -1548,6 +1682,8 @@ struct RawRuntime {
 #[serde(deny_unknown_fields)]
 struct RawLimits {
     max_connections: i64,
+    #[serde(default)]
+    max_client_connections: Option<i64>,
     max_header_bytes: i64,
     header_read_timeout_ms: i64,
     idle_timeout_ms: i64,
@@ -1626,6 +1762,21 @@ struct RawTransport {
     max_connect_attempts: Option<i64>,
     #[serde(default)]
     max_connecting: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawHttp {
+    #[serde(default)]
+    max_headers: Option<i64>,
+    #[serde(default)]
+    response_header_timeout_ms: Option<i64>,
+    #[serde(default)]
+    pool_max_idle: Option<i64>,
+    #[serde(default)]
+    pool_max_idle_per_key: Option<i64>,
+    #[serde(default)]
+    pool_idle_timeout_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]

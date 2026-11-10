@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod m03;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
