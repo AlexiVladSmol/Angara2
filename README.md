@@ -297,8 +297,9 @@ absolute URI.
   request body и response body/trailers; ошибка, drop, timeout или shutdown
   вытесняют соединение и возвращают permit. Idle sender вытесняется только
   при фактическом закрытии connection task, а не при временной
-  неготовности `is_ready`, поэтому успешный keep-alive обмен не создаёт
-  лишний origin accept.
+  неготовности `is_ready`; перед отправкой wrapper ждёт `ready()`, поэтому
+  успешный keep-alive обмен не создаёт лишний origin accept и не даёт 502
+  из-за ещё не опрошенного driver.
 - `limits.max_client_connections` — общий входящий бюджет всех listeners;
   permit удерживается до закрытия клиентского socket, включая idle keep-alive.
 - `limits.max_connections` — общий бюджет исходящих sockets, включая idle;

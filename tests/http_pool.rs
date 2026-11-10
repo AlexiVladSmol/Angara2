@@ -87,6 +87,55 @@ fn m03_pool01_reuses_origin_socket_until_exchange_end() {
 }
 
 #[test]
+fn m03_pool01_pipelined_reuse_waits_for_sender_readiness() {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build four-worker runtime");
+    runtime.block_on(async {
+        let origin = spawn_origin(|_, _| response("200 OK", &[], b"cycle"))
+            .await
+            .expect("start origin");
+        let text = proxy_config()
+            .replace("pool_max_idle = 4", "pool_max_idle = 64")
+            .replace("pool_max_idle_per_key = 2", "pool_max_idle_per_key = 32");
+        let (server, proxy) = start_proxy(&text).await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let origin_address = origin.address;
+            tasks.push(tokio::spawn(async move {
+                let mut client = RawClient::connect(proxy).await.expect("connect client");
+                let mut requests = Vec::new();
+                for _ in 0..1_000 {
+                    requests.extend_from_slice(&request(
+                        "GET",
+                        origin_address,
+                        "/pipeline",
+                        &[],
+                        b"",
+                    ));
+                }
+                client.send(&requests).await.expect("send pipeline");
+                for index in 0..1_000 {
+                    let response = client
+                        .read_response()
+                        .await
+                        .unwrap_or_else(|error| panic!("response {index}: {error}"));
+                    assert_eq!(response.head.status, 200, "response {index}");
+                    assert_eq!(response.text(), "cycle", "response {index}");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join client");
+        }
+        server.shutdown().await;
+    });
+}
+
+#[test]
 fn m03_pool01_lease_returns_only_after_response_trailers() {
     runtime().block_on(async {
         let origin = spawn_origin(|_, _| {

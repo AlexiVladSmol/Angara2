@@ -280,17 +280,23 @@ impl PooledSender {
     /// Whether the origin connection task has ended.
     ///
     /// `SendRequest::is_ready` is only a transient poll hint: it can be false
-    /// until the connection task is polled after the previous response. Using
-    /// it here would evict healthy keep-alive sockets immediately after a
-    /// successful exchange. `send_request` already waits for readiness.
+    /// until the connection task is polled after the previous response. A
+    /// temporarily not-ready sender is healthy and must stay in the pool;
+    /// `send_request` awaits `ready()` before dispatch.
     pub(crate) fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
 
+    /// Waits until the connection can accept a request, then sends it.
+    ///
+    /// `SendRequest::send_request` itself does not wait: a temporarily
+    /// not-ready dispatcher returns `connection was not ready`. The caller
+    /// wraps this future in the response-header timeout.
     pub(crate) async fn send_request(
         &mut self,
         request: http::Request<PoolBody>,
     ) -> Result<Response<Incoming>, hyper::Error> {
+        self.sender.ready().await?;
         self.sender.send_request(request).await
     }
 }
