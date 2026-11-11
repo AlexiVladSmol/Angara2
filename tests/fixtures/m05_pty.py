@@ -37,7 +37,10 @@ def read_rest(fd: int, timeout: float) -> bytes:
         ready, _, _ = select.select([fd], [], [], remaining)
         if not ready:
             continue
-        chunk = os.read(fd, 4096)
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
         if not chunk:
             break
         output += chunk

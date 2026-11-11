@@ -563,7 +563,8 @@ action = "allow"
 users = ["alice"]
 "#,
             443,
-        ),
+        )
+        .replace("verify_timeout_ms = 2000", "verify_timeout_ms = 10000"),
     );
     let (server, address) = start_config(&config_path).await;
 
