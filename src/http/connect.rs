@@ -52,12 +52,14 @@ pub(crate) async fn run(
         origin_write,
         Arc::clone(&progress),
         Arc::clone(&state),
+        "client->origin",
     ));
     let mut origin_to_client = Box::pin(copy_direction(
         origin_read,
         client_write,
         Arc::clone(&progress),
         Arc::clone(&state),
+        "origin->client",
     ));
     let idle = wait_idle(Arc::clone(&progress), idle_timeout);
     tokio::pin!(idle);
@@ -96,6 +98,7 @@ async fn copy_direction<R, W>(
     mut writer: WriteHalf<W>,
     progress: Arc<TunnelProgress>,
     state: Arc<CopyState>,
+    label: &'static str,
 ) -> io::Result<()>
 where
     R: AsyncRead,
@@ -109,8 +112,9 @@ where
             writer.shutdown().await?;
             return Ok(());
         }
+        eprintln!("M04 {label} read={read}");
         progress.hit();
-        write_all_progress(&mut writer, &buffer[..read], &progress).await?;
+        write_all_progress(&mut writer, &buffer[..read], &progress, label).await?;
     }
 }
 
@@ -118,6 +122,7 @@ async fn write_all_progress<W>(
     writer: &mut W,
     mut bytes: &[u8],
     progress: &TunnelProgress,
+    label: &'static str,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -130,6 +135,7 @@ where
                 "tunnel peer stopped accepting bytes",
             ));
         }
+        eprintln!("M04 {label} wrote={written}");
         progress.hit();
         bytes = &bytes[written..];
     }
@@ -271,7 +277,7 @@ mod tests {
         runtime.block_on(async {
             let progress = TunnelProgress::new();
             let mut writer = ChunkWriter { max: 3 };
-            write_all_progress(&mut writer, &[1_u8; 10], &progress)
+            write_all_progress(&mut writer, &[1_u8; 10], &progress, "unit")
                 .await
                 .expect("write");
             assert_eq!(progress.sequence.load(Ordering::Relaxed), 4);
