@@ -144,6 +144,11 @@ async fn wait_idle(progress: Arc<TunnelProgress>, idle: Duration) {
             _ = notified => {}
             _ = tokio::time::sleep(idle) => {
                 if progress.sequence.load(Ordering::Relaxed) == observed {
+                    eprintln!(
+                        "M04 idle close seq={} observed={}",
+                        progress.sequence.load(Ordering::Relaxed),
+                        observed
+                    );
                     return;
                 }
             }
