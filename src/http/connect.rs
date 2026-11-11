@@ -66,8 +66,7 @@ pub(crate) async fn run(
     let mut origin_done = false;
     loop {
         tokio::select! {
-            _ = &mut idle => return TunnelEnd::Idle,
-            _ = &mut drain => return TunnelEnd::HalfCloseTimeout,
+            biased;
             result = &mut client_to_origin, if !client_done => {
                 client_done = true;
                 if let Err(_error) = result {
@@ -80,6 +79,8 @@ pub(crate) async fn run(
                     return TunnelEnd::Io;
                 }
             }
+            _ = &mut idle => return TunnelEnd::Idle,
+            _ = &mut drain => return TunnelEnd::HalfCloseTimeout,
         }
         if client_done && origin_done {
             return TunnelEnd::Complete;

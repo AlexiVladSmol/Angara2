@@ -553,7 +553,7 @@ fn m04_con06_http_then_connect_keeps_order_and_tunnel_is_opaque() {
     runtime().block_on(async {
         let http_origin = spawn_origin(|_, _| {
             let mut bytes = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n".to_vec();
-            bytes.extend_from_slice(&response("200 OK", &[], &vec![b'H'; 4096]));
+            bytes.extend_from_slice(&response("200 OK", &[], &vec![b'H'; 128 * 1024]));
             bytes
         })
         .await
@@ -575,7 +575,7 @@ fn m04_con06_http_then_connect_keeps_order_and_tunnel_is_opaque() {
         let first = client.read_response().await.expect("read HTTP response");
         assert_eq!(first.head.status, 200);
         assert_eq!(first.interim.len(), 1);
-        assert_eq!(first.body.len(), 4096);
+        assert_eq!(first.body.len(), 128 * 1024);
         assert!(first.body.iter().all(|byte| *byte == b'H'));
         assert_eq!(
             client.read_head().await.expect("read CONNECT 200").status,
@@ -1635,6 +1635,32 @@ fn m04_con03_connect_timeout_maps_to_504() {
                 .head
                 .status,
             504
+        );
+        drop(client);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m04_con04_effective_zero_content_length_keeps_early_bytes() {
+    runtime().block_on(async {
+        let echo = spawn_echo_origin(None).await.expect("echo origin");
+        let (server, proxy) = start_proxy(&connect_config(echo.address.port())).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(
+                format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\n\r\nzero",
+                    echo.address, echo.address
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send connect");
+        assert_eq!(client.read_head().await.expect("read 200").status, 200);
+        assert_eq!(
+            client.read_exact_bytes(4).await.expect("early zero echo"),
+            b"zero"
         );
         drop(client);
         server.shutdown().await;
