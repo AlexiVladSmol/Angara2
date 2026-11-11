@@ -1204,6 +1204,10 @@ fn m03_http01_large_binary_upload_and_download_stream() {
         let text = proxy_config()
             .replace("idle_timeout_ms = 5000", "idle_timeout_ms = 60000")
             .replace(
+                "header_read_timeout_ms = 2000",
+                "header_read_timeout_ms = 120000",
+            )
+            .replace(
                 "response_header_timeout_ms = 5000",
                 "response_header_timeout_ms = 120000",
             );
