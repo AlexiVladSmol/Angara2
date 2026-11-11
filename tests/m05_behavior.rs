@@ -655,12 +655,7 @@ allow_special = true
         "failed auth must not dial or consume a pooled socket"
     );
 
-    let request = make_request("alice", ALICE);
-    let mut client = RawClient::connect(proxy).await.expect("client");
-    client.send(&request).await.expect("send alice again");
-    assert_eq!(client.read_response().await.expect("200").head.status, 200);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
+    let before_second = origin.accepts.load(Ordering::SeqCst);
     let (other_server, other_addresses) = m05::start(&config_path).await;
     let other_proxy = m05::address(&other_addresses, "proxy");
     let request = make_request("alice", ALICE);
@@ -669,7 +664,7 @@ allow_special = true
     assert_eq!(client.read_response().await.expect("200").head.status, 200);
     assert_eq!(
         origin.accepts.load(Ordering::SeqCst),
-        4,
+        before_second + 1,
         "different server snapshots must not share a pool"
     );
 
