@@ -636,6 +636,7 @@ allow_special = true
             200,
             "{user} on {address}"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
         origin.accepts.load(Ordering::SeqCst),
@@ -647,6 +648,7 @@ allow_special = true
     let mut client = RawClient::connect(proxy).await.expect("client");
     client.send(&request).await.expect("send wrong");
     assert_eq!(client.read_response().await.expect("407").head.status, 407);
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         origin.accepts.load(Ordering::SeqCst),
         3,
@@ -657,6 +659,7 @@ allow_special = true
     let mut client = RawClient::connect(proxy).await.expect("client");
     client.send(&request).await.expect("send alice again");
     assert_eq!(client.read_response().await.expect("200").head.status, 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         origin.accepts.load(Ordering::SeqCst),
         3,
