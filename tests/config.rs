@@ -124,7 +124,7 @@ fn cfg01_rejects_corrupted_toml_with_position() {
 
 #[test]
 fn cfg01_rejects_unknown_and_future_root_fields() {
-    for field in ["tls", "auth", "acl", "cache", "admin", "users", "parent"] {
+    for field in ["tls", "acl", "cache", "admin", "users", "parent"] {
         let text = config("\"auto\"").replace(
             "[runtime]",
             &format!("[{field}]\nenabled = true\n\n[runtime]"),
@@ -135,6 +135,9 @@ fn cfg01_rejects_unknown_and_future_root_fields() {
             "{field}: {message}"
         );
     }
+
+    let auth = config("\"auto\"").replace("[runtime]", "[auth]\nenabled = true\n\n[runtime]");
+    assert_rejected(&auth, &["unknown field `enabled`", "auth"]);
 
     let text = config("\"auto\"").replace("[runtime]", "unexpected = true\n\n[runtime]");
     assert_rejected(&text, &["unknown field `unexpected`"]);

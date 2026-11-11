@@ -17,6 +17,7 @@ use ipnet::{IpNet, Ipv4Net};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
+use crate::auth::{self, AuthMode, UsersSnapshot};
 use crate::target::{DomainName, parse_method};
 
 /// The only configuration schema version supported by this build.
@@ -89,6 +90,12 @@ const MAX_CONNECT_HALF_CLOSE_TIMEOUT_MS: i64 = 300_000;
 const DEFAULT_CONNECT_HALF_CLOSE_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_CONNECT_ALLOWED_PORT: i64 = 443;
 const MAX_CONNECT_ALLOWED_PORTS: usize = 64;
+const MIN_AUTH_MAX_VERIFYING: i64 = 1;
+const MAX_AUTH_MAX_VERIFYING: i64 = 16;
+const DEFAULT_AUTH_MAX_VERIFYING: i64 = 2;
+const MIN_AUTH_VERIFY_TIMEOUT_MS: i64 = 100;
+const MAX_AUTH_VERIFY_TIMEOUT_MS: i64 = 30_000;
+const DEFAULT_AUTH_VERIFY_TIMEOUT_MS: i64 = 2_000;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -111,11 +118,37 @@ pub struct Config {
     connect: ConnectConfig,
     egress: Vec<EgressProfile>,
     routing: RoutingConfig,
+    auth: Option<AuthConfig>,
 }
 
 impl Config {
-    /// Parses and validates a configuration from TOML text.
+    /// Parses and validates a configuration from TOML text without a file
+    /// context. Configurations that declare `[auth]` are rejected: their
+    /// `users_file` may only be resolved relative to the main TOML directory.
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        Self::parse_inner(input, None)
+    }
+
+    /// Parses a configuration and resolves a relative `users_file` against
+    /// `base_dir`.
+    pub fn parse_with_base_dir(input: &str, base_dir: &Path) -> Result<Self, ConfigError> {
+        Self::parse_inner(input, Some(base_dir))
+    }
+
+    /// Reads, parses and validates a configuration file.
+    ///
+    /// A relative `[auth].users_file` is resolved against the directory that
+    /// contains this configuration file, not the process working directory.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
+        Self::parse_inner(&input, Some(base_dir))
+    }
+
+    fn parse_inner(input: &str, base_dir: Option<&Path>) -> Result<Self, ConfigError> {
         let deserializer = toml::de::Deserializer::parse(input)
             .map_err(|error| ConfigError::from_toml(input, None, error))?;
         let raw: RawConfig = serde_path_to_error::deserialize(deserializer).map_err(|error| {
@@ -123,16 +156,7 @@ impl Config {
             let path = (path != ".").then_some(path);
             ConfigError::from_toml(input, path, error.into_inner())
         })?;
-        validate(raw)
-    }
-
-    /// Reads, parses and validates a configuration file.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::parse(&input)
+        validate(raw, base_dir)
     }
 
     /// The validated schema version.
@@ -188,6 +212,50 @@ impl Config {
     /// Egress routing rules.
     pub fn routing(&self) -> &RoutingConfig {
         &self.routing
+    }
+
+    /// Prepared local users and verification limits, if `[auth]` is declared.
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        self.auth.as_ref()
+    }
+
+    /// Finds a listener by its stable identifier.
+    pub fn listener(&self, id: &str) -> Option<&Listener> {
+        self.listeners.iter().find(|listener| listener.id == id)
+    }
+}
+
+/// Prepared authentication settings and immutable users snapshot.
+pub struct AuthConfig {
+    max_verifying: usize,
+    verify_timeout: Duration,
+    snapshot: std::sync::Arc<UsersSnapshot>,
+}
+
+impl AuthConfig {
+    /// Maximum simultaneous Argon2 verifications across all listeners.
+    pub fn max_verifying(&self) -> usize {
+        self.max_verifying
+    }
+
+    /// Time allowed to wait for one verification result.
+    pub fn verify_timeout(&self) -> Duration {
+        self.verify_timeout
+    }
+
+    pub(crate) fn snapshot(&self) -> &std::sync::Arc<UsersSnapshot> {
+        &self.snapshot
+    }
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("max_verifying", &self.max_verifying)
+            .field("verify_timeout", &self.verify_timeout)
+            .field("snapshot", &self.snapshot)
+            .finish()
     }
 }
 
@@ -400,6 +468,7 @@ pub struct Selectors {
     methods: Option<Vec<Method>>,
     ports: Option<Vec<u16>>,
     hosts: HostSelectors,
+    users: Option<Vec<String>>,
 }
 
 impl Selectors {
@@ -426,6 +495,11 @@ impl Selectors {
     /// Host selectors.
     pub fn hosts(&self) -> &HostSelectors {
         &self.hosts
+    }
+
+    /// Local usernames when the selector is present.
+    pub fn users(&self) -> Option<&[String]> {
+        self.users.as_deref()
     }
 }
 
@@ -641,6 +715,8 @@ pub struct Listener {
     id: String,
     bind: SocketAddr,
     transport: Transport,
+    auth: AuthMode,
+    allow_insecure_basic: bool,
 }
 
 impl Listener {
@@ -657,6 +733,16 @@ impl Listener {
     /// Listener transport.
     pub fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// Required client authentication mode.
+    pub fn auth(&self) -> AuthMode {
+        self.auth
+    }
+
+    /// Explicit opt-in for plain Basic on a non-loopback bind.
+    pub fn allow_insecure_basic(&self) -> bool {
+        self.allow_insecure_basic
     }
 }
 
@@ -794,7 +880,7 @@ fn line_column(input: &str, offset: usize) -> (usize, usize) {
 /// that was placed in a wrong field cannot reach stdout, stderr or CI logs.
 /// Field names and expected tokens are preserved, but are escaped and length
 /// limited before they are inserted into the message.
-fn sanitize_message(message: &str) -> String {
+pub(crate) fn sanitize_message(message: &str) -> String {
     let normalized = if let Some(rest) = message.strip_prefix("unknown field `")
         && let Some((field, _)) = rest.split_once('`')
     {
@@ -846,7 +932,7 @@ fn redact_double_quoted(message: &str) -> String {
     sanitized
 }
 
-fn escape_control(input: &str, max_chars: usize) -> String {
+pub(crate) fn escape_control(input: &str, max_chars: usize) -> String {
     let mut output = String::new();
     let mut count = 0;
     for character in input.chars() {
@@ -884,7 +970,6 @@ fn is_future_feature_field(field: &str) -> bool {
         field,
         "acl"
             | "admin"
-            | "auth"
             | "cache"
             | "control"
             | "logging"
@@ -899,7 +984,7 @@ fn is_future_feature_field(field: &str) -> bool {
     )
 }
 
-fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
+fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigError> {
     if raw.schema_version != i64::from(SCHEMA_VERSION) {
         return Err(validation(
             "schema_version",
@@ -909,10 +994,34 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         ));
     }
+    if raw.auth.is_some() && base_dir.is_none() {
+        return Err(validation(
+            "auth",
+            "requires a configuration file context; use Config::load or Config::parse_with_base_dir",
+        ));
+    }
 
     let limits = validate_limits(raw.limits)?;
     let listeners = validate_listeners(raw.listeners)?;
     let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
+    let auth = validate_auth(raw.auth, base_dir)?;
+    for (index, listener) in listeners.iter().enumerate() {
+        if listener.auth == AuthMode::Basic && auth.is_none() {
+            return Err(validation(
+                format!("listeners[{index}].auth"),
+                "listener requests Basic authentication but the [auth] table is missing",
+            ));
+        }
+        if listener.auth == AuthMode::Basic
+            && !listener.allow_insecure_basic
+            && !is_loopback_ip(listener.bind.ip())
+        {
+            return Err(validation(
+                format!("listeners[{index}].bind"),
+                "plain Basic on a non-loopback bind requires listeners[].allow_insecure_basic = true",
+            ));
+        }
+    }
 
     let access = validate_access(raw.access, &listener_ids)?;
     let dns = validate_dns(raw.dns)?;
@@ -935,7 +1044,65 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         connect,
         egress,
         routing,
+        auth,
     })
+}
+
+fn validate_auth(
+    raw: Option<RawAuth>,
+    base_dir: Option<&Path>,
+) -> Result<Option<AuthConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.users_file.is_empty() {
+        return Err(validation("auth.users_file", "must not be empty"));
+    }
+    let max_verifying = bounded_optional(
+        "auth.max_verifying",
+        raw.max_verifying,
+        MIN_AUTH_MAX_VERIFYING,
+        MAX_AUTH_MAX_VERIFYING,
+        DEFAULT_AUTH_MAX_VERIFYING,
+    )?;
+    let verify_timeout_ms = bounded_optional(
+        "auth.verify_timeout_ms",
+        raw.verify_timeout_ms,
+        MIN_AUTH_VERIFY_TIMEOUT_MS,
+        MAX_AUTH_VERIFY_TIMEOUT_MS,
+        DEFAULT_AUTH_VERIFY_TIMEOUT_MS,
+    )?;
+
+    let declared = Path::new(&raw.users_file);
+    let resolved = if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        base_dir
+            .ok_or_else(|| {
+                validation(
+                    "auth",
+                    "requires a configuration file context to resolve users_file",
+                )
+            })?
+            .join(declared)
+    };
+    let snapshot = UsersSnapshot::load(&resolved)
+        .map_err(|error| validation("auth.users_file", error.to_string()))?;
+
+    Ok(Some(AuthConfig {
+        max_verifying: max_verifying as usize,
+        verify_timeout: Duration::from_millis(verify_timeout_ms as u64),
+        snapshot: std::sync::Arc::new(snapshot),
+    }))
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
 }
 
 fn validate_limits(raw: RawLimits) -> Result<Limits, ConfigError> {
@@ -1163,6 +1330,7 @@ fn validate_selectors(
     sources: Option<Vec<String>>,
     methods: Option<Vec<String>>,
     ports: Option<Vec<i64>>,
+    users: Option<Vec<String>>,
     host_exact: Option<Vec<String>>,
     host_suffix: Option<Vec<String>>,
     listener_ids: &[&str],
@@ -1176,6 +1344,9 @@ fn validate_selectors(
 
     let listeners = listeners
         .map(|values| parse_listener_refs(&values, &format!("{path}.listeners"), listener_ids))
+        .transpose()?;
+    let users = users
+        .map(|values| parse_user_list(&values, &format!("{path}.users")))
         .transpose()?;
     let sources = sources
         .map(|values| parse_cidr_list(&values, &format!("{path}.sources"), false))
@@ -1200,7 +1371,27 @@ fn validate_selectors(
         methods,
         ports,
         hosts,
+        users,
     })
+}
+
+fn parse_user_list(values: &[String], path: &str) -> Result<Vec<String>, ConfigError> {
+    validate_list_len(values, path)?;
+    if values.is_empty() {
+        return Err(validation(path, "must not be empty"));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if !auth::is_valid_username(value) {
+            return Err(validation(
+                format!("{path}[{index}]"),
+                "must be a local username of 1..=64 ASCII characters",
+            ));
+        }
+        if values[..index].contains(value) {
+            return Err(validation(format!("{path}[{index}]"), "duplicate username"));
+        }
+    }
+    Ok(values.to_vec())
 }
 
 fn validate_action(value: &str, path: &str) -> Result<RuleAction, ConfigError> {
@@ -1242,6 +1433,7 @@ fn validate_access(
             rule.sources,
             rule.methods,
             rule.ports,
+            rule.users,
             rule.host_exact,
             rule.host_suffix,
             listener_ids,
@@ -1583,6 +1775,7 @@ fn validate_egress_routing(
             raw.sources,
             raw.methods,
             raw.ports,
+            raw.users,
             raw.host_exact,
             raw.host_suffix,
             listener_ids,
@@ -1644,10 +1837,19 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
     for (index, listener) in raw.into_iter().enumerate() {
         validate_listener_id(&listener.id, index)?;
         validate_listener_address(listener.bind.0, index)?;
+        let auth = listener.auth.unwrap_or(AuthMode::None);
+        if listener.allow_insecure_basic && auth != AuthMode::Basic {
+            return Err(validation(
+                format!("listeners[{index}].allow_insecure_basic"),
+                "is only allowed with auth = \"basic\"",
+            ));
+        }
         listeners.push(Listener {
             id: listener.id,
             bind: listener.bind.0,
             transport: listener.transport,
+            auth,
+            allow_insecure_basic: listener.allow_insecure_basic,
         });
     }
 
@@ -1751,6 +1953,8 @@ struct RawConfig {
     egress: Option<Vec<RawEgress>>,
     #[serde(default)]
     routing: Option<RawRouting>,
+    #[serde(default)]
+    auth: Option<RawAuth>,
 }
 
 #[derive(Deserialize)]
@@ -1777,6 +1981,20 @@ struct RawListener {
     id: String,
     bind: ListenerAddress,
     transport: Transport,
+    #[serde(default)]
+    auth: Option<AuthMode>,
+    #[serde(default)]
+    allow_insecure_basic: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawAuth {
+    users_file: String,
+    #[serde(default)]
+    max_verifying: Option<i64>,
+    #[serde(default)]
+    verify_timeout_ms: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1805,6 +2023,8 @@ struct RawAccessRule {
     methods: Option<Vec<String>>,
     #[serde(default)]
     ports: Option<Vec<i64>>,
+    #[serde(default)]
+    users: Option<Vec<String>>,
     #[serde(default)]
     host_exact: Option<Vec<String>>,
     #[serde(default)]
@@ -1901,6 +2121,8 @@ struct RawRoutingRule {
     #[serde(default)]
     ports: Option<Vec<i64>>,
     #[serde(default)]
+    users: Option<Vec<String>>,
+    #[serde(default)]
     host_exact: Option<Vec<String>>,
     #[serde(default)]
     host_suffix: Option<Vec<String>>,
@@ -1917,6 +2139,20 @@ impl<'de> Deserialize<'de> for ListenerAddress {
         value.parse::<SocketAddr>().map(Self).map_err(|_| {
             de::Error::custom("must be a numeric IP:port such as `127.0.0.1:3128` or `[::1]:3128`")
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "none" => Ok(Self::None),
+            "basic" => Ok(Self::Basic),
+            _ => Err(de::Error::custom("must be `none` or `basic`")),
+        }
     }
 }
 
@@ -2014,5 +2250,22 @@ impl<'de> Deserialize<'de> for WorkerThreads {
         }
 
         deserializer.deserialize_any(WorkerThreadsVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_ip;
+
+    #[test]
+    fn loopback_detection_normalizes_ipv4_mapped_addresses() {
+        assert!(is_loopback_ip("127.0.0.1".parse().expect("v4")));
+        assert!(is_loopback_ip("::1".parse().expect("v6")));
+        assert!(is_loopback_ip("::ffff:127.0.0.1".parse().expect("mapped")));
+        assert!(!is_loopback_ip("192.0.2.10".parse().expect("public v4")));
+        assert!(!is_loopback_ip(
+            "::ffff:192.0.2.10".parse().expect("mapped public")
+        ));
+        assert!(!is_loopback_ip("2001:db8::1".parse().expect("public v6")));
     }
 }

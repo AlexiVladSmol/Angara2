@@ -1,0 +1,85 @@
+# Angara M05 — локальный HTTP Basic listener на loopback.
+#
+# Перед `angara check --config` создайте users_file рядом с этим файлом.
+# Пароль не вводится в argv. Используйте интерактивный TTY:
+#
+#   umask 077
+#   angara users hash > /tmp/alice.phc
+#   {
+#     printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
+#     printf 'password_hash = "'
+#     tr -d '\n' < /tmp/alice.phc
+#     printf '"\ndisabled = false\n'
+#   } > examples/m05-users.local.toml
+#   chmod 0600 examples/m05-users.local.toml
+#   rm -f /tmp/alice.phc
+#
+# `angara check` только читает и структурно проверяет файл: runtime, сеть и
+# Argon2 hashing не запускаются. `serve` binds 127.0.0.1:3128. Пароль и PHC
+# из примеров не являются рабочими credentials.
+
+schema_version = 1
+
+[runtime]
+worker_threads = 2
+
+[limits]
+max_connections = 256
+max_client_connections = 128
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[auth]
+users_file = "m05-users.local.toml"
+max_verifying = 2
+verify_timeout_ms = 2000
+
+[[listeners]]
+id = "proxy-auth-local"
+bind = "127.0.0.1:3128"
+transport = "http"
+auth = "basic"
+
+[access]
+source_allow = ["127.0.0.0/8"]
+ip_default = "deny"
+
+[[access.rules]]
+id = "alice-local-http"
+action = "allow"
+listeners = ["proxy-auth-local"]
+users = ["alice"]
+methods = ["GET", "POST", "CONNECT"]
+ports = [8080, 8443]
+
+[[access.ip_rules]]
+id = "allow-loopback-target"
+action = "allow"
+networks = ["127.0.0.0/8", "::1/128"]
+allow_special = true
+
+[transport]
+total_timeout_ms = 10000
+connect_timeout_ms = 3000
+max_connect_attempts = 3
+max_connecting = 32
+
+[http]
+max_headers = 100
+response_header_timeout_ms = 30000
+pool_max_idle = 16
+pool_max_idle_per_key = 2
+pool_idle_timeout_ms = 15000
+
+[connect]
+allowed_ports = [8443]
+half_close_timeout_ms = 5000
+
+[[egress]]
+id = "system"
+mode = "system"
+
+[routing]
+default_egress = "system"

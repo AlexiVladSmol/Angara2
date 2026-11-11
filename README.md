@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00–M03 приняты и слиты; M04 (CONNECT и TCP-туннели) реализован в ветке `feat/11-m04-connect` и передан на ревью.** Ревизия документов: 0.5. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1 и принимает CONNECT; TLS-вход к прокси, auth, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M04 приняты и слиты; M05 (локальные пользователи, Basic и ACL по identity) реализуется в ветке `feat/14-m05-auth`.** Ревизия документов: 0.6. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1, принимает CONNECT и проверяет Basic credentials на listener с `auth = "basic"`; TLS-вход к прокси, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -72,9 +72,12 @@ cargo deny check
 | `angara --version` | Печатает `angara 0.1.0`, код 0 |
 | `angara check --config <path>` | Читает, разбирает и проверяет TOML; код 0 при успехе, без сети |
 | `angara serve --config <path>` | Проверяет config, связывает все listeners, затем обслуживает HTTP/1.1 forward proxy; код 0 при штатной остановке по SIGINT/SIGTERM, 3 при ошибке bind/запуска |
+| `angara users hash` | Читает пароль и подтверждение из TTY без echo и печатает один Argon2id PHC в stdout; без TTY требует явный `--password-stdin` |
+| `angara users hash --password-stdin` | Читает одну ограниченную строку stdin, проверяет UTF-8/NFC и печатает один PHC; пароль не принимается через argv или env |
 | `angara --help` | Печатает справку, код 0 |
 
-Коды: `0` — успех, `1` — ошибка конфигурации, `2` — ошибка аргументов,
+Коды: `0` — успех, `1` — ошибка конфигурации, ввода пароля, хэширования или
+локального users-файла, `2` — ошибка аргументов,
 `3` — ошибка запуска сервера или неожиданное завершение. Ошибки печатаются в
 stderr, не содержат значений config; семантические конфликты описываются
 через пути полей и индексы, а управляющие символы в путях и именах полей
@@ -428,11 +431,65 @@ root, изменения маршрутов или firewall. В PowerShell пу�
 `--noproxy ''` может быть потерян; используйте `curl.exe --proxy ...` с
 `NO_PROXY=nohost.invalid` в окружении.
 
+## M05: локальные пользователи и Basic
+
+M05 добавляет строгий users TOML (`version = 1`, до 1 MiB/1024 записей),
+Argon2id PHC с фиксированным профилем `m=19456,t=2,p=1`, соли 16 и выхода
+32 байта, listener-local Basic и selectors `users` в ACL/routing. Проверка
+пароля выполняется в `spawn_blocking` под общим `max_verifying`; локальный
+407 закрывает соединение без DNS/dial/100 Continue, перегрузка и timeout
+дают 503. Snapshot пользователей читается при `check`/`serve` и применяется
+после restart; auth cache, reload и online CRUD не входят в M05.
+
+На Linux users-файл должен быть regular file с правами без group write и
+любых world-битов (например `0600`/`0640`) и принадлежать effective UID
+сервиса либо root. Проверка выполняется по уже открытому handle; proxy не
+меняет права автоматически. Доверенный административный каталог и сам
+users-файл не должны быть доступны на запись другим пользователям.
+
+Фиксированный профиль Argon2id требует около 19 MiB рабочей памяти на одну
+проверку. При default `max_verifying = 2` одновременно занято около 38 MiB
+плюс overhead; максимум `16` — до 304 MiB плюс overhead. Это настройка
+памяти, а не обещание throughput. Уже начатая blocking-проверка не
+отменяется при timeout/disconnect; она удерживает permit до фактического
+завершения и не публикует поздний результат. Shutdown ограничен общим
+deadline и не ждёт такие проверки отдельным окном.
+
+```console
+umask 077
+angara users hash > /tmp/alice.phc   # интерактивный ввод и подтверждение
+{
+  printf 'version = 1\n\n[[users]]\nusername = "alice"\npassword_hash = "'
+  tr -d '\n' </tmp/alice.phc
+  printf '"\ndisabled = false\n'
+} > examples/m05-users.local.toml
+chmod 0600 examples/m05-users.local.toml
+rm -f /tmp/alice.phc
+angara check --config examples/m05-auth-local.toml
+angara serve --config examples/m05-auth-local.toml
+curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user alice http://127.0.0.1:8080/
+```
+
+`curl --proxy-user alice` запрашивает пароль интерактивно и не помещает его
+в argv или history. Для неинтерактивного стенда используйте защищённый
+временный curl config `0600` с `proxy-user`; не передавайте пароль через
+`--proxy-user user:password`. `examples/m05-auth-local.toml` не содержит
+рабочих credentials. Подробный контракт и матрица приёмки —
+[M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
+
+Проверка `check` читает и структурно валидирует users-файл, но не запускает
+runtime, сеть и Argon2 hashing. Plain Basic разрешён только на loopback bind
+(`127.0.0.0/8`, `::1`) либо при явном `allow_insecure_basic = true`; это не
+делает transport TLS. TLS listener к прокси — M06. Unix-проверка прав и
+owner реализована для Linux; другие ОС не объявляются поддержанными до
+отдельных испытаний.
+
 ## Текущее состояние
 
-M00, M01 и M02 приняты и слиты. M03 реализован в ветке
-`feat/9-m03-http-proxy`; Linux CI выполняет baseline M02 (127 тестов) и новые
-M03-проверки, включая CLI/raw/curl-совместимые и resource checks. Следующий
-этап — CONNECT-туннель M04; слияние M03 выполняет владелец после ревью.
+M00–M04 приняты и слиты. M05 реализован в ветке `feat/14-m05-auth` и передан
+на ревью; Linux CI выполняет прежние M01–M04 проверки, новые M05-тесты,
+`cargo deny` и проверку auth-примера с временным users-файлом. Слияние
+выполняет владелец после ревью.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

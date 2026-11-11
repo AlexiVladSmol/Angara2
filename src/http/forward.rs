@@ -14,6 +14,7 @@ use hyper::ext::OriginalRequestTarget;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 
+use crate::auth::{AuthError, AuthMode, AuthService, PasswordVerifier, VerifiedIdentity};
 use crate::config::Config;
 use crate::http::ResponseBody;
 use crate::http::connect::TunnelSetup;
@@ -51,20 +52,14 @@ pub struct Proxy {
     pool: Arc<OriginPool>,
     origin_tasks: Arc<crate::http::OriginTasks>,
     draining: Arc<AtomicBool>,
+    auth: Option<AuthService>,
 }
 
 impl Proxy {
     /// Builds proxy state.
     pub fn new(config: Arc<Config>) -> Arc<Self> {
         let outbound = OutboundService::new(Arc::clone(&config));
-        let pool = OriginPool::new(&config);
-        Arc::new(Self {
-            config,
-            outbound,
-            pool,
-            origin_tasks: crate::http::OriginTasks::new(),
-            draining: Arc::new(AtomicBool::new(false)),
-        })
+        Self::assemble(config, outbound)
     }
 
     /// Builds proxy state with injected resolver and dialer for library tests.
@@ -75,14 +70,90 @@ impl Proxy {
         dialer: Arc<dyn crate::transport::Dialer>,
     ) -> Arc<Self> {
         let outbound = OutboundService::with_components(Arc::clone(&config), resolver, dialer);
+        Self::assemble(config, outbound)
+    }
+
+    fn assemble(config: Arc<Config>, outbound: OutboundService) -> Arc<Self> {
+        Self::assemble_with_verifier(config, outbound, None)
+    }
+
+    fn assemble_with_verifier(
+        config: Arc<Config>,
+        outbound: OutboundService,
+        verifier: Option<Arc<dyn PasswordVerifier>>,
+    ) -> Arc<Self> {
         let pool = OriginPool::new(&config);
+        let auth = match verifier {
+            Some(verifier) => AuthService::from_config_with_verifier(&config, verifier),
+            None => AuthService::from_config(&config),
+        };
         Arc::new(Self {
             config,
             outbound,
             pool,
             origin_tasks: crate::http::OriginTasks::new(),
             draining: Arc::new(AtomicBool::new(false)),
+            auth,
         })
+    }
+
+    /// Test/library API with an injected password verifier.
+    #[doc(hidden)]
+    pub fn with_verifier(config: Arc<Config>, verifier: Arc<dyn PasswordVerifier>) -> Arc<Self> {
+        let outbound = OutboundService::new(Arc::clone(&config));
+        Self::assemble_with_verifier(config, outbound, Some(verifier))
+    }
+
+    /// Test/library API with injected components and a password verifier.
+    #[doc(hidden)]
+    pub fn with_components_and_verifier(
+        config: Arc<Config>,
+        resolver: Arc<dyn crate::resolver::Resolver>,
+        dialer: Arc<dyn crate::transport::Dialer>,
+        verifier: Arc<dyn PasswordVerifier>,
+    ) -> Arc<Self> {
+        let outbound = OutboundService::with_components(Arc::clone(&config), resolver, dialer);
+        Self::assemble_with_verifier(config, outbound, Some(verifier))
+    }
+
+    /// Number of free password-verification slots across all listeners.
+    #[doc(hidden)]
+    pub fn auth_available_permits(&self) -> Option<usize> {
+        self.auth.as_ref().map(AuthService::available_permits)
+    }
+
+    /// Applies the listener's authentication mode before policy and routing.
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        client: &ClientInfo,
+    ) -> Result<Option<VerifiedIdentity>, Response<ResponseBody>> {
+        let Some(listener) = self.config.listener(&client.listener_id) else {
+            return Err(headers::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+            ));
+        };
+        match listener.auth() {
+            AuthMode::None => Ok(None),
+            AuthMode::Basic => {
+                let Some(auth) = self.auth.as_ref() else {
+                    return Err(headers::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        true,
+                    ));
+                };
+                match auth.authenticate_headers(headers).await {
+                    Ok(identity) => Ok(Some(identity)),
+                    Err(AuthError::InvalidCredentials) => {
+                        Err(headers::proxy_auth_required_response())
+                    }
+                    Err(AuthError::Busy | AuthError::Timeout | AuthError::Internal) => Err(
+                        headers::error_response(StatusCode::SERVICE_UNAVAILABLE, true),
+                    ),
+                }
+            }
+        }
     }
 
     /// Starts shutdown: new exchanges are refused and idle origin sockets are
@@ -185,17 +256,29 @@ impl Proxy {
         if target::check_host_header(&target, host_header).is_err() {
             return Err(error(StatusCode::BAD_REQUEST));
         }
+        if policy::check_source(self.config.access(), client.peer).is_err() {
+            return Err(error(StatusCode::FORBIDDEN));
+        }
+        let identity = self.authenticate(request.headers(), &client).await?;
         if !self.config.connect().allows_port(target.port()) {
             return Err(error(StatusCode::FORBIDDEN));
         }
 
-        let context = RequestContext::new(client.peer, client.listener_id.clone());
+        let context = match identity {
+            Some(identity) => {
+                RequestContext::with_identity(client.peer, client.listener_id.clone(), identity)
+            }
+            None => RequestContext::new(client.peer, client.listener_id.clone()),
+        };
         let plan = match self
             .outbound
             .prepare_outbound(&context, &Method::CONNECT, &target_text, host_header)
             .await
         {
             Ok(plan) => plan,
+            Err(OutboundError::AuthenticationRequired) => {
+                return Err(headers::proxy_auth_required_response());
+            }
             Err(outbound_error) => {
                 let (status, close) = outbound_status(outbound_error);
                 return Err(headers::error_response(status, close));
@@ -309,7 +392,6 @@ impl Proxy {
         };
         let request_had_content_length = request.headers().contains_key(CONTENT_LENGTH);
         let request_accepts_trailers = headers::accepts_trailers(request.headers());
-        let original_request_headers = request.headers().clone();
         let max_forwards = if method == Method::OPTIONS {
             match headers::max_forwards(request.headers()) {
                 Ok(value) => value,
@@ -319,19 +401,30 @@ impl Proxy {
             None
         };
 
-        let context = RequestContext::new(client.peer, client.listener_id.clone());
+        if policy::check_source(self.config.access(), client.peer).is_err() {
+            return headers::error_response(StatusCode::FORBIDDEN, true);
+        }
+        let identity = match self.authenticate(request.headers(), &client).await {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        };
         let meta = RequestMeta {
             listener_id: &client.listener_id,
             source: client.peer,
             method: &method,
             target: &target,
+            identity: identity.as_ref(),
         };
-        if policy::check_source(self.config.access(), client.peer).is_err() {
-            return headers::error_response(StatusCode::FORBIDDEN, true);
-        }
         if policy::check_request(self.config.access(), &meta).is_err() {
             return headers::error_response(StatusCode::FORBIDDEN, true);
         }
+        let context = match identity {
+            Some(identity) => {
+                RequestContext::with_identity(client.peer, client.listener_id.clone(), identity)
+            }
+            None => RequestContext::new(client.peer, client.listener_id.clone()),
+        };
+        let original_request_headers = request.headers().clone();
         if max_forwards == Some(0) {
             let has_body = request_chunked
                 || request
@@ -377,6 +470,9 @@ impl Proxy {
             .await
         {
             Ok(plan) => plan,
+            Err(OutboundError::AuthenticationRequired) => {
+                return headers::proxy_auth_required_response();
+            }
             Err(error) => {
                 let (status, close) = outbound_status(error);
                 return headers::error_response(status, close);
@@ -561,6 +657,7 @@ fn target_status(error: TargetError) -> StatusCode {
 fn outbound_status(error: OutboundError) -> (StatusCode, bool) {
     match error {
         OutboundError::InvalidTarget => (StatusCode::BAD_REQUEST, true),
+        OutboundError::AuthenticationRequired => (StatusCode::PROXY_AUTHENTICATION_REQUIRED, true),
         OutboundError::SourceDenied
         | OutboundError::AccessDenied
         | OutboundError::DestinationDenied => (StatusCode::FORBIDDEN, true),
