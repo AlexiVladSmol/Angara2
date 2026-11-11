@@ -1764,11 +1764,11 @@ fn m04_io02_partial_origin_writes_refresh_shared_idle() {
             .expect("send connect");
         assert_eq!(client.read_head().await.expect("read 200").status, 200);
 
-        let payload = vec![b'P'; 2 * 1024 * 1024];
+        let payload = vec![b'P'; 16 * 1024 * 1024];
         let send = client.send(&payload);
         let mut send = Box::pin(send);
         tokio::select! {
-            result = &mut send => panic!("2 MiB upload completed without backpressure: {result:?}"),
+            result = &mut send => panic!("16 MiB upload completed without backpressure: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
         }
         drop(send);
