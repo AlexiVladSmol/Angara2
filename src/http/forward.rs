@@ -4,17 +4,19 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use http::header::{CONTENT_LENGTH, HOST};
+use http::header::{CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1 as client_http1;
 use hyper::ext::OriginalRequestTarget;
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 
 use crate::config::Config;
 use crate::http::ResponseBody;
+use crate::http::connect::TunnelSetup;
 use crate::http::headers;
 use crate::http::interim::InterimSender;
 use crate::http::pool::{
@@ -111,10 +113,128 @@ impl Proxy {
         self.draining.load(Ordering::Acquire)
     }
 
-    /// Handles one client request. All failures before final headers become
-    /// bounded local responses; failures after headers are surfaced as body
-    /// errors so the server closes/evicts the exchange.
-    pub async fn handle(
+    /// Handles a CONNECT request and performs all pre-dial validation.
+    ///
+    /// On success the returned setup owns the authorized origin socket and the
+    /// hyper upgrade; the caller must send the 200 response before awaiting it.
+    pub(crate) async fn handle_connect(
+        &self,
+        request: Request<Incoming>,
+        client: ClientInfo,
+        on_upgrade: OnUpgrade,
+    ) -> Result<(Response<ResponseBody>, TunnelSetup), Response<ResponseBody>> {
+        let error = |status: StatusCode| headers::error_response(status, true);
+        if self.is_draining() {
+            return Err(error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        if request.version() != Version::HTTP_11 {
+            return Err(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
+        }
+        if request.method() != Method::CONNECT {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        if request.headers().contains_key(EXPECT) {
+            return Err(error(StatusCode::EXPECTATION_FAILED));
+        }
+        if headers::has_upgrade(request.headers()) {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        if headers::via_has_angara(request.headers()) {
+            return Err(error(StatusCode::LOOP_DETECTED));
+        }
+        if headers::validate_framing(request.headers()).is_err() {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        if request.headers().contains_key(TRANSFER_ENCODING)
+            || request.headers().contains_key(TRAILER)
+        {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        for value in request.headers().get_all(CONTENT_LENGTH) {
+            let Ok(value) = value.to_str() else {
+                return Err(error(StatusCode::BAD_REQUEST));
+            };
+            if value
+                .split(',')
+                .map(str::trim)
+                .any(|part| part.parse::<u64>() != Ok(0))
+            {
+                return Err(error(StatusCode::BAD_REQUEST));
+            }
+        }
+
+        let target_text = request
+            .extensions()
+            .get::<OriginalRequestTarget>()
+            .map(|target| target.as_str().to_owned())
+            .unwrap_or_else(|| request.uri().to_string());
+        let target = match CanonicalTarget::parse(&Method::CONNECT, &target_text) {
+            Ok(target) if target.is_connect() => target,
+            Ok(_) => return Err(error(StatusCode::BAD_REQUEST)),
+            Err(target_error) => return Err(error(target_status(target_error))),
+        };
+
+        let host_count = request.headers().get_all(HOST).iter().count();
+        if host_count != 1 {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        let host_header = request
+            .headers()
+            .get(HOST)
+            .and_then(|value| value.to_str().ok());
+        if target::check_host_header(&target, host_header).is_err() {
+            return Err(error(StatusCode::BAD_REQUEST));
+        }
+        if !self.config.connect().allows_port(target.port()) {
+            return Err(error(StatusCode::FORBIDDEN));
+        }
+
+        let context = RequestContext::new(client.peer, client.listener_id.clone());
+        let plan = match self
+            .outbound
+            .prepare_outbound(&context, &Method::CONNECT, &target_text, host_header)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(outbound_error) => {
+                let (status, close) = outbound_status(outbound_error);
+                return Err(headers::error_response(status, close));
+            }
+        };
+        let origin = match self.outbound.open_plan(&plan).await {
+            Ok(origin) => origin,
+            Err(outbound_error) => {
+                let (status, close) = outbound_status(outbound_error);
+                return Err(headers::error_response(status, close));
+            }
+        };
+
+        let body = http_body_util::Full::new(bytes::Bytes::new())
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .version(Version::HTTP_11)
+            .body(body)
+            .unwrap_or_else(|_| {
+                Response::new(
+                    http_body_util::Full::new(bytes::Bytes::new())
+                        .map_err(|never: std::convert::Infallible| match never {})
+                        .boxed(),
+                )
+            });
+        let setup = TunnelSetup {
+            on_upgrade,
+            origin,
+            deadline: tokio::time::Instant::now() + self.config.limits().idle_timeout(),
+        };
+        Ok((response, setup))
+    }
+
+    /// Handles one non-CONNECT client request. All failures before final headers
+    /// become bounded local responses; failures after headers are surfaced as
+    /// body errors so the server closes/evicts the exchange.
+    pub(crate) async fn handle(
         &self,
         request: Request<Incoming>,
         client: ClientInfo,
@@ -153,10 +273,9 @@ impl Proxy {
         }
 
         if method == Method::CONNECT {
-            return match CanonicalTarget::parse(&method, &target_text) {
-                Ok(_) => headers::error_response(StatusCode::NOT_IMPLEMENTED, true),
-                Err(_) => headers::error_response(StatusCode::BAD_REQUEST, true),
-            };
+            // CONNECT is served by `handle_connect`, which owns the upgrade
+            // handoff. A direct call without that context cannot succeed.
+            return headers::error_response(StatusCode::BAD_REQUEST, true);
         }
         if method == Method::TRACE {
             return headers::error_response(StatusCode::NOT_IMPLEMENTED, true);

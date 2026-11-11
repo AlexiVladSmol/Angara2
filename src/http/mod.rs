@@ -9,6 +9,7 @@ use http_body::{Body, Frame, SizeHint};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::{AbortHandle, JoinSet};
 
+pub mod connect;
 pub mod forward;
 pub mod headers;
 pub mod idle;

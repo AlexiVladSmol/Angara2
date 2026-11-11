@@ -190,6 +190,21 @@ impl RawClient {
         self.stream.shutdown().await
     }
 
+    /// Reads exactly `length` raw bytes from the tunnel.
+    pub async fn read_exact_bytes(&mut self, length: usize) -> io::Result<Vec<u8>> {
+        self.read_exact(length).await
+    }
+
+    /// Reads the remaining tunnel bytes until the peer closes.
+    pub async fn read_until_eof(&mut self) -> io::Result<Vec<u8>> {
+        let mut output = std::mem::take(&mut self.buffer);
+        match tokio::time::timeout(IO_TIMEOUT, self.stream.read_to_end(&mut output)).await {
+            Ok(Ok(_)) => Ok(output),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+        }
+    }
+
     pub async fn read_head(&mut self) -> io::Result<RawHead> {
         loop {
             if let Some(position) = self

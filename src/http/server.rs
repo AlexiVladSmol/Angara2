@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, Proxy};
 use crate::http::headers;
 use crate::http::interim::{InterimHub, SplitIo, writer_loop};
@@ -278,8 +280,14 @@ async fn serve_client(
 ) {
     let _client_permit = permit;
     let idle_timeout = config.limits().idle_timeout();
+    let tunnel_mode = Arc::new(AtomicBool::new(false));
     let output = ConnectionOutput::new();
-    let (io, write_half, bridge_reader) = SplitIo::new(stream, idle_timeout, Arc::clone(&output));
+    let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag(
+        stream,
+        idle_timeout,
+        Arc::clone(&output),
+        Arc::clone(&tunnel_mode),
+    );
     let (hub, interim_receiver) = InterimHub::new();
     let client = ClientInfo {
         peer: peer.ip(),
@@ -288,12 +296,16 @@ async fn serve_client(
     let service_hub = hub.clone();
     let exchange_gate = Arc::new(Semaphore::new(1));
     let service_output = Arc::clone(&output);
-    let service = service_fn(move |request| {
+    let tunnel_slot: Arc<Mutex<Option<TunnelSetup>>> = Arc::new(Mutex::new(None));
+    let service_slot = Arc::clone(&tunnel_slot);
+    let tunnel_progress = TunnelProgress::new();
+    let service = service_fn(move |mut request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
         let interim = service_hub.begin();
         let exchange_gate = Arc::clone(&exchange_gate);
         let service_output = Arc::clone(&service_output);
+        let service_slot = Arc::clone(&service_slot);
         async move {
             let Ok(permit) = exchange_gate.acquire_owned().await else {
                 return Ok::<_, Infallible>(headers::error_response(
@@ -301,10 +313,33 @@ async fn serve_client(
                     true,
                 ));
             };
-            let response = proxy.handle(request, client, interim).await;
+            let (response, setup) = if request.method() == http::Method::CONNECT {
+                let on_upgrade = hyper::upgrade::on(&mut request);
+                match proxy.handle_connect(request, client, on_upgrade).await {
+                    Ok((response, setup)) => (response, Some(setup)),
+                    Err(response) => (response, None),
+                }
+            } else {
+                (proxy.handle(request, client, interim).await, None)
+            };
+            if let Some(setup) = setup {
+                let Ok(mut slot) = service_slot.lock() else {
+                    return Ok::<_, Infallible>(headers::error_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        true,
+                    ));
+                };
+                if slot.is_some() {
+                    return Ok::<_, Infallible>(headers::error_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        true,
+                    ));
+                }
+                *slot = Some(setup);
+            }
             let (parts, body) = response.into_parts();
             let body: ResponseBody = ExchangeBody::new(body, permit, service_output).boxed();
-            Ok(http::Response::from_parts(parts, body))
+            Ok::<_, Infallible>(http::Response::from_parts(parts, body))
         }
     });
 
@@ -316,13 +351,17 @@ async fn serve_client(
         .header_read_timeout(config.limits().header_read_timeout())
         .max_buf_size(crate::http::forward::connection_buffer_size(&config))
         .timer(TokioTimer::new());
-    let connection = builder.serve_connection(TokioIo::new(io), service);
+    let connection = builder
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades();
     let writer = writer_loop(
         write_half,
         bridge_reader,
         interim_receiver,
         idle_timeout,
         Arc::clone(&output),
+        Arc::clone(&tunnel_mode),
+        Arc::clone(&tunnel_progress),
     );
     let mut connection = Box::pin(connection);
     let mut writer = Box::pin(writer);
@@ -343,7 +382,65 @@ async fn serve_client(
             }
             _ = Arc::clone(&output).release_loop() => {}
             result = &mut connection => {
-                let _ = result;
+                let setup = tunnel_slot.lock().ok().and_then(|mut slot| slot.take());
+                if result.is_ok()
+                    && let Some(setup) = setup
+                {
+                    drop(connection);
+                    drop(hub);
+                    tunnel_mode.store(true, Ordering::Release);
+                    let TunnelSetup {
+                        on_upgrade,
+                        origin,
+                        deadline,
+                    } = setup;
+                    let upgraded = tokio::select! {
+                        biased;
+                        _ = force.changed() => None,
+                        result = tokio::time::timeout_at(deadline, on_upgrade) => {
+                            result.ok().and_then(Result::ok)
+                        }
+                    };
+                    let Some(upgraded) = upgraded else {
+                        drop(writer);
+                        output.close();
+                        return;
+                    };
+                    let mut tunnel = Box::pin(crate::http::connect::run(
+                        TokioIo::new(upgraded),
+                        origin,
+                        idle_timeout,
+                        config.connect().half_close_timeout(),
+                        Arc::clone(&tunnel_progress),
+                    ));
+                    let mut writer_done = false;
+                    let outcome = loop {
+                        tokio::select! {
+                            biased;
+                            _ = force.changed() => break None,
+                            result = &mut writer, if !writer_done => {
+                                writer_done = true;
+                                if result.is_err() {
+                                    break None;
+                                }
+                            }
+                            outcome = &mut tunnel => break Some(outcome),
+                        }
+                    };
+                    drop(tunnel);
+                    match outcome {
+                        Some(TunnelEnd::Complete { drain_deadline }) if !writer_done => {
+                            if let Some(deadline) = drain_deadline {
+                                let _ = tokio::time::timeout_at(deadline, &mut writer).await;
+                            }
+                            drop(writer);
+                        }
+                        _ => drop(writer),
+                    }
+                    output.close();
+                    return;
+                }
+                drop(setup);
                 // Dropping the connection closes the bridge writer; the writer
                 // then drains any response bytes already buffered in the duplex.
                 drop(connection);

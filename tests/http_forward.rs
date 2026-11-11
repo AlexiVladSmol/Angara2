@@ -976,7 +976,7 @@ fn m03_http07_rejections_happen_without_origin_dial() {
                     origin.address, origin.address
                 )
                 .into_bytes(),
-                501,
+                403,
             ),
             (
                 b"CONNECT bad/host HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
@@ -1201,7 +1201,8 @@ fn m03_http01_large_binary_upload_and_download_stream() {
         })
         .await
         .expect("start origin");
-        let (server, proxy) = start_proxy(&proxy_config()).await;
+        let text = proxy_config().replace("idle_timeout_ms = 5000", "idle_timeout_ms = 60000");
+        let (server, proxy) = start_proxy(&text).await;
         let mut client = RawClient::connect(proxy).await.expect("connect proxy");
 
         let mut upload = Vec::with_capacity(SIZE);

@@ -56,11 +56,17 @@ jobs:
           cargo test --locked --test http_limits \
             m03_res02 \
             -- --ignored --test-threads=1 --nocapture
+          cargo test --locked --test m04_limits \
+            m04_res02 \
+            -- --ignored --test-threads=1 --nocapture
 
       - name: CPU evidence (multi-worker HTTP path)
         run: |
           cargo test --locked --test http_forward \
             m03_cpu01_angara_outbound_path_uses_multiple_workers \
+            -- --nocapture
+          cargo test --locked --test m04_connect \
+            m04_cpu01_connect_path_uses_multiple_workers \
             -- --nocapture
 
       - name: Validate example configurations
@@ -70,6 +76,7 @@ jobs:
           cargo run --locked -- check --config examples/m02-policy.toml
           cargo run --locked -- check --config examples/m02-egress-local.toml
           cargo run --locked -- check --config examples/m03-http-local.toml
+          cargo run --locked -- check --config examples/m04-connect-local.toml
 
       - name: Curl smoke through the real proxy
         run: |
@@ -115,6 +122,66 @@ jobs:
           wait "$PROXY_PID"
           kill "$ORIGIN_PID"
           trap - EXIT
+
+      - name: TLS curl smoke through the real proxy
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          PROXY_PID=""
+          python3 tests/fixtures/m04_tls_site.py --dir "$TMP" \
+            >"$TMP/port.txt" 2>"$TMP/site.log" &
+          SITE_PID=$!
+          cleanup() {
+            if [ -n "$PROXY_PID" ]; then kill -TERM "$PROXY_PID" 2>/dev/null || true; fi
+            kill "$SITE_PID" 2>/dev/null || true
+            rm -rf "$TMP"
+          }
+          for _ in $(seq 1 100); do
+            test -s "$TMP/port.txt" && break
+            sleep 0.1
+          done
+          PORT=$(sed -n 's/^PORT=//p' "$TMP/port.txt")
+          test -n "$PORT"
+          sed "s/allowed_ports = \[443, 8443\]/allowed_ports = [$PORT]/" \
+            examples/m04-connect-local.toml >"$TMP/m04.toml"
+          ./target/debug/angara serve --config "$TMP/m04.toml" 2>"$TMP/proxy.log" &
+          PROXY_PID=$!
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+              --cacert "$TMP/ca.pem" "https://localhost:$PORT/" \
+              -o "$TMP/tls.txt" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep -q 'tls-ok' "$TMP/tls.txt"
+          head -c 1048576 /dev/urandom >"$TMP/upload.bin"
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --cacert "$TMP/ca.pem" \
+            --data-binary @"$TMP/upload.bin" "https://localhost:$PORT/upload" \
+            -o "$TMP/upload.txt"
+          test "$(cat "$TMP/upload.txt")" = \
+            "upload:1048576:$(sha256sum "$TMP/upload.bin" | cut -d' ' -f1)"
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --cacert "$TMP/ca.pem" "https://localhost:$PORT/download" \
+            -o "$TMP/download.bin"
+          test "$(wc -c <"$TMP/download.bin")" -eq 1048576
+          EXPECTED=$(python3 -c 'import hashlib; print(hashlib.sha256(bytes((i * 17) % 251 for i in range(1024 * 1024))).hexdigest())')
+          test "$(sha256sum "$TMP/download.bin" | cut -d' ' -f1)" = "$EXPECTED"
+          set +e
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --cacert "$TMP/ca.pem" "https://127.0.0.1:$PORT/" \
+            -o /dev/null 2>"$TMP/negative.err"
+          NEGATIVE_CODE=$?
+          set -e
+          test "$NEGATIVE_CODE" -eq 60
+          grep -Eqi 'certificate|subject|altname|SSL' "$TMP/negative.err"
+          kill -TERM "$PROXY_PID"
+          wait "$PROXY_PID"
+          kill "$SITE_PID" 2>/dev/null || true
+          trap - EXIT
+          rm -rf "$TMP"
 
   deny:
     name: Dependency policy (advisories, licenses, sources)
