@@ -193,7 +193,10 @@ impl TunnelProgress {
     }
 
     pub(crate) fn hit(&self) {
-        self.sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 12 {
+            eprintln!("M04 progress hit seq={sequence}");
+        }
         self.notify.notify_one();
     }
 }
