@@ -52,14 +52,12 @@ pub(crate) async fn run(
         origin_write,
         Arc::clone(&progress),
         Arc::clone(&state),
-        "client->origin",
     ));
     let mut origin_to_client = Box::pin(copy_direction(
         origin_read,
         client_write,
         Arc::clone(&progress),
         Arc::clone(&state),
-        "origin->client",
     ));
     let idle = wait_idle(Arc::clone(&progress), idle_timeout);
     tokio::pin!(idle);
@@ -98,7 +96,6 @@ async fn copy_direction<R, W>(
     mut writer: WriteHalf<W>,
     progress: Arc<TunnelProgress>,
     state: Arc<CopyState>,
-    label: &'static str,
 ) -> io::Result<()>
 where
     R: AsyncRead,
@@ -112,9 +109,8 @@ where
             writer.shutdown().await?;
             return Ok(());
         }
-        eprintln!("M04 {label} read={read}");
         progress.hit();
-        write_all_progress(&mut writer, &buffer[..read], &progress, label).await?;
+        write_all_progress(&mut writer, &buffer[..read], &progress).await?;
     }
 }
 
@@ -122,7 +118,6 @@ async fn write_all_progress<W>(
     writer: &mut W,
     mut bytes: &[u8],
     progress: &TunnelProgress,
-    label: &'static str,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -135,7 +130,6 @@ where
                 "tunnel peer stopped accepting bytes",
             ));
         }
-        eprintln!("M04 {label} wrote={written}");
         progress.hit();
         bytes = &bytes[written..];
     }
@@ -150,11 +144,6 @@ async fn wait_idle(progress: Arc<TunnelProgress>, idle: Duration) {
             _ = notified => {}
             _ = tokio::time::sleep(idle) => {
                 if progress.sequence.load(Ordering::Relaxed) == observed {
-                    eprintln!(
-                        "M04 idle close seq={} observed={}",
-                        progress.sequence.load(Ordering::Relaxed),
-                        observed
-                    );
                     return;
                 }
             }
@@ -199,10 +188,7 @@ impl TunnelProgress {
     }
 
     pub(crate) fn hit(&self) {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence <= 12 {
-            eprintln!("M04 progress hit seq={sequence}");
-        }
+        self.sequence.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
     }
 }
@@ -277,10 +263,32 @@ mod tests {
         runtime.block_on(async {
             let progress = TunnelProgress::new();
             let mut writer = ChunkWriter { max: 3 };
-            write_all_progress(&mut writer, &[1_u8; 10], &progress, "unit")
+            write_all_progress(&mut writer, &[1_u8; 10], &progress)
                 .await
                 .expect("write");
             assert_eq!(progress.sequence.load(Ordering::Relaxed), 4);
+        });
+    }
+
+    #[test]
+    fn idle_deadline_resets_on_partial_progress() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let progress = TunnelProgress::new();
+            let waiter = tokio::spawn(wait_idle(Arc::clone(&progress), Duration::from_millis(300)));
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                progress.hit();
+            }
+            assert!(!waiter.is_finished(), "idle fired despite progress");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                waiter.await.is_ok(),
+                "idle did not fire after progress stopped"
+            );
         });
     }
 }

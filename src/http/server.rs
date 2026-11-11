@@ -430,25 +430,12 @@ async fn serve_client(
                     drop(tunnel);
                     match outcome {
                         Some(TunnelEnd::Complete { drain_deadline }) if !writer_done => {
-                            eprintln!("M04 tunnel complete deadline={drain_deadline:?}");
                             if let Some(deadline) = drain_deadline {
                                 let _ = tokio::time::timeout_at(deadline, &mut writer).await;
                             }
                             drop(writer);
                         }
-                        other => {
-                            eprintln!(
-                                "M04 tunnel end {}",
-                                match other {
-                                    Some(TunnelEnd::Complete { .. }) => "complete",
-                                    Some(TunnelEnd::Idle) => "idle",
-                                    Some(TunnelEnd::HalfCloseTimeout) => "drain-timeout",
-                                    Some(TunnelEnd::Io) => "io",
-                                    None => "force/writer",
-                                }
-                            );
-                            drop(writer)
-                        }
+                        _ => drop(writer),
                     }
                     output.close();
                     return;

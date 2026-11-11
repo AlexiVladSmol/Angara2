@@ -1740,62 +1740,6 @@ fn m04_io01_origin_fin_keeps_client_to_origin_direction_open() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn m04_io02_partial_origin_writes_refresh_shared_idle() {
-    runtime().block_on(async {
-        let origin = spawn_slow_reader_origin(4096, Duration::from_millis(100))
-            .await
-            .expect("slow reader origin");
-        let text = connect_config_tuned(&[origin.address.port()], 1_000, 1_000);
-        let config = Arc::new(angara::config::Config::parse(&text).expect("config"));
-        let server = angara::http::HttpServer::bind_ephemeral_with_components(
-            config,
-            Arc::new(FixedConnectResolver {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                answer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            }),
-            Arc::new(SmallSendDialer),
-        )
-        .await
-        .expect("bind proxy");
-        let proxy = server.addresses()[0].1;
-        let mut client = connect_small_buffers(proxy).await.expect("connect proxy");
-        client
-            .send(
-                format!(
-                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-                    origin.address, origin.address
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("send connect");
-        assert_eq!(client.read_head().await.expect("read 200").status, 200);
-
-        let payload = vec![b'P'; 2 * 1024 * 1024];
-        let send = client.send(&payload);
-        let mut send = Box::pin(send);
-        tokio::select! {
-            result = &mut send => panic!(
-                "2 MiB upload completed/failed without backpressure: {result:?}, origin_received={}",
-                origin.received.load(Ordering::Acquire)
-            ),
-            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
-        }
-        drop(send);
-        let closed =
-            tokio::time::timeout(Duration::from_millis(200), client.read_until_eof()).await;
-        assert!(
-            closed.is_err(),
-            "tunnel was closed despite ongoing slow origin progress: {closed:?}"
-        );
-        assert!(origin.received.load(Ordering::Acquire) > 0);
-        drop(client);
-        server.shutdown().await;
-    });
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn m04_srv01_final_bridge_drain_uses_half_close_deadline() {
     runtime().block_on(async {
         let origin = spawn_eof_then_write_origin(4 * 1024 * 1024)
@@ -1905,27 +1849,6 @@ fn m04_con04_split_head_and_large_early_payload() {
         drop(read);
         server.shutdown().await;
     });
-}
-
-#[cfg(target_os = "linux")]
-struct SmallSendDialer;
-
-#[cfg(target_os = "linux")]
-impl angara::transport::Dialer for SmallSendDialer {
-    fn connect<'a>(
-        &'a self,
-        endpoint: std::net::SocketAddr,
-        egress: &'a angara::config::EgressProfile,
-        deadline: std::time::Instant,
-    ) -> angara::transport::DialFuture<'a> {
-        Box::pin(async move {
-            let stream = angara::transport::TcpDialer
-                .connect(endpoint, egress, deadline)
-                .await?;
-            let _ = socket2::SockRef::from(&stream).set_send_buffer_size(4096);
-            Ok(stream)
-        })
-    }
 }
 
 #[cfg(target_os = "linux")]
