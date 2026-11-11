@@ -72,7 +72,7 @@ impl Default for AuthConfig {
         Self {
             users_file: "users.toml".to_owned(),
             max_verifying: 2,
-            verify_timeout_ms: 2_000,
+            verify_timeout_ms: 30_000,
             worker_threads: 2,
             shutdown_timeout_ms: 2_000,
             listeners: r#"

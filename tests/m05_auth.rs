@@ -71,7 +71,7 @@ shutdown_timeout_ms = 2000
 [auth]
 users_file = "{users_file}"
 max_verifying = 2
-verify_timeout_ms = 2000
+verify_timeout_ms = 30000
 
 [[listeners]]
 id = "proxy"
@@ -343,7 +343,16 @@ fn auth_defaults_ranges_and_required_fields_are_strict() {
     let defaults = Config::parse_with_base_dir(&base, dir.path()).expect("defaults");
     let auth = defaults.auth().expect("auth config");
     assert_eq!(auth.max_verifying(), 2);
-    assert_eq!(auth.verify_timeout(), Duration::from_millis(2_000));
+    assert_eq!(auth.verify_timeout(), Duration::from_millis(30_000));
+
+    let default_text = base
+        .replace("max_verifying = 2\n", "")
+        .replace("verify_timeout_ms = 30000\n", "");
+    let default_config =
+        Config::parse_with_base_dir(&default_text, dir.path()).expect("implicit auth defaults");
+    let default_auth = default_config.auth().expect("default auth config");
+    assert_eq!(default_auth.max_verifying(), 2);
+    assert_eq!(default_auth.verify_timeout(), Duration::from_millis(2_000));
 
     for (old, new, expected) in [
         (
@@ -357,12 +366,12 @@ fn auth_defaults_ranges_and_required_fields_are_strict() {
             "auth.max_verifying",
         ),
         (
-            "verify_timeout_ms = 2000",
+            "verify_timeout_ms = 30000",
             "verify_timeout_ms = 99",
             "auth.verify_timeout_ms",
         ),
         (
-            "verify_timeout_ms = 2000",
+            "verify_timeout_ms = 30000",
             "verify_timeout_ms = 30001",
             "auth.verify_timeout_ms",
         ),
@@ -436,7 +445,7 @@ action = "allow"
         443,
     )
     .replace(
-        "[auth]\nusers_file = \"users.toml\"\nmax_verifying = 2\nverify_timeout_ms = 2000\n",
+        "[auth]\nusers_file = \"users.toml\"\nmax_verifying = 2\nverify_timeout_ms = 30000\n",
         "",
     );
     let error = Config::parse_with_base_dir(&missing_auth, dir.path())
@@ -563,8 +572,7 @@ action = "allow"
 users = ["alice"]
 "#,
             443,
-        )
-        .replace("verify_timeout_ms = 2000", "verify_timeout_ms = 10000"),
+        ),
     );
     let (server, address) = start_config(&config_path).await;
 
