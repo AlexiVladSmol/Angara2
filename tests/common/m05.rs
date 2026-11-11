@@ -140,7 +140,7 @@ max_headers = 64
 response_header_timeout_ms = 5000
 pool_max_idle = 8
 pool_max_idle_per_key = 2
-pool_idle_timeout_ms = 4000
+pool_idle_timeout_ms = 30000
 
 [connect]
 allowed_ports = [{}]

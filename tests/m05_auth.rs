@@ -1,4 +1,4 @@
-//! Focused M05 tests: users snapshot, Basic guard, identity selectors, pool
+﻿//! Focused M05 tests: users snapshot, Basic guard, identity selectors, pool
 //! isolation and the `users hash` CLI input contract.
 
 mod common;
@@ -103,7 +103,7 @@ max_headers = 64
 response_header_timeout_ms = 5000
 pool_max_idle = 4
 pool_max_idle_per_key = 2
-pool_idle_timeout_ms = 4000
+pool_idle_timeout_ms = 30000
 
 [connect]
 allowed_ports = [{connect_port}]
@@ -1029,7 +1029,7 @@ fn cli_users_hash_stdin_prints_only_one_phc() {
         .to_owned();
     assert!(
         Argon2Verifier
-            .verify(&nfc_phc, "café")
+            .verify(&nfc_phc, "cafГ©")
             .expect("composed verify"),
         "stdin hashing must normalize to NFC"
     );
