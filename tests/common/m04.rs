@@ -526,11 +526,16 @@ pub async fn spawn_slow_reader_origin(
             let received = Arc::clone(&task_received);
             tokio::spawn(async move {
                 let mut buffer = vec![0_u8; read_size.max(1)];
+                let mut first = true;
                 loop {
                     tokio::time::sleep(interval).await;
                     match stream.read(&mut buffer).await {
                         Ok(0) | Err(_) => return,
                         Ok(read) => {
+                            if first {
+                                eprintln!("M04 slow reader first read={read}");
+                                first = false;
+                            }
                             received.fetch_add(read, Ordering::AcqRel);
                         }
                     }

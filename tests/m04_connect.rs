@@ -1775,7 +1775,10 @@ fn m04_io02_partial_origin_writes_refresh_shared_idle() {
         let send = client.send(&payload);
         let mut send = Box::pin(send);
         tokio::select! {
-            result = &mut send => panic!("2 MiB upload completed without backpressure: {result:?}"),
+            result = &mut send => panic!(
+                "2 MiB upload completed/failed without backpressure: {result:?}, origin_received={}",
+                origin.received.load(Ordering::Acquire)
+            ),
             _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
         }
         drop(send);
