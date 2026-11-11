@@ -68,8 +68,10 @@ def main() -> int:
     reaped = False
     try:
         output += read_until(master, b"Password:", 10)
+        time.sleep(0.5)
         os.write(master, args.password.encode("utf-8") + b"\n")
         output += read_until(master, b"Confirm password:", 10)
+        time.sleep(0.5)
         os.write(master, args.confirm.encode("utf-8") + b"\n")
         output += read_rest(master, 30)
         _, status = os.waitpid(pid, 0)
