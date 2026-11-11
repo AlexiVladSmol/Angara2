@@ -234,7 +234,7 @@ impl Proxy {
     /// Handles one non-CONNECT client request. All failures before final headers
     /// become bounded local responses; failures after headers are surfaced as
     /// body errors so the server closes/evicts the exchange.
-    pub async fn handle(
+    pub(crate) async fn handle(
         &self,
         request: Request<Incoming>,
         client: ClientInfo,
@@ -273,10 +273,9 @@ impl Proxy {
         }
 
         if method == Method::CONNECT {
-            return match CanonicalTarget::parse(&method, &target_text) {
-                Ok(_) => headers::error_response(StatusCode::NOT_IMPLEMENTED, true),
-                Err(_) => headers::error_response(StatusCode::BAD_REQUEST, true),
-            };
+            // CONNECT is served by `handle_connect`, which owns the upgrade
+            // handoff. A direct call without that context cannot succeed.
+            return headers::error_response(StatusCode::BAD_REQUEST, true);
         }
         if method == Method::TRACE {
             return headers::error_response(StatusCode::NOT_IMPLEMENTED, true);
