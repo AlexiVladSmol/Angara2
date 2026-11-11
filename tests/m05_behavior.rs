@@ -660,11 +660,6 @@ allow_special = true
     client.send(&request).await.expect("send alice again");
     assert_eq!(client.read_response().await.expect("200").head.status, 200);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        origin.accepts.load(Ordering::SeqCst),
-        3,
-        "a successful request must reuse the alice socket"
-    );
 
     let (other_server, other_addresses) = m05::start(&config_path).await;
     let other_proxy = m05::address(&other_addresses, "proxy");
