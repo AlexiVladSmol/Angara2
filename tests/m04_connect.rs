@@ -1666,3 +1666,27 @@ fn m04_con04_effective_zero_content_length_keeps_early_bytes() {
         server.shutdown().await;
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m04_con03_real_refused_loopback_maps_to_502() {
+    runtime().block_on(async {
+        let closed_port = free_port();
+        let (server, proxy) = start_proxy(&connect_config(closed_port)).await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(
+                format!(
+                    "CONNECT 127.0.0.1:{closed_port} HTTP/1.1\r\nHost: 127.0.0.1:{closed_port}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send refused connect");
+        let response = client.read_response().await.expect("read refused");
+        assert_eq!(response.head.status, 502);
+        assert!(response.body.is_empty());
+        drop(client);
+        server.shutdown().await;
+    });
+}
