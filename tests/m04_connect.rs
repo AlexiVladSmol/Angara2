@@ -1517,3 +1517,126 @@ fn m04_res02_upload_backpressure_does_not_buffer_the_whole_stream() {
         server.shutdown().await;
     });
 }
+
+struct SequenceResolver {
+    answers: std::sync::Mutex<std::collections::VecDeque<std::net::IpAddr>>,
+}
+
+impl angara::resolver::Resolver for SequenceResolver {
+    fn resolve<'a>(
+        &'a self,
+        _host: &'a str,
+        _deadline: std::time::Instant,
+    ) -> angara::resolver::ResolveFuture<'a> {
+        Box::pin(async move {
+            self.answers
+                .lock()
+                .expect("answers")
+                .pop_front()
+                .ok_or(angara::resolver::ResolveError::Failed)
+                .map(|answer| vec![answer])
+        })
+    }
+}
+
+#[test]
+fn m04_pol02_dns_change_uses_new_endpoint_for_second_connect() {
+    runtime().block_on(async {
+        let first = spawn_echo_origin(None).await.expect("first echo");
+        let second_address = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+            first.address.port(),
+        );
+        let second = spawn_echo_origin_at(second_address, None)
+            .await
+            .expect("second echo");
+        let resolver = Arc::new(SequenceResolver {
+            answers: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+            ])),
+        });
+        let config = Arc::new(
+            angara::config::Config::parse(&connect_config(first.address.port())).expect("config"),
+        );
+        let server = angara::http::HttpServer::bind_ephemeral_with_components(
+            config,
+            resolver,
+            Arc::new(angara::transport::TcpDialer),
+        )
+        .await
+        .expect("bind proxy");
+        let proxy = server.addresses()[0].1;
+        let target = format!("switch.test:{}", first.address.port());
+        for attempt in 0..2 {
+            let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+            client
+                .send(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+                .await
+                .expect("send connect");
+            assert_eq!(
+                client.read_head().await.expect("read 200").status,
+                200,
+                "attempt {attempt}"
+            );
+            client.send(b"d").await.expect("send byte");
+            assert_eq!(
+                client.read_exact_bytes(1).await.expect("echo"),
+                b"d",
+                "attempt {attempt}"
+            );
+            drop(client);
+        }
+        assert_eq!(first.accepts.load(Ordering::Acquire), 1);
+        assert_eq!(second.accepts.load(Ordering::Acquire), 1);
+        server.shutdown().await;
+    });
+}
+
+struct ConnectTimeoutDialer;
+
+impl angara::transport::Dialer for ConnectTimeoutDialer {
+    fn connect<'a>(
+        &'a self,
+        _endpoint: std::net::SocketAddr,
+        _egress: &'a angara::config::EgressProfile,
+        _deadline: std::time::Instant,
+    ) -> angara::transport::DialFuture<'a> {
+        Box::pin(async { Err(angara::transport::DialError::ConnectTimeout) })
+    }
+}
+
+#[test]
+fn m04_con03_connect_timeout_maps_to_504() {
+    runtime().block_on(async {
+        let text = connect_config(443);
+        let config = Arc::new(angara::config::Config::parse(&text).expect("config"));
+        let server = angara::http::HttpServer::bind_ephemeral_with_components(
+            config,
+            Arc::new(FixedConnectResolver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                answer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            }),
+            Arc::new(ConnectTimeoutDialer),
+        )
+        .await
+        .expect("bind proxy");
+        let proxy = server.addresses()[0].1;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .expect("send connect");
+        assert_eq!(
+            client
+                .read_response()
+                .await
+                .expect("read timeout")
+                .head
+                .status,
+            504
+        );
+        drop(client);
+        server.shutdown().await;
+    });
+}
