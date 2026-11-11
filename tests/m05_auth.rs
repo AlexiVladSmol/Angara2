@@ -1029,7 +1029,7 @@ fn cli_users_hash_stdin_prints_only_one_phc() {
         .to_owned();
     assert!(
         Argon2Verifier
-            .verify(&nfc_phc, "cafГ©")
+            .verify(&nfc_phc, "caf\u{e9}")
             .expect("composed verify"),
         "stdin hashing must normalize to NFC"
     );
