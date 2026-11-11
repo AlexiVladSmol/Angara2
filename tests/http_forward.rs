@@ -1201,7 +1201,12 @@ fn m03_http01_large_binary_upload_and_download_stream() {
         })
         .await
         .expect("start origin");
-        let text = proxy_config().replace("idle_timeout_ms = 5000", "idle_timeout_ms = 60000");
+        let text = proxy_config()
+            .replace("idle_timeout_ms = 5000", "idle_timeout_ms = 60000")
+            .replace(
+                "response_header_timeout_ms = 5000",
+                "response_header_timeout_ms = 120000",
+            );
         let (server, proxy) = start_proxy(&text).await;
         let mut client = RawClient::connect(proxy).await.expect("connect proxy");
 
