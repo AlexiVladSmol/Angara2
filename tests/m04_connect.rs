@@ -1742,7 +1742,7 @@ fn m04_io01_origin_fin_keeps_client_to_origin_direction_open() {
 #[test]
 fn m04_io02_partial_origin_writes_refresh_shared_idle() {
     runtime().block_on(async {
-        let origin = spawn_slow_reader_origin(1024, Duration::from_millis(100))
+        let origin = spawn_slow_reader_origin(4096, Duration::from_millis(100))
             .await
             .expect("slow reader origin");
         let text = connect_config_tuned(&[origin.address.port()], 1_000, 1_000);
