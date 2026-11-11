@@ -150,7 +150,10 @@ async fn m05_http01_basic_get_post_streaming_trailers_and_expect_order() {
         m05::authorization("alice", ALICE)
     );
     let mut client = RawClient::connect(proxy).await.expect("client");
-    client.send(chunked.as_bytes()).await.expect("chunked upload");
+    client
+        .send(chunked.as_bytes())
+        .await
+        .expect("chunked upload");
     let response = client.read_response().await.expect("chunked response");
     assert_eq!(response.head.status, 200);
     assert_eq!(response.text(), "upload:5");
