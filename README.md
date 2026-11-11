@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M02 принят и слит; M03 (HTTP/1.1 forward proxy) реализован в ветке `feat/9-m03-http-proxy` и передан на ревью.** Ревизия документов: 0.4. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners и выполняет forward-proxy для absolute-form HTTP/1.1; CONNECT-туннель, TLS, auth, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M03 приняты и слиты; M04 (CONNECT и TCP-туннели) реализован в ветке `feat/11-m04-connect` и передан на ревью.** Ревизия документов: 0.5. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1 и принимает CONNECT; TLS-вход к прокси, auth, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -281,9 +281,9 @@ min(32, limits.max_connections) (1..=256 и не больше max_connections).
 GET/HEAD/POST/PUT/DELETE/OPTIONS/PATCH, fixed Content-Length, chunked и
 response-until-EOF тела, потоковая передача с backpressure, клиентский
 keep-alive, `Expect: 100-continue`, упорядоченные 1xx (102/103), trailers,
-Range/If-Range и SSE. CONNECT, TRACE, Upgrade/101, HTTP/1.0 и HTTP/2
-отвергаются без dial; `Host` обязателен, единственен и должен совпадать с
-absolute URI.
+Range/If-Range и SSE. CONNECT описан в разделе M04; TRACE, Upgrade/101,
+HTTP/1.0 и HTTP/2 отвергаются без dial; `Host` обязателен, единственен и
+должен совпадать с absolute URI.
 
 - Для каждого запроса, включая keep-alive и pool hit, заново применяются
   source/request ACL, выбирается один egress и выполняется свежий DNS lookup;
@@ -318,8 +318,68 @@ absolute URI.
 Ограничения текущего этапа: 1xx передаются узким bounded writer-adapter
 (не более 16 heads/64 KiB на обмен); hyper 1.12 нормализует CL+TE до TE до
 вызова service, поэтому такой запрос обслуживается по TE и клиентское
-соединение принудительно закрывается после ответа. CONNECT и TLS — M04/M06,
-локальная auth — M05, reload и control service — M07.
+соединение принудительно закрывается после ответа. CONNECT реализован в M04;
+TLS-listener — M06, локальная auth — M05, reload и control service — M07.
+
+## M04: CONNECT и TCP-туннели
+
+`CONNECT authority:port HTTP/1.1` проходит те же source/request ACL, выбор
+egress, свежий DNS и IP-политику M02. Успешный ответ 200 отправляется только
+после реального TCP connect и не содержит Content-Length, Transfer-Encoding,
+Trailer, Upgrade, Connection или body. После 200 Angara передаёт
+непрозрачные байты в обе стороны через существующий bounded bridge и один
+writer; TLS/HTTPS, SNI и сертификат сайта остаются между клиентом и
+origin. Пул HTTP-соединений для CONNECT не используется.
+
+- `[connect]` необязателен. `allowed_ports` по умолчанию `[443]`; пустой
+  список запрещает CONNECT, максимум 64 уникальных порта 1..=65535.
+  `half_close_timeout_ms` по умолчанию 5000, диапазон 100..=300000.
+  `[connect]` с неизвестным полем или неверным значением отклоняется
+  `ConfigError`.
+- CONNECT требует authority-form с явным портом. Path/query/fragment,
+  userinfo, нулевой/переполненный порт, неверный Host, CL>0, TE, Trailer,
+  Upgrade, Expect дают локальный отказ без dial; `Expect` — 417, Via-loop —
+  508. Ранние байты после корректного head считаются началом туннеля и
+  доставляются origin ровно один раз, включая один write с CONNECT.
+- Исходящий бюджет общий с HTTP: `limits.max_connections`,
+  `transport.max_connecting` и `limits.max_client_connections` учитывают
+  живые туннели. Никакого отдельного неучтённого max_tunnels нет.
+- Relay использует фиксированные буферы 16 KiB на направление (не более
+  64 KiB) и общий byte-progress idle `limits.idle_timeout_ms`: активность
+  только в одну сторону сохраняет туннель, отсутствие положительных
+  read/write bytes закрывает его. После первого EOF уже прочитанные bytes
+  дописываются, write half получателя закрывается, и один абсолютный
+  `connect.half_close_timeout_ms` ограничивает drain второго направления;
+  обратный progress этот срок не продлевает.
+- Shutdown применяет тот же общий `shutdown_timeout_ms`, отменяет setup,
+  upgrade, relay и blocked write, затем дожидается фактического завершения
+  задач и освобождения клиентского/исходящего permit. После 200 ошибки и
+  сбросы не превращаются в новый HTTP-ответ.
+
+Ошибки до 200: неверный CONNECT → 400/close; Expect → 417/close; source,
+port gate, request ACL или IP deny → 403/close; DNS/connect/outbound busy →
+503/close; timeout → 504/close; DNS/connect failure → 502/close. Внутренние
+адреса, raw target и payload в локальные тела ошибок не попадают.
+
+### Локальный TLS/HTTPS стенд
+
+Fixture `tests/fixtures/m04_tls_site.py` создаёт временную CA и сертификат
+с SAN `localhost` только во временном каталоге (private key не коммитится),
+запускает локальный TLS site и печатает `PORT=<n>`:
+
+```console
+tmp=$(mktemp -d)
+python3 tests/fixtures/m04_tls_site.py --dir "$tmp"
+# укажите напечатанный PORT в connect.allowed_ports примера
+cargo run --locked -- serve --config examples/m04-connect-local.toml
+curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --cacert "$tmp/ca.pem" https://localhost:PORT/
+```
+
+`curl` без `-k` проверяет CA и hostname; запрос к `https://127.0.0.1:PORT/`
+отвергается проверкой имени. Тест `tests/m04_tls.rs` дополнительно проверяет
+wrong CA и cleanup. Сертификаты существуют только в `mktemp` и не попадают в
+репозиторий или CI artifacts.
 
 ### Patch hyper 1.12 для исходного request-target
 

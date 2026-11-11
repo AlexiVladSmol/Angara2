@@ -976,7 +976,7 @@ fn m03_http07_rejections_happen_without_origin_dial() {
                     origin.address, origin.address
                 )
                 .into_bytes(),
-                501,
+                403,
             ),
             (
                 b"CONNECT bad/host HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),

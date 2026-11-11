@@ -84,6 +84,11 @@ const MAX_HTTP_RESPONSE_HEADER_TIMEOUT_MS: i64 = 300_000;
 const MAX_HTTP_POOL_IDLE: i64 = 1_024;
 const MIN_HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 100;
 const MAX_HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 300_000;
+const MIN_CONNECT_HALF_CLOSE_TIMEOUT_MS: i64 = 100;
+const MAX_CONNECT_HALF_CLOSE_TIMEOUT_MS: i64 = 300_000;
+const DEFAULT_CONNECT_HALF_CLOSE_TIMEOUT_MS: i64 = 5_000;
+const DEFAULT_CONNECT_ALLOWED_PORT: i64 = 443;
+const MAX_CONNECT_ALLOWED_PORTS: usize = 64;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -103,6 +108,7 @@ pub struct Config {
     dns: DnsConfig,
     transport: TransportConfig,
     http: HttpConfig,
+    connect: ConnectConfig,
     egress: Vec<EgressProfile>,
     routing: RoutingConfig,
 }
@@ -167,6 +173,11 @@ impl Config {
     /// HTTP ingress, pool, and header limits.
     pub fn http(&self) -> &HttpConfig {
         &self.http
+    }
+
+    /// CONNECT tunnel policy and half-close drain.
+    pub fn connect(&self) -> &ConnectConfig {
+        &self.connect
     }
 
     /// Validated egress profiles.
@@ -595,6 +606,30 @@ impl HttpConfig {
     }
 }
 
+/// CONNECT tunnel policy.
+#[derive(Debug)]
+pub struct ConnectConfig {
+    allowed_ports: Vec<u16>,
+    half_close_timeout: Duration,
+}
+
+impl ConnectConfig {
+    /// Ports that CONNECT may dial. An empty list denies every CONNECT.
+    pub fn allowed_ports(&self) -> &[u16] {
+        &self.allowed_ports
+    }
+
+    /// Whether the destination port is explicitly allowed.
+    pub fn allows_port(&self, port: u16) -> bool {
+        self.allowed_ports.binary_search(&port).is_ok()
+    }
+
+    /// Absolute drain deadline after the first tunnel read EOF.
+    pub fn half_close_timeout(&self) -> Duration {
+        self.half_close_timeout
+    }
+}
+
 /// One listener definition.
 ///
 /// This build supports only the `http` transport. An IPv6 listener is IPv6-only;
@@ -883,6 +918,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let dns = validate_dns(raw.dns)?;
     let transport = validate_transport(raw.transport, &limits)?;
     let http = validate_http(raw.http, &limits)?;
+    let connect = validate_connect(raw.connect)?;
     let (egress, routing) = validate_egress_routing(raw.egress, raw.routing, &listener_ids)?;
 
     Ok(Config {
@@ -896,6 +932,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         dns,
         transport,
         http,
+        connect,
         egress,
         routing,
     })
@@ -1411,6 +1448,48 @@ fn validate_http(raw: Option<RawHttp>, limits: &Limits) -> Result<HttpConfig, Co
     })
 }
 
+fn validate_connect(raw: Option<RawConnect>) -> Result<ConnectConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let mut allowed_ports = match raw.allowed_ports {
+        Some(ports) => {
+            if ports.len() > MAX_CONNECT_ALLOWED_PORTS {
+                return Err(validation(
+                    "connect.allowed_ports",
+                    format!("at most {MAX_CONNECT_ALLOWED_PORTS} ports are supported"),
+                ));
+            }
+            let mut parsed = Vec::with_capacity(ports.len());
+            for (index, port) in ports.into_iter().enumerate() {
+                let path = format!("connect.allowed_ports[{index}]");
+                if !(1..=i64::from(u16::MAX)).contains(&port) {
+                    return Err(validation(path, "must be an integer from 1 to 65535"));
+                }
+                let port = port as u16;
+                if parsed.contains(&port) {
+                    return Err(validation(path, "duplicate CONNECT port"));
+                }
+                parsed.push(port);
+            }
+            parsed
+        }
+        None => vec![DEFAULT_CONNECT_ALLOWED_PORT as u16],
+    };
+    allowed_ports.sort_unstable();
+
+    let half_close_timeout_ms = bounded_optional(
+        "connect.half_close_timeout_ms",
+        raw.half_close_timeout_ms,
+        MIN_CONNECT_HALF_CLOSE_TIMEOUT_MS,
+        MAX_CONNECT_HALF_CLOSE_TIMEOUT_MS,
+        DEFAULT_CONNECT_HALF_CLOSE_TIMEOUT_MS,
+    )?;
+
+    Ok(ConnectConfig {
+        allowed_ports,
+        half_close_timeout: Duration::from_millis(half_close_timeout_ms as u64),
+    })
+}
+
 fn validate_egress_routing(
     raw_egress: Option<Vec<RawEgress>>,
     raw_routing: Option<RawRouting>,
@@ -1667,6 +1746,8 @@ struct RawConfig {
     #[serde(default)]
     http: Option<RawHttp>,
     #[serde(default)]
+    connect: Option<RawConnect>,
+    #[serde(default)]
     egress: Option<Vec<RawEgress>>,
     #[serde(default)]
     routing: Option<RawRouting>,
@@ -1777,6 +1858,15 @@ struct RawHttp {
     pool_max_idle_per_key: Option<i64>,
     #[serde(default)]
     pool_idle_timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawConnect {
+    #[serde(default)]
+    allowed_ports: Option<Vec<i64>>,
+    #[serde(default)]
+    half_close_timeout_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]

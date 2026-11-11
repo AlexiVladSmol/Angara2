@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod m03;
+pub mod m04;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -124,6 +124,7 @@ pub struct SplitIo {
     write: DuplexStream,
     idle: IdleState,
     output: Arc<ConnectionOutput>,
+    tunnel: Arc<AtomicBool>,
 }
 
 impl SplitIo {
@@ -133,6 +134,21 @@ impl SplitIo {
         idle_timeout: Duration,
         output: Arc<ConnectionOutput>,
     ) -> (Self, OwnedWriteHalf, DuplexStream) {
+        Self::with_tunnel_flag(
+            stream,
+            idle_timeout,
+            output,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Creates the combined IO with a shared tunnel-mode flag.
+    pub fn with_tunnel_flag(
+        stream: tokio::net::TcpStream,
+        idle_timeout: Duration,
+        output: Arc<ConnectionOutput>,
+        tunnel: Arc<AtomicBool>,
+    ) -> (Self, OwnedWriteHalf, DuplexStream) {
         let (read, write) = stream.into_split();
         let (bridge_writer, bridge_reader) = tokio::io::duplex(64 * 1024);
         (
@@ -141,6 +157,7 @@ impl SplitIo {
                 write: bridge_writer,
                 idle: IdleState::new(idle_timeout),
                 output,
+                tunnel,
             },
             write,
             bridge_reader,
@@ -165,7 +182,9 @@ impl AsyncRead for SplitIo {
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => {
-                if this.idle.poll_expired(context).is_ready() {
+                if !this.tunnel.load(Ordering::Acquire)
+                    && this.idle.poll_expired(context).is_ready()
+                {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "idle client read timeout",
@@ -195,7 +214,9 @@ impl AsyncWrite for SplitIo {
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => {
-                if this.idle.poll_expired(context).is_ready() {
+                if !this.tunnel.load(Ordering::Acquire)
+                    && this.idle.poll_expired(context).is_ready()
+                {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "idle client write timeout",
@@ -216,7 +237,9 @@ impl AsyncWrite for SplitIo {
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => {
-                if this.idle.poll_expired(context).is_ready() {
+                if !this.tunnel.load(Ordering::Acquire)
+                    && this.idle.poll_expired(context).is_ready()
+                {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "idle client flush timeout",
@@ -243,6 +266,7 @@ pub async fn writer_loop(
     mut interim: mpsc::Receiver<Bytes>,
     idle_timeout: Duration,
     output: Arc<ConnectionOutput>,
+    tunnel: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut interim_open = true;
@@ -252,7 +276,7 @@ pub async fn writer_loop(
             maybe_interim = interim.recv(), if interim_open => {
                 match maybe_interim {
                     Some(bytes) => {
-                        write_all_bounded(&mut socket, &bytes, idle_timeout).await?;
+                        write_all_bounded(&mut socket, &bytes, idle_timeout, &tunnel).await?;
                     }
                     None => interim_open = false,
                 }
@@ -262,12 +286,16 @@ pub async fn writer_loop(
                 if read == 0 {
                     break;
                 }
-                write_all_bounded(&mut socket, &buffer[..read], idle_timeout).await?;
+                write_all_bounded(&mut socket, &buffer[..read], idle_timeout, &tunnel).await?;
                 output.consumed(read);
             }
         }
     }
-    let _ = tokio::time::timeout(idle_timeout, socket.shutdown()).await;
+    if tunnel.load(Ordering::Acquire) {
+        let _ = socket.shutdown().await;
+    } else {
+        let _ = tokio::time::timeout(idle_timeout, socket.shutdown()).await;
+    }
     Ok(())
 }
 
@@ -275,24 +303,32 @@ async fn write_all_bounded(
     socket: &mut OwnedWriteHalf,
     bytes: &[u8],
     idle_timeout: Duration,
+    tunnel: &AtomicBool,
 ) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        match tokio::time::timeout(idle_timeout, socket.write(&bytes[written..])).await {
-            Ok(Ok(0)) => {
+        let result = if tunnel.load(Ordering::Acquire) {
+            socket.write(&bytes[written..]).await
+        } else {
+            match tokio::time::timeout(idle_timeout, socket.write(&bytes[written..])).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "idle client write timeout",
+                    ));
+                }
+            }
+        };
+        match result {
+            Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "client socket stopped accepting bytes",
                 ));
             }
-            Ok(Ok(count)) => written += count,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "idle client write timeout",
-                ));
-            }
+            Ok(count) => written += count,
+            Err(error) => return Err(error),
         }
     }
     Ok(())
