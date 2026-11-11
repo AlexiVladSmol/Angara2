@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::m03::*;
 use common::m04::*;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::{Builder, Runtime};
 
 fn runtime() -> Runtime {
@@ -1687,6 +1687,212 @@ fn m04_con03_real_refused_loopback_maps_to_502() {
         assert_eq!(response.head.status, 502);
         assert!(response.body.is_empty());
         drop(client);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m04_io01_origin_fin_keeps_client_to_origin_direction_open() {
+    runtime().block_on(async {
+        let origin = spawn_half_close_write_origin(b"origin-finished-writing".to_vec())
+            .await
+            .expect("half-close origin");
+        let (server, proxy) = start_proxy(&connect_config_tuned(
+            &[origin.address.port()],
+            5_000,
+            1_000,
+        ))
+        .await;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        client
+            .send(
+                format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    origin.address, origin.address
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send connect");
+        assert_eq!(client.read_head().await.expect("read 200").status, 200);
+        let greeting = client.read_until_eof().await.expect("read origin FIN");
+        assert_eq!(greeting, b"origin-finished-writing");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+            .send(b"client-after-origin-fin")
+            .await
+            .expect("send after origin FIN");
+        client.shutdown_write().await.expect("client EOF");
+        assert!(
+            wait_until(|| {
+                origin.received.lock().unwrap().as_slice() == b"client-after-origin-fin"
+            })
+            .await,
+            "origin did not receive bytes after its FIN: {:?}",
+            origin.received.lock().unwrap()
+        );
+        assert_eq!(origin.accepts.load(Ordering::Acquire), 1);
+        drop(client);
+        server.shutdown().await;
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m04_io02_partial_origin_writes_refresh_shared_idle() {
+    runtime().block_on(async {
+        let origin = spawn_slow_reader_origin(1024, Duration::from_millis(100))
+            .await
+            .expect("slow reader origin");
+        let (server, proxy) = start_proxy(&connect_config_tuned(
+            &[origin.address.port()],
+            1_000,
+            1_000,
+        ))
+        .await;
+        let mut client = connect_small_buffers(proxy).await.expect("connect proxy");
+        client
+            .send(
+                format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    origin.address, origin.address
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send connect");
+        assert_eq!(client.read_head().await.expect("read 200").status, 200);
+
+        let payload = vec![b'P'; 2 * 1024 * 1024];
+        let send = client.send(&payload);
+        let mut send = Box::pin(send);
+        tokio::select! {
+            result = &mut send => panic!("2 MiB upload completed without backpressure: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
+        }
+        drop(send);
+        let closed =
+            tokio::time::timeout(Duration::from_millis(200), client.read_until_eof()).await;
+        assert!(
+            closed.is_err(),
+            "tunnel was closed despite ongoing slow origin progress: {closed:?}"
+        );
+        assert!(origin.received.load(Ordering::Acquire) > 0);
+        drop(client);
+        server.shutdown().await;
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m04_srv01_final_bridge_drain_uses_half_close_deadline() {
+    runtime().block_on(async {
+        let origin = spawn_eof_then_write_origin(4 * 1024 * 1024)
+            .await
+            .expect("EOF then write origin");
+        let text = connect_config_tuned(&[origin.address.port()], 5_000, 200)
+            .replace("max_client_connections = 16", "max_client_connections = 1");
+        let (server, proxy) = start_proxy(&text).await;
+
+        let mut first = connect_small_buffers(proxy).await.expect("first client");
+        first
+            .send(
+                format!(
+                    "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                    origin.address, origin.address
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send first connect");
+        assert_eq!(first.read_head().await.expect("read first 200").status, 200);
+        first.shutdown_write().await.expect("first half-close");
+        let started = std::time::Instant::now();
+
+        let mut second = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut candidate = RawClient::connect(proxy).await.expect("second client");
+            candidate
+                .send(
+                    format!(
+                        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+                        origin.address, origin.address
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("send second connect");
+            match tokio::time::timeout(Duration::from_millis(500), candidate.read_head()).await {
+                Ok(Ok(head)) if head.status == 200 => {
+                    second = Some(candidate);
+                    break;
+                }
+                _ => drop(candidate),
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            second.is_some(),
+            "client permit was not released within 2 s: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "final drain used a fresh idle window: {elapsed:?}"
+        );
+        drop(second);
+        drop(first);
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn m04_con04_split_head_and_large_early_payload() {
+    runtime().block_on(async {
+        let echo = spawn_echo_origin(None).await.expect("echo origin");
+        let (server, proxy) = start_proxy(&connect_config(echo.address.port())).await;
+        let stream = tokio::net::TcpStream::connect(proxy)
+            .await
+            .expect("connect proxy");
+        let (mut read, mut write) = stream.into_split();
+        let target = echo.address.to_string();
+        let first = format!("CONNECT {target} HTTP/1.1\r\nHo");
+        let second = format!("st: {target}\r\n\r\n");
+        let mut payload = b"GET http://looks-like-http/ HTTP/1.1\r\n\r\n\0\xff".to_vec();
+        payload.extend((0..128 * 1024).map(|value| (value % 251) as u8));
+        let payload_len = payload.len();
+        let mut full = second.into_bytes();
+        full.extend_from_slice(&payload);
+        let writer = tokio::spawn(async move {
+            write
+                .write_all(first.as_bytes())
+                .await
+                .expect("write head part 1");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            write
+                .write_all(&full)
+                .await
+                .expect("write head part 2 and payload");
+        });
+
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            read.read_exact(&mut byte).await.expect("read head byte");
+            head.push(byte[0]);
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "unexpected CONNECT head: {:?}",
+            String::from_utf8_lossy(&head)
+        );
+        let mut echoed = vec![0_u8; payload_len];
+        read.read_exact(&mut echoed).await.expect("read early echo");
+        assert_eq!(echoed, payload, "large early payload changed");
+        writer.await.expect("join writer");
+        assert_eq!(echo.accepts.load(Ordering::Acquire), 1);
+        drop(read);
         server.shutdown().await;
     });
 }

@@ -43,6 +43,7 @@ fn m04_spike_connect_upgrade_preserves_early_and_origin_first_bytes() {
             let (stream, _) = listener.accept().await.expect("proxy accept");
             let output = ConnectionOutput::new();
             let tunnel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let progress = angara::http::connect::TunnelProgress::new();
             let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag(
                 stream,
                 Duration::from_secs(5),
@@ -57,6 +58,7 @@ fn m04_spike_connect_upgrade_preserves_early_and_origin_first_bytes() {
                 Duration::from_secs(5),
                 output.clone(),
                 tunnel,
+                progress,
             );
             let service = service_fn(move |mut request| async move {
                 let on_upgrade = hyper::upgrade::on(&mut request);

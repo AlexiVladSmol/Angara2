@@ -24,8 +24,10 @@ pub(crate) struct TunnelSetup {
 
 /// How a tunnel session ended.
 pub(crate) enum TunnelEnd {
-    /// Both directions reached EOF and shut down their write halves.
-    Complete,
+    /// Both directions reached EOF and shut down their write halves. The
+    /// optional deadline is the absolute first-EOF drain deadline, which still
+    /// applies to the final bridge/socket writer drain.
+    Complete { drain_deadline: Option<Instant> },
     /// No byte progress was observed in either direction before the idle limit.
     Idle,
     /// The first EOF was not followed by completion within the drain deadline.
@@ -39,11 +41,11 @@ pub(crate) async fn run(
     origin: Connected,
     idle_timeout: Duration,
     half_close_timeout: Duration,
+    progress: Arc<TunnelProgress>,
 ) -> TunnelEnd {
     let (client_read, client_write) = tokio::io::split(client);
     let (origin_read, origin_write) = tokio::io::split(origin);
 
-    let progress = Arc::new(Progress::new());
     let state = Arc::new(CopyState::new());
     let mut client_to_origin = Box::pin(copy_direction(
         client_read,
@@ -59,7 +61,7 @@ pub(crate) async fn run(
     ));
     let idle = wait_idle(Arc::clone(&progress), idle_timeout);
     tokio::pin!(idle);
-    let drain = wait_drain(state, half_close_timeout);
+    let drain = wait_drain(Arc::clone(&state), half_close_timeout);
     tokio::pin!(drain);
 
     let mut client_done = false;
@@ -83,7 +85,8 @@ pub(crate) async fn run(
             _ = &mut drain => return TunnelEnd::HalfCloseTimeout,
         }
         if client_done && origin_done {
-            return TunnelEnd::Complete;
+            let drain_deadline = state.first_eof().map(|first| first + half_close_timeout);
+            return TunnelEnd::Complete { drain_deadline };
         }
     }
 }
@@ -91,7 +94,7 @@ pub(crate) async fn run(
 async fn copy_direction<R, W>(
     mut reader: ReadHalf<R>,
     mut writer: WriteHalf<W>,
-    progress: Arc<Progress>,
+    progress: Arc<TunnelProgress>,
     state: Arc<CopyState>,
 ) -> io::Result<()>
 where
@@ -107,12 +110,33 @@ where
             return Ok(());
         }
         progress.hit();
-        writer.write_all(&buffer[..read]).await?;
-        progress.hit();
+        write_all_progress(&mut writer, &buffer[..read], &progress).await?;
     }
 }
 
-async fn wait_idle(progress: Arc<Progress>, idle: Duration) {
+async fn write_all_progress<W>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    progress: &TunnelProgress,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !bytes.is_empty() {
+        let written = writer.write(bytes).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "tunnel peer stopped accepting bytes",
+            ));
+        }
+        progress.hit();
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+async fn wait_idle(progress: Arc<TunnelProgress>, idle: Duration) {
     loop {
         let observed = progress.sequence.load(Ordering::Relaxed);
         let notified = progress.notify.notified();
@@ -146,20 +170,24 @@ async fn wait_drain(state: Arc<CopyState>, half_close_timeout: Duration) {
     tokio::time::sleep_until(first + half_close_timeout).await;
 }
 
-struct Progress {
+/// Shared tunnel byte-progress notifier.
+#[doc(hidden)]
+pub struct TunnelProgress {
     sequence: AtomicU64,
     notify: Notify,
 }
 
-impl Progress {
-    fn new() -> Self {
-        Self {
+impl TunnelProgress {
+    /// Creates a progress tracker.
+    #[doc(hidden)]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             sequence: AtomicU64::new(0),
             notify: Notify::new(),
-        }
+        })
     }
 
-    fn hit(&self) {
+    pub(crate) fn hit(&self) {
         self.sequence.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
     }
@@ -191,5 +219,54 @@ impl CopyState {
         if first {
             self.notify.notify_one();
         }
+    }
+
+    fn first_eof(&self) -> Option<Instant> {
+        *self.first_eof.lock().expect("tunnel EOF state")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ChunkWriter {
+        max: usize,
+    }
+
+    impl AsyncWrite for ChunkWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len().min(self.max)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn partial_writes_count_as_progress() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let progress = TunnelProgress::new();
+            let mut writer = ChunkWriter { max: 3 };
+            write_all_progress(&mut writer, &[1_u8; 10], &progress)
+                .await
+                .expect("write");
+            assert_eq!(progress.sequence.load(Ordering::Relaxed), 4);
+        });
     }
 }

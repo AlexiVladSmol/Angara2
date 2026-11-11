@@ -91,15 +91,19 @@ fn m04_con05_tls_handshake_and_certificate_validation_through_tunnel() {
             "/tests/fixtures/m04_tls_client.py"
         );
         let ca = dir.path().join("ca.pem");
-        for mode in ["good", "wrong-name", "wrong-ca"] {
+        for mode in [
+            "good",
+            "good-upload",
+            "good-download",
+            "wrong-name",
+            "wrong-ca",
+        ] {
             let output = Command::new(python())
                 .arg(client_script)
                 .arg("--proxy-host")
                 .arg("127.0.0.1")
                 .arg("--proxy-port")
                 .arg(proxy.port().to_string())
-                .arg("--target-host")
-                .arg("localhost")
                 .arg("--target-port")
                 .arg(port.to_string())
                 .arg("--ca")
@@ -115,11 +119,35 @@ fn m04_con05_tls_handshake_and_certificate_validation_through_tunnel() {
                 "mode {mode} failed: status={:?} stdout={stdout} stderr={stderr}",
                 output.status
             );
-            match mode {
-                "good" => assert_eq!(stdout.trim(), "TLS_OK", "{stderr}"),
-                _ => assert_eq!(stdout.trim(), "TLS_REJECTED", "{stderr}"),
-            }
+            let expected = match mode {
+                "good" => "TLS_OK",
+                "good-upload" => "TLS_UPLOAD_OK",
+                "good-download" => "TLS_DOWNLOAD_OK",
+                _ => "TLS_REJECTED",
+            };
+            assert_eq!(stdout.trim(), expected, "mode {mode}: {stderr}");
         }
+
+        let unavailable_proxy = free_port();
+        let control = Command::new(python())
+            .arg(client_script)
+            .arg("--proxy-host")
+            .arg("127.0.0.1")
+            .arg("--proxy-port")
+            .arg(unavailable_proxy.to_string())
+            .arg("--target-port")
+            .arg(port.to_string())
+            .arg("--ca")
+            .arg(&ca)
+            .arg("--mode")
+            .arg("wrong-ca")
+            .output()
+            .expect("run unavailable proxy control");
+        assert!(
+            !control.status.success(),
+            "unavailable proxy was misreported as an expected TLS rejection: {}",
+            String::from_utf8_lossy(&control.stdout)
+        );
         server.shutdown().await;
     });
 }

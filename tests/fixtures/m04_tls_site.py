@@ -7,6 +7,7 @@ The private key stays in the temporary directory and is never committed.
 """
 
 import argparse
+import hashlib
 import http.server
 import os
 import socket
@@ -157,11 +158,35 @@ def ensure_certificates(directory: str) -> None:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"tls-ok"
+        if self.path == "/download":
+            body = bytes(((index * 17) % 251) for index in range(1024 * 1024))
+        elif self.path == "/":
+            body = b"tls-ok"
+        else:
+            body = b"not-found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/upload":
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        response = f"upload:{len(body)}:{hashlib.sha256(body).hexdigest()}".encode("ascii")
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
 
     def log_message(self, _format, *_args):
         pass

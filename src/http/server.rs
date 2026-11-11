@@ -18,7 +18,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::http::connect::{TunnelEnd, TunnelSetup};
+use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, Proxy};
 use crate::http::headers;
 use crate::http::interim::{InterimHub, SplitIo, writer_loop};
@@ -298,6 +298,7 @@ async fn serve_client(
     let service_output = Arc::clone(&output);
     let tunnel_slot: Arc<Mutex<Option<TunnelSetup>>> = Arc::new(Mutex::new(None));
     let service_slot = Arc::clone(&tunnel_slot);
+    let tunnel_progress = TunnelProgress::new();
     let service = service_fn(move |mut request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
@@ -360,6 +361,7 @@ async fn serve_client(
         idle_timeout,
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
+        Arc::clone(&tunnel_progress),
     );
     let mut connection = Box::pin(connection);
     let mut writer = Box::pin(writer);
@@ -409,19 +411,29 @@ async fn serve_client(
                         origin,
                         idle_timeout,
                         config.connect().half_close_timeout(),
+                        Arc::clone(&tunnel_progress),
                     ));
-                    let outcome = tokio::select! {
-                        biased;
-                        _ = force.changed() => None,
-                        _ = &mut writer => {
-                            None
+                    let mut writer_done = false;
+                    let outcome = loop {
+                        tokio::select! {
+                            biased;
+                            _ = force.changed() => break None,
+                            result = &mut writer, if !writer_done => {
+                                writer_done = true;
+                                if result.is_err() {
+                                    break None;
+                                }
+                            }
+                            outcome = &mut tunnel => break Some(outcome),
                         }
-                        outcome = &mut tunnel => Some(outcome),
                     };
                     drop(tunnel);
                     match outcome {
-                        Some(TunnelEnd::Complete) => {
-                            let _ = tokio::time::timeout(idle_timeout, &mut writer).await;
+                        Some(TunnelEnd::Complete { drain_deadline }) if !writer_done => {
+                            if let Some(deadline) = drain_deadline {
+                                let _ = tokio::time::timeout_at(deadline, &mut writer).await;
+                            }
+                            drop(writer);
                         }
                         _ => drop(writer),
                     }

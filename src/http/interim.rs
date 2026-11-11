@@ -21,6 +21,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use crate::http::ConnectionOutput;
+use crate::http::connect::TunnelProgress;
 use crate::http::headers;
 use crate::http::idle::IdleState;
 
@@ -267,6 +268,7 @@ pub async fn writer_loop(
     idle_timeout: Duration,
     output: Arc<ConnectionOutput>,
     tunnel: Arc<AtomicBool>,
+    progress: Arc<TunnelProgress>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut interim_open = true;
@@ -276,7 +278,7 @@ pub async fn writer_loop(
             maybe_interim = interim.recv(), if interim_open => {
                 match maybe_interim {
                     Some(bytes) => {
-                        write_all_bounded(&mut socket, &bytes, idle_timeout, &tunnel).await?;
+                        write_all_bounded(&mut socket, &bytes, idle_timeout, &tunnel, &progress).await?;
                     }
                     None => interim_open = false,
                 }
@@ -286,7 +288,7 @@ pub async fn writer_loop(
                 if read == 0 {
                     break;
                 }
-                write_all_bounded(&mut socket, &buffer[..read], idle_timeout, &tunnel).await?;
+                write_all_bounded(&mut socket, &buffer[..read], idle_timeout, &tunnel, &progress).await?;
                 output.consumed(read);
             }
         }
@@ -304,14 +306,20 @@ async fn write_all_bounded(
     bytes: &[u8],
     idle_timeout: Duration,
     tunnel: &AtomicBool,
+    progress: &TunnelProgress,
 ) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let result = if tunnel.load(Ordering::Acquire) {
-            socket.write(&bytes[written..]).await
+        let count = if tunnel.load(Ordering::Acquire) {
+            let count = socket.write(&bytes[written..]).await?;
+            if count > 0 {
+                progress.hit();
+            }
+            count
         } else {
             match tokio::time::timeout(idle_timeout, socket.write(&bytes[written..])).await {
-                Ok(result) => result,
+                Ok(Ok(count)) => count,
+                Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -320,16 +328,13 @@ async fn write_all_bounded(
                 }
             }
         };
-        match result {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "client socket stopped accepting bytes",
-                ));
-            }
-            Ok(count) => written += count,
-            Err(error) => return Err(error),
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "client socket stopped accepting bytes",
+            ));
         }
+        written += count;
     }
     Ok(())
 }

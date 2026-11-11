@@ -433,3 +433,168 @@ pub async fn spawn_holding_origin() -> io::Result<HoldingOrigin> {
         task,
     })
 }
+
+/// A TCP origin that writes a greeting, half-closes its write side, then keeps
+/// reading and recording client bytes.
+pub struct HalfCloseWriteOrigin {
+    pub address: SocketAddr,
+    pub accepts: Arc<AtomicUsize>,
+    pub received: Arc<std::sync::Mutex<Vec<u8>>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for HalfCloseWriteOrigin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn spawn_half_close_write_origin(greeting: Vec<u8>) -> io::Result<HalfCloseWriteOrigin> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_accepts = Arc::clone(&accepts);
+    let task_received = Arc::clone(&received);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            task_accepts.fetch_add(1, Ordering::AcqRel);
+            let greeting = greeting.clone();
+            let received = Arc::clone(&task_received);
+            tokio::spawn(async move {
+                if stream.write_all(&greeting).await.is_err() {
+                    return;
+                }
+                if stream.shutdown().await.is_err() {
+                    return;
+                }
+                let mut buffer = [0_u8; TEST_TUNNEL_BUFFER];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => received
+                            .lock()
+                            .expect("half-close received")
+                            .extend_from_slice(&buffer[..read]),
+                    }
+                }
+            });
+        }
+    });
+    Ok(HalfCloseWriteOrigin {
+        address,
+        accepts,
+        received,
+        task,
+    })
+}
+
+/// A TCP origin that reads slowly in small chunks and records all bytes.
+pub struct SlowReaderOrigin {
+    pub address: SocketAddr,
+    pub accepts: Arc<AtomicUsize>,
+    pub received: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for SlowReaderOrigin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn spawn_slow_reader_origin(
+    read_size: usize,
+    interval: Duration,
+) -> io::Result<SlowReaderOrigin> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(AtomicUsize::new(0));
+    let task_accepts = Arc::clone(&accepts);
+    let task_received = Arc::clone(&received);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            task_accepts.fetch_add(1, Ordering::AcqRel);
+            let _ = socket2::SockRef::from(&stream).set_recv_buffer_size(4096);
+            let received = Arc::clone(&task_received);
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; read_size.max(1)];
+                loop {
+                    tokio::time::sleep(interval).await;
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => {
+                            received.fetch_add(read, Ordering::AcqRel);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(SlowReaderOrigin {
+        address,
+        accepts,
+        received,
+        task,
+    })
+}
+
+/// A TCP origin that waits for client EOF, then sends `total` bytes and closes.
+pub struct EofThenWriteOrigin {
+    pub address: SocketAddr,
+    pub accepts: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for EofThenWriteOrigin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn spawn_eof_then_write_origin(total: usize) -> io::Result<EofThenWriteOrigin> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let task_accepts = Arc::clone(&accepts);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            task_accepts.fetch_add(1, Ordering::AcqRel);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; TEST_TUNNEL_BUFFER];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+                let chunk = vec![b'L'; 64 * 1024];
+                let mut sent = 0;
+                while sent < total {
+                    let take = chunk.len().min(total - sent);
+                    if stream.write_all(&chunk[..take]).await.is_err() {
+                        return;
+                    }
+                    sent += take;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    Ok(EofThenWriteOrigin {
+        address,
+        accepts,
+        task,
+    })
+}

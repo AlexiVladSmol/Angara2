@@ -156,12 +156,27 @@ jobs:
             sleep 0.1
           done
           grep -q 'tls-ok' "$TMP/tls.txt"
-          if curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+          head -c 1048576 /dev/urandom >"$TMP/upload.bin"
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --cacert "$TMP/ca.pem" \
+            --data-binary @"$TMP/upload.bin" "https://localhost:$PORT/upload" \
+            -o "$TMP/upload.txt"
+          test "$(cat "$TMP/upload.txt")" = \
+            "upload:1048576:$(sha256sum "$TMP/upload.bin" | cut -d' ' -f1)"
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
+            --cacert "$TMP/ca.pem" "https://localhost:$PORT/download" \
+            -o "$TMP/download.bin"
+          test "$(wc -c <"$TMP/download.bin")" -eq 1048576
+          EXPECTED=$(python3 -c 'import hashlib; print(hashlib.sha256(bytes((i * 17) % 251 for i in range(1024 * 1024))).hexdigest())')
+          test "$(sha256sum "$TMP/download.bin" | cut -d' ' -f1)" = "$EXPECTED"
+          set +e
+          curl -fsS --noproxy '' --proxy http://127.0.0.1:3128 \
             --cacert "$TMP/ca.pem" "https://127.0.0.1:$PORT/" \
-            -o /dev/null 2>/dev/null; then
-            echo "wrong-name TLS unexpectedly succeeded" >&2
-            exit 1
-          fi
+            -o /dev/null 2>"$TMP/negative.err"
+          NEGATIVE_CODE=$?
+          set -e
+          test "$NEGATIVE_CODE" -eq 60
+          grep -Eqi 'certificate|subject|altname|SSL' "$TMP/negative.err"
           kill -TERM "$PROXY_PID"
           wait "$PROXY_PID"
           kill "$SITE_PID" 2>/dev/null || true
