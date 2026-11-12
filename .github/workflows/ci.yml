@@ -225,6 +225,7 @@ jobs:
           trap cleanup EXIT
           umask 077
           python3 tests/fixtures/m06_pki.py --dir "$TMP/pki"
+          mkdir -p "$TMP/site"
           python3 tests/fixtures/m04_tls_site.py --dir "$TMP/site" \
             >"$TMP/site-port.txt" 2>"$TMP/site.log" &
           SITE_PID=$!
