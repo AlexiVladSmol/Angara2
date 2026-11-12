@@ -15,4 +15,5 @@ pub mod resolver;
 pub mod routing;
 pub mod runtime;
 pub mod target;
+mod tls;
 pub mod transport;

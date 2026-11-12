@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00–M04 приняты и слиты; M05 (локальные пользователи, Basic и ACL по identity) реализуется в ветке `feat/14-m05-auth`.** Ревизия документов: 0.6. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1, принимает CONNECT и проверяет Basic credentials на listener с `auth = "basic"`; TLS-вход к прокси, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M05 приняты и слиты; M06 (HTTPS listeners и TLS-вход к прокси) реализован в ветке `feat/17-m06-tls` и передан на ревью.** Ревизия документов: 0.7. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP и HTTPS listeners, выполняет forward-proxy для absolute-form HTTP/1.1, принимает CONNECT и проверяет Basic credentials на listener с `auth = "basic"`; cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -92,6 +92,10 @@ schema_version = 1
 [runtime]
 worker_threads = "auto" # или целое 1..=64
 
+[tls]
+max_handshaking = 32
+handshake_timeout_ms = 5000
+
 [limits]
 max_connections = 256
 max_client_connections = 128
@@ -113,17 +117,30 @@ bind = "127.0.0.1:3128"
 transport = "http"
 ```
 
-- Неизвестные ключи и будущие активные разделы (TLS, auth, ACL, egress,
-  routing, cache, admin и т. п.) отклоняются, а не игнорируются.
+- Неизвестные ключи и будущие активные разделы (ACL вне `[access]`, cache,
+  admin, parent и т. п.) отклоняются, а не игнорируются.
 - `schema_version` поддерживается только `1`.
 - `listeners`: от 1 до 64 определений; `id` уникален, состоит из 1–64 ASCII
   букв, цифр, `-`, `_`, `.`; `bind` — только числовой `IP:port` с портом
-  1–65535; `transport` в M01 — только `http`.
+  1–65535; `transport` — `http` или `https`. Для `https` обязателен
+  `[listeners.tls]`, для `http` он запрещён. `allow_insecure_basic` допустим
+  только с `auth = "basic"` на HTTP listener и отвергается на HTTPS.
 - Дубли `id`/адресов и пересечение wildcard-адреса с конкретным адресом того
   же семейства и порта отвергаются. IPv6 listener проектируется как IPv6-only:
   будущий bind выставит `IPV6_V6ONLY`, поэтому `0.0.0.0` и `[::]` на одном
   порту не конфликтуют. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) и scoped IPv6
   отклоняются.
+- `[tls]` необязателен: `max_handshaking` 1–256 (default 32) — общий предел
+  одновременных TLS handshake всех HTTPS listeners; `handshake_timeout_ms`
+  100–60000 (default 5000) — абсолютный срок от TCP accept.
+  `listeners[].tls.cert_chain_file` и `listeners[].tls.private_key_file`
+  разрешаются относительно каталога config и читаются один раз при загрузке
+  snapshot. Chain — 1–16 PEM `CERTIFICATE` (leaf-first), key — ровно один
+  поддерживаемый unencrypted PKCS#1/PKCS#8/SEC1 ключ, файл до 1 MiB; rustls
+  проверяет соответствие ключа leaf-сертификату. На Linux key не должен иметь
+  group-write/world-битов (например `0600`/`0640`), chain — write для
+  group/world (например `0600`/`0644`), владелец — effective UID сервиса или
+  root.
 - `limits`: `max_connections` 1–65535 — общий бюджет исходящих sockets
   (connecting, leased и idle); `max_client_connections` 1–65535 — отдельный
   входящий бюджет принятых клиентских sockets, включая keep-alive idle
@@ -170,13 +187,16 @@ transport = "http"
 M02 добавляет `http`, `ipnet`, `idna` и Tokio `net`/`time`/`sync`/`io-util`.
 M03 добавляет `hyper` 1.12 (`client`, `http1`, `server`), `hyper-util`
 (`TokioIo`, таймер), `http-body`, `http-body-util`, `bytes`, `socket2` и
-Tokio `macros`/`signal`. Hyper 1.12.0 закреплён с минимальным локальным
-patch для `OriginalRequestTarget`; см. раздел M03 и
+Tokio `macros`/`signal`. M06 добавляет `rustls` 0.23 (ring, `tls12`),
+`tokio-rustls` 0.26, `rustls-pki-types` 1 (PEM parsing) и `x509-parser` 0.18.
+Hyper 1.12.0
+закреплён с минимальным локальным patch для `OriginalRequestTarget`; см.
+раздел M03 и
 [`vendor/hyper-1.12.0/ANGARA_PATCH.md`](vendor/hyper-1.12.0/ANGARA_PATCH.md).
-`rustls`, CLI-фреймворк и dev-зависимости пока не подключены. Политика
+Политика
 зависимостей проверяется
 [`deny.toml`](deny.toml): RustSec advisories, allow-list MIT/Apache-2.0/
-Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
+BSD-3-Clause/ISC/Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
 не выбрана и `LICENSE` не создаётся; `[licenses.private]` исключает только
 непубликуемый crate Angara, внешние зависимости проверяются полностью.
 
@@ -188,7 +208,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 
 | Job | Проверки |
 | --- | --- |
-| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, проверка четырёх примеров через `angara check` |
+| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.
@@ -621,7 +641,7 @@ rm -rf "$tmpdir" "$tlsdir"
 в argv/env/log. Этот сценарий проверяет HTTP, CONNECT HTTPS через настоящий
 локальный TLS site, 407 без credentials, 403 для аутентифицированного
 пользователя без ACL, а также disable + restart. TLS listener самого proxy
-остаётся M06.
+реализован в M06 и описан ниже.
 
 `examples/m05-auth-local.toml` не содержит рабочих credentials. Подробный
 контракт и матрица приёмки — [M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
@@ -629,15 +649,128 @@ rm -rf "$tmpdir" "$tlsdir"
 Проверка `check` читает и структурно валидирует users-файл, но не запускает
 runtime, сеть и Argon2 hashing. Plain Basic разрешён только на loopback bind
 (`127.0.0.0/8`, `::1`) либо при явном `allow_insecure_basic = true`; это не
-делает transport TLS. TLS listener к прокси — M06. Unix-проверка прав и
+делает transport TLS. HTTPS listener к прокси реализован в M06 и допускает
+Basic на non-loopback/wildcard bind без `allow_insecure_basic`; на HTTP это
+исключение по-прежнему требуется. Unix-проверка прав и
 owner реализована для Linux; другие ОС не объявляются поддержанными до
 отдельных испытаний.
 
+## M06: HTTPS listeners и TLS до прокси
+
+M06 добавляет `transport = "https"`: клиент подключается к Angara как к HTTPS
+proxy, проверяет сертификат самого proxy и передаёт HTTP/1.1 proxy
+protocol/Basic внутри TLS. Обычный forwarding и `CONNECT` работают поверх
+этого TLS без изменений; TLS сайта внутри CONNECT остаётся сквозным и
+проверяется клиентом отдельно. Сертификат, SNI или факт HTTPS внутри CONNECT
+не создают identity и не ослабляют auth/ACL.
+
+```toml
+[tls]
+max_handshaking = 32
+handshake_timeout_ms = 5000
+
+[[listeners]]
+id = "proxy-https"
+bind = "127.0.0.1:3129"
+transport = "https"
+auth = "basic"
+
+[listeners.tls]
+cert_chain_file = "tls/proxy-chain.pem"
+private_key_file = "tls/proxy-key.pem"
+```
+
+Полный стенд — [`examples/m06-https-local.toml`](examples/m06-https-local.toml):
+HTTP listener 3128 без auth и HTTPS listener 3129 с Basic. `check` и `serve`
+читают cert/key/users до bind; ошибка любого TLS listener или пары key/chain
+отвергает весь startup, ранее подготовленные listeners не начинают accept.
+
+- Политика rustls: explicit ring provider, TLS1.2 и TLS1.3, ALPN только
+  `http/1.1` (отсутствие ALPN у клиента допустимо, `h2`-only отвергается).
+  Сессии, tickets, early data/0-RTT, cert compression, secret extraction и
+  key logging отключены; TLS1.0/1.1 не предлагаются.
+- `max_handshaking` — общий semaphore всех HTTPS listeners. Client permit
+  берётся с TCP accept и удерживается до конца TLS/HTTP/CONNECT; handshake
+  permit освобождается после успешного handshake. Source gate проверяется до
+  TLS bytes. Перегрузка handshake закрывает TCP без plaintext 503; абсолютный
+  `handshake_timeout_ms` отсчитывается от accept и не продлевается chunks.
+- Один plaintext writer обслуживает interim/final/CONNECT output. Реальный
+  TLS flush учитывается output barrier; 103/102, final body, CONNECT 200 и
+  early tunnel bytes сохраняют порядок. Буфер приложения — 64 KiB, bridge —
+  64 KiB на направление.
+- TLS1.3 корректный `close_notify` — EOF одного направления: принятые bytes
+  дописываются, write side закрывается, reverse drain ограничен прежним
+  first-EOF deadline M04. TLS1.2 использует полный closure exchange по
+  RFC5246; независимый reverse half-close после `close_notify` не
+  гарантируется. Abrupt TCP EOF без `close_notify` не считается успешным
+  TLS-закрытием и не повторяет response.
+- Сертификат/ключ читаются один раз в immutable snapshot. Замена файлов на
+  диске не меняет работающий сервер; новый startup читает новую пару и
+  отвергает несовпадающую до bind. Shutdown использует общий absolute
+  deadline для handshake, HTTP, CONNECT, TLS flush/close и runtime.
+
+### Локальный HTTPS-стенд
+
+```console
+set -euo pipefail
+umask 077
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+python3 tests/fixtures/m06_pki.py --dir "$tmp/pki"
+mkdir -p "$tmp/tls"
+cp "$tmp/pki/proxy_chain.pem" "$tmp/tls/proxy-chain.pem"
+cp "$tmp/pki/proxy_key.pem" "$tmp/tls/proxy-key.pem"
+chmod 0600 "$tmp/tls/proxy-key.pem"
+
+angara users hash >"$tmp/alice.phc"   # интерактивно, без echo
+{
+  printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
+  printf 'password_hash = "%s"\ndisabled = false\n' "$(cat "$tmp/alice.phc")"
+} >"$tmp/m06-users.local.toml"
+chmod 0600 "$tmp/m06-users.local.toml"
+cp examples/m06-https-local.toml "$tmp/m06.toml"
+```
+
+Запустите локальный HTTP origin и TLS site, подставьте их порты в копию
+config (`ports` правила и `connect.allowed_ports`), затем `angara serve
+--config "$tmp/m06.toml"`. Пример использует две независимые CA: proxy CA и
+site CA. Ручные проверки:
+
+```console
+# HTTP 200 через HTTPS listener; пароль вводится интерактивно.
+curl --noproxy '' --proxy https://localhost:3129 \
+  --proxy-cacert "$tmp/pki/proxy_ca.pem" --proxy-user alice \
+  http://127.0.0.1:18080/
+
+# Без credentials — 407; аутентифицированный пользователь без ACL — 403.
+curl --noproxy '' --proxy https://localhost:3129 \
+  --proxy-cacert "$tmp/pki/proxy_ca.pem" \
+  -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/
+
+# HTTPS сайта внутри CONNECT: отдельный --cacert для site CA.
+curl --noproxy '' --proxy https://localhost:3129 \
+  --proxy-cacert "$tmp/pki/proxy_ca.pem" --proxy-user alice \
+  --cacert "$tmp/site/ca.pem" \
+  "https://localhost:$TLS_PORT/download" -o "$tmp/download.bin"
+```
+
+Ожидаются 200, 407, 403 и 1 MiB download/upload через настоящий layered
+TLS-in-TLS. Неверная proxy CA или имя дают curl exit 60 до auth/origin;
+неверная site CA/имя — exit 60 после CONNECT. Не используйте `-k`,
+`--proxy-insecure` или глобальную установку тестовой CA. `SSLKEYLOGFILE`
+игнорируется: key log не создаётся. Автоматический эквивалент — CI шаг
+«M06 HTTPS proxy curl smoke with two CAs», тесты `tests/m06_tls.rs`,
+`tests/m06_extra.rs`, `tests/config_m06.rs`, `tests/cli_m06.rs`,
+`tests/m06_limits.rs`.
+
+Подробный контракт и матрица приёмки — [M06-r1, Issue #17](https://github.com/AlexeiSmol/Angara/issues/17).
+
 ## Текущее состояние
 
-M00–M04 приняты и слиты. M05 реализован в ветке `feat/14-m05-auth` и передан
-на ревью; Linux CI выполняет прежние M01–M04 проверки, новые M05-тесты,
-`cargo deny` и проверку auth-примера с временным users-файлом. Слияние
+M00–M05 приняты и слиты. M06 реализован в ветке `feat/17-m06-tls` и передан
+на ревью; Linux CI выполняет прежние M01–M05 проверки, новые M06-тесты,
+resource/load/CPU и handshake evidence, `cargo deny`, проверку HTTPS-примера с
+временным PKI/users-файлом и HTTPS-proxy curl smoke с двумя CA. Слияние
 выполняет владелец после ревью.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

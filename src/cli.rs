@@ -44,7 +44,8 @@ Usage:
 
 Commands:
   check --config <path>       Validate the configuration without network access.
-  serve --config <path>       Bind all listeners and run the HTTP/1.1 proxy.
+  serve --config <path>       Bind all listeners and run the HTTP/1.1 proxy
+                              (HTTP and HTTPS ingress).
   users hash                  Read a password from the terminal without echo.
   users hash --password-stdin Read exactly one password line from stdin.
   --version                   Print the version and stop.

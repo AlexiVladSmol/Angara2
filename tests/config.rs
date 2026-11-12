@@ -124,7 +124,7 @@ fn cfg01_rejects_corrupted_toml_with_position() {
 
 #[test]
 fn cfg01_rejects_unknown_and_future_root_fields() {
-    for field in ["tls", "acl", "cache", "admin", "users", "parent"] {
+    for field in ["acl", "cache", "admin", "users", "parent"] {
         let text = config("\"auto\"").replace(
             "[runtime]",
             &format!("[{field}]\nenabled = true\n\n[runtime]"),
@@ -135,6 +135,9 @@ fn cfg01_rejects_unknown_and_future_root_fields() {
             "{field}: {message}"
         );
     }
+
+    let tls = config("\"auto\"").replace("[runtime]", "[tls]\nenabled = true\n\n[runtime]");
+    assert_rejected(&tls, &["unknown field `enabled`", "tls"]);
 
     let auth = config("\"auto\"").replace("[runtime]", "[auth]\nenabled = true\n\n[runtime]");
     assert_rejected(&auth, &["unknown field `enabled`", "auth"]);
@@ -156,7 +159,7 @@ fn cfg01_rejects_unknown_nested_fields() {
     let text = config_with(&text, "\"auto\"");
     let message = message(&text);
     assert!(
-        message.contains("field `tls` is not supported by this build"),
+        message.contains("listeners[0].tls") || message.contains("field `tls`"),
         "{message}"
     );
 }
@@ -198,17 +201,16 @@ fn cfg01_rejects_unsupported_schema_version() {
 #[test]
 fn cfg03_rejects_unsupported_transport() {
     let text = config_with(
+        &listener("loopback", "127.0.0.1:3128").replace("http", "quic"),
+        "\"auto\"",
+    );
+    assert_rejected(&text, &["listeners[0].transport", "http", "https"]);
+
+    let text = config_with(
         &listener("loopback", "127.0.0.1:3128").replace("http", "https"),
         "\"auto\"",
     );
-    assert_rejected(
-        &text,
-        &[
-            "listeners[0].transport",
-            "unsupported transport",
-            "only `http`",
-        ],
-    );
+    assert_rejected(&text, &["listeners[0].tls", "required"]);
 }
 
 #[test]
