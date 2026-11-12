@@ -225,6 +225,7 @@ jobs:
           trap cleanup EXIT
           umask 077
           python3 tests/fixtures/m06_pki.py --dir "$TMP/pki"
+          echo "M06 stage: pki ready"
           mkdir -p "$TMP/site"
           python3 tests/fixtures/m04_tls_site.py --dir "$TMP/site" \
             >"$TMP/site-port.txt" 2>"$TMP/site.log" &
@@ -233,13 +234,17 @@ jobs:
             test -s "$TMP/site-port.txt" && break
             sleep 0.1
           done
+          echo "M06 stage: site port bytes=$(wc -c <"$TMP/site-port.txt")"
+          cat "$TMP/site.log"
           SITE_PORT=$(sed -n 's/^PORT=//p' "$TMP/site-port.txt")
           test -n "$SITE_PORT"
+          echo "M06 stage: site port=$SITE_PORT"
           python3 examples/m03-local-origin.py --port 18080 \
             >"$TMP/origin.log" 2>&1 &
           ORIGIN_PID=$!
           PHC=$(printf '%s\n' 'synthetic-ci-password' | \
             ./target/debug/angara users hash --password-stdin)
+          echo "M06 stage: users hash ready"
           {
             printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
             printf 'password_hash = "%s"\ndisabled = false\n' "$PHC"
@@ -252,10 +257,12 @@ jobs:
           sed -e "s|ports = \[8080, 8443\]|ports = [18080, $SITE_PORT]|g" \
             -e "s|allowed_ports = \[8443\]|allowed_ports = [$SITE_PORT]|" \
             examples/m06-https-local.toml >"$TMP/m06.toml"
+          echo "M06 stage: config ready"
           SSLKEYLOGFILE="$TMP/keylog.txt" \
             ./target/debug/angara serve --config "$TMP/m06.toml" \
-            2>"$TMP/proxy.log" &
+            2>"$TMP/proxy.err" &
           PROXY_PID=$!
+          echo "M06 stage: proxy started"
           READY=0
           for _ in $(seq 1 100); do
             if curl -fsS --noproxy '' --proxy https://localhost:3129 \
