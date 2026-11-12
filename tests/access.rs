@@ -24,6 +24,7 @@ fn meta<'a>(
     listener: &'a str,
 ) -> RequestMeta<'a> {
     RequestMeta {
+        identity: None,
         listener_id: listener,
         source,
         method,

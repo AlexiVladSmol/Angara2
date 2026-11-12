@@ -362,6 +362,19 @@ pub fn keep_representation_length(headers: &mut HeaderMap, original: &HeaderMap)
     }
 }
 
+/// Challenge used for every local 407 response.
+pub const BASIC_CHALLENGE: &str = "Basic realm=\"Angara\", charset=\"UTF-8\"";
+
+/// Creates the fixed 407 response with one Basic challenge and close.
+pub fn proxy_auth_required_response() -> Response<ResponseBody> {
+    let mut response = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, true);
+    response.headers_mut().insert(
+        PROXY_AUTHENTICATE,
+        HeaderValue::from_static(BASIC_CHALLENGE),
+    );
+    response
+}
+
 /// Creates a bounded local response with no body.
 pub fn error_response(status: StatusCode, close: bool) -> Response<ResponseBody> {
     let mut builder = Response::builder().status(status).version(Version::HTTP_11);

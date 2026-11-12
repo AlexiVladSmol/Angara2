@@ -31,6 +31,9 @@ pub struct OriginKey {
     endpoint: std::net::SocketAddr,
     egress_id: String,
     generation: u64,
+    listener_id: String,
+    identity: Option<String>,
+    auth_snapshot_id: Option<u64>,
 }
 
 impl OriginKey {
@@ -41,6 +44,9 @@ impl OriginKey {
             endpoint,
             egress_id: plan.egress_id().to_owned(),
             generation: plan.generation(),
+            listener_id: plan.listener_id().to_owned(),
+            identity: plan.identity().map(str::to_owned),
+            auth_snapshot_id: plan.auth_snapshot_id(),
         }
     }
 }

@@ -59,13 +59,13 @@ pub struct HttpServer {
 impl HttpServer {
     /// Binds every configured listener before accepting any connection.
     pub async fn bind(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, false, None).await
+        Self::bind_inner(config, false, None, None).await
     }
 
     /// Test/library API that binds configured listeners with ephemeral ports.
     #[doc(hidden)]
     pub async fn bind_ephemeral(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None).await
+        Self::bind_inner(config, true, None, None).await
     }
 
     /// Test/library API with an injected resolver and dialer.
@@ -75,7 +75,27 @@ impl HttpServer {
         resolver: Arc<dyn crate::resolver::Resolver>,
         dialer: Arc<dyn crate::transport::Dialer>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, Some((resolver, dialer))).await
+        Self::bind_inner(config, true, Some((resolver, dialer)), None).await
+    }
+
+    /// Test/library API with an injected password verifier.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_verifier(
+        config: Arc<Config>,
+        verifier: Arc<dyn crate::auth::PasswordVerifier>,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, true, None, Some(verifier)).await
+    }
+
+    /// Test/library API with injected components and a password verifier.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_components_and_verifier(
+        config: Arc<Config>,
+        resolver: Arc<dyn crate::resolver::Resolver>,
+        dialer: Arc<dyn crate::transport::Dialer>,
+        verifier: Arc<dyn crate::auth::PasswordVerifier>,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, true, Some((resolver, dialer)), Some(verifier)).await
     }
 
     async fn bind_inner(
@@ -85,6 +105,7 @@ impl HttpServer {
             Arc<dyn crate::resolver::Resolver>,
             Arc<dyn crate::transport::Dialer>,
         )>,
+        verifier: Option<Arc<dyn crate::auth::PasswordVerifier>>,
     ) -> Result<Self, ServerError> {
         let mut listeners = Vec::new();
         let mut addresses = Vec::new();
@@ -103,11 +124,15 @@ impl HttpServer {
             addresses.push((listener.id().to_owned(), local));
         }
 
-        let proxy = match components {
-            Some((resolver, dialer)) => {
+        let proxy = match (components, verifier) {
+            (Some((resolver, dialer)), Some(verifier)) => {
+                Proxy::with_components_and_verifier(Arc::clone(&config), resolver, dialer, verifier)
+            }
+            (Some((resolver, dialer)), None) => {
                 Proxy::with_components(Arc::clone(&config), resolver, dialer)
             }
-            None => Proxy::new(Arc::clone(&config)),
+            (None, Some(verifier)) => Proxy::with_verifier(Arc::clone(&config), verifier),
+            (None, None) => Proxy::new(Arc::clone(&config)),
         };
         let permits = Arc::new(Semaphore::new(
             config.limits().max_client_connections() as usize
@@ -159,13 +184,26 @@ impl HttpServer {
         &self.addresses
     }
 
+    /// Free password-verification slots, if authentication is configured.
+    #[doc(hidden)]
+    pub fn auth_available_permits(&self) -> Option<usize> {
+        self._proxy.auth_available_permits()
+    }
+
     /// Stops accepting, drains active work up to the configured deadline, then
     /// forces remaining tracked tasks closed.
     pub async fn shutdown(self) {
-        // One absolute deadline covers every graceful phase. Once it expires,
-        // the remaining tasks are aborted and awaited to actual completion;
-        // cancellation itself is not given a fresh fixed budget.
-        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
+        let deadline = std::time::Instant::now() + self.shutdown_timeout;
+        self.shutdown_until(deadline).await;
+    }
+
+    /// Stops the server before one absolute shutdown deadline.
+    ///
+    /// The deadline is shared with the runtime and CLI; no phase gets a fresh
+    /// full window after it has elapsed.
+    #[doc(hidden)]
+    pub async fn shutdown_until(self, deadline: std::time::Instant) {
+        let deadline = tokio::time::Instant::from_std(deadline);
         self._proxy.begin_shutdown();
         let _ = self.drain.send(true);
         if !self.tasks.wait_until(deadline).await {

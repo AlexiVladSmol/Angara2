@@ -7,7 +7,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
@@ -96,18 +96,32 @@ impl AngaraRuntime {
 
     /// Stops the runtime, waiting at most the configured shutdown timeout.
     pub fn shutdown(mut self) {
-        self.shutdown_inner();
+        let deadline = Instant::now() + self.shutdown_timeout;
+        self.shutdown_until_inner(deadline);
     }
 
-    fn shutdown_inner(&mut self) {
+    /// Stops the runtime before one absolute deadline.
+    ///
+    /// This is used after the HTTP server has already consumed part of the
+    /// shared shutdown budget. If the deadline is already in the past, the
+    /// runtime is not given a fresh timeout window.
+    #[doc(hidden)]
+    pub fn shutdown_until(mut self, deadline: Instant) {
+        self.shutdown_until_inner(deadline);
+    }
+
+    fn shutdown_until_inner(&mut self, deadline: Instant) {
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_timeout(self.shutdown_timeout);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            runtime.shutdown_timeout(remaining);
         }
     }
 }
 
 impl Drop for AngaraRuntime {
     fn drop(&mut self) {
-        self.shutdown_inner();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(self.shutdown_timeout);
+        }
     }
 }

@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::auth::{AuthMode, VerifiedIdentity};
 use crate::config::{Config, EgressMode};
 use crate::policy::{self, PolicyError, RequestMeta};
 use crate::resolver::{ResolveError, Resolver, SystemResolver};
@@ -25,14 +26,35 @@ use crate::transport::{DialError, Dialer, TcpDialer};
 pub struct RequestContext {
     source: IpAddr,
     listener_id: String,
+    identity: Option<VerifiedIdentity>,
 }
 
 impl RequestContext {
-    /// Creates a trusted context from a real peer address and listener.
+    /// Creates an anonymous trusted context from a real peer address and
+    /// listener.
     pub fn new(source: IpAddr, listener_id: impl Into<String>) -> Self {
         Self {
             source,
             listener_id: listener_id.into(),
+            identity: None,
+        }
+    }
+
+    /// Creates a context carrying one verified identity.
+    ///
+    /// The identity type has no public constructor; it can only come from a
+    /// successful [`crate::auth::AuthService`] verification. The outbound
+    /// pipeline rechecks that it belongs to the current configuration snapshot.
+    #[doc(hidden)]
+    pub fn with_identity(
+        source: IpAddr,
+        listener_id: impl Into<String>,
+        identity: VerifiedIdentity,
+    ) -> Self {
+        Self {
+            source,
+            listener_id: listener_id.into(),
+            identity: Some(identity),
         }
     }
 
@@ -44,6 +66,11 @@ impl RequestContext {
     /// Listener identifier.
     pub fn listener_id(&self) -> &str {
         &self.listener_id
+    }
+
+    /// Verified identity, if the caller supplied one.
+    pub fn identity(&self) -> Option<&VerifiedIdentity> {
+        self.identity.as_ref()
     }
 }
 
@@ -147,6 +174,8 @@ pub enum OutboundError {
     InvalidTarget,
     /// Source gate denied the client.
     SourceDenied,
+    /// The listener requires a verified identity that is missing or stale.
+    AuthenticationRequired,
     /// Pre-DNS request ACL denied the request.
     AccessDenied,
     /// Destination IP policy denied every candidate.
@@ -184,6 +213,7 @@ impl fmt::Display for OutboundError {
         formatter.write_str(match self {
             Self::InvalidTarget => "invalid request target",
             Self::SourceDenied => "client source is not allowed",
+            Self::AuthenticationRequired => "proxy authentication is required",
             Self::AccessDenied => "request is denied by access rules",
             Self::DestinationDenied => "destination address is denied",
             Self::RouteInvalid => "egress route is invalid",
@@ -209,7 +239,7 @@ impl std::error::Error for OutboundError {}
 ///
 /// The plan may be handed to the pool only after fresh ACL/DNS/IP checks. It
 /// contains no unchecked constructor for callers outside the crate path.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OutboundPlan {
     target: CanonicalTarget,
     egress: crate::config::EgressProfile,
@@ -217,6 +247,23 @@ pub struct OutboundPlan {
     endpoints: Vec<SocketAddr>,
     generation: u64,
     deadline: Instant,
+    listener_id: String,
+    identity: Option<String>,
+    auth_snapshot_id: Option<u64>,
+}
+
+impl fmt::Debug for OutboundPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutboundPlan")
+            .field("target", &self.target)
+            .field("egress_id", &self.egress.id())
+            .field("matched_rule_id", &self.matched_rule_id)
+            .field("endpoints", &self.endpoints)
+            .field("generation", &self.generation)
+            .field("listener_id", &self.listener_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OutboundPlan {
@@ -253,6 +300,21 @@ impl OutboundPlan {
     /// Whether the authorization/DNS/connect deadline has elapsed.
     pub fn is_expired(&self) -> bool {
         Instant::now() >= self.deadline
+    }
+
+    /// Listener that accepted the request.
+    pub fn listener_id(&self) -> &str {
+        &self.listener_id
+    }
+
+    /// Verified username, or `None` for an anonymous context.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// Snapshot that produced the identity, if any.
+    pub fn auth_snapshot_id(&self) -> Option<u64> {
+        self.auth_snapshot_id
     }
 }
 
@@ -333,11 +395,33 @@ impl OutboundService {
         target::check_host_header(&target, host_header)
             .map_err(|_| OutboundError::InvalidTarget)?;
 
+        let listener = self
+            .config
+            .listener(context.listener_id())
+            .ok_or(OutboundError::AccessDenied)?;
+        let identity = match listener.auth() {
+            AuthMode::None => None,
+            AuthMode::Basic => {
+                let identity = context
+                    .identity()
+                    .ok_or(OutboundError::AuthenticationRequired)?;
+                let auth = self
+                    .config
+                    .auth()
+                    .ok_or(OutboundError::AuthenticationRequired)?;
+                if !identity.belongs_to(auth.snapshot()) {
+                    return Err(OutboundError::AuthenticationRequired);
+                }
+                Some(identity)
+            }
+        };
+
         let meta = RequestMeta {
             listener_id: context.listener_id(),
             source: context.source(),
             method: target.method(),
             target: &target,
+            identity,
         };
 
         policy::check_source(self.config.access(), context.source()).map_err(map_policy)?;
@@ -397,6 +481,9 @@ impl OutboundService {
             endpoints,
             generation: self.generation,
             deadline,
+            listener_id: context.listener_id().to_owned(),
+            identity: identity.map(|identity| identity.username().to_owned()),
+            auth_snapshot_id: identity.map(VerifiedIdentity::snapshot_id),
         })
     }
 

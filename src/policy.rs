@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use http::Method;
 use ipnet::IpNet;
 
+use crate::auth::VerifiedIdentity;
 use crate::config::{AccessConfig, AccessRule, HostSelectors, IpDefault, RuleAction, Selectors};
 use crate::target::{CanonicalTarget, normalize_ip};
 
@@ -20,6 +21,8 @@ pub struct RequestMeta<'a> {
     pub method: &'a Method,
     /// Canonical destination.
     pub target: &'a CanonicalTarget,
+    /// Verified identity for this request, when the listener requires auth.
+    pub identity: Option<&'a VerifiedIdentity>,
 }
 
 /// Policy rejection classes.
@@ -125,6 +128,14 @@ pub(crate) fn selectors_match(selectors: &Selectors, meta: &RequestMeta<'_>) -> 
         && !ports.contains(&meta.target.port())
     {
         return false;
+    }
+    if let Some(users) = selectors.users() {
+        let Some(identity) = meta.identity else {
+            return false;
+        };
+        if !users.iter().any(|username| username == identity.username()) {
+            return false;
+        }
     }
 
     match selectors.hosts() {
@@ -327,6 +338,58 @@ allow_special = true
     }
 
     #[test]
+    fn user_selector_ors_names_and_never_matches_anonymous() {
+        let config = config_with_access(
+            r#"
+[access]
+source_allow = ["127.0.0.0/8"]
+
+[[access.rules]]
+id = "alice-only"
+action = "deny"
+users = ["alice", "bob"]
+
+[[access.rules]]
+id = "open-anonymous"
+action = "allow"
+"#,
+        );
+        let access = config.access();
+        let target = CanonicalTarget::parse(&Method::GET, "http://example.com/").expect("target");
+        let anonymous = RequestMeta {
+            listener_id: "lab",
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            method: &Method::GET,
+            target: &target,
+            identity: None,
+        };
+        assert_eq!(
+            check_request(access, &anonymous).expect("allowed").id(),
+            "open-anonymous"
+        );
+
+        let alice = crate::auth::test_identity("alice");
+        let authenticated = RequestMeta {
+            identity: Some(&alice),
+            ..anonymous
+        };
+        assert_eq!(
+            check_request(access, &authenticated).unwrap_err(),
+            PolicyError::AccessDenied
+        );
+
+        let carol = crate::auth::test_identity("carol");
+        let other = RequestMeta {
+            identity: Some(&carol),
+            ..authenticated
+        };
+        assert_eq!(
+            check_request(access, &other).expect("allowed").id(),
+            "open-anonymous"
+        );
+    }
+
+    #[test]
     fn request_rules_apply_and_or_and_label_boundaries() {
         let config = config_with_access(
             r#"
@@ -354,6 +417,7 @@ host_suffix = ["example.com"]
             source: IpAddr::V4(Ipv4Addr::LOCALHOST),
             method: &Method::GET,
             target: &target,
+            identity: None,
         };
         assert_eq!(
             check_request(access, &meta).expect("allowed").id(),
@@ -367,6 +431,7 @@ host_suffix = ["example.com"]
             source: IpAddr::V4(Ipv4Addr::LOCALHOST),
             method: &Method::GET,
             target: &admin,
+            identity: None,
         };
         assert_eq!(
             check_request(access, &meta).unwrap_err(),
@@ -379,6 +444,7 @@ host_suffix = ["example.com"]
             source: IpAddr::V4(Ipv4Addr::LOCALHOST),
             method: &Method::GET,
             target: &other,
+            identity: None,
         };
         assert_eq!(
             check_request(access, &meta).unwrap_err(),
@@ -392,6 +458,7 @@ host_suffix = ["example.com"]
             source: IpAddr::V4(Ipv4Addr::LOCALHOST),
             method: &Method::GET,
             target: &wrong_port,
+            identity: None,
         };
         assert_eq!(
             check_request(access, &meta).unwrap_err(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTPS-through-CONNECT client for M04 tests.
+"""HTTPS-through-CONNECT client for M04/M05 tests.
 
 Modes:
   good           verify the test CA and hostname localhost; short GET
@@ -8,11 +8,13 @@ Modes:
   wrong-name     CA-valid certificate checked against 127.0.0.1 (SAN localhost)
   wrong-ca       default trust store instead of the test CA
 
+An optional --proxy-password adds Basic proxy authorization to CONNECT.
 Negative modes succeed only on an expected certificate-verification failure.
 Connection, CONNECT, timeout and protocol failures always fail the test.
 """
 
 import argparse
+import base64
 import hashlib
 import http.client
 import ssl
@@ -44,6 +46,7 @@ def main() -> int:
     parser.add_argument("--proxy-port", required=True, type=int)
     parser.add_argument("--target-port", required=True, type=int)
     parser.add_argument("--ca", required=True)
+    parser.add_argument("--proxy-password")
     parser.add_argument(
         "--mode",
         choices=["good", "good-upload", "good-download", "wrong-name", "wrong-ca"],
@@ -66,7 +69,13 @@ def main() -> int:
             timeout=20,
         )
         host = "127.0.0.1" if args.mode == "wrong-name" else "localhost"
-        connection.set_tunnel(host, args.target_port)
+        tunnel_headers = {}
+        if args.proxy_password is not None:
+            token = base64.b64encode(
+                f"alice:{args.proxy_password}".encode("utf-8")
+            ).decode("ascii")
+            tunnel_headers["Proxy-Authorization"] = f"Basic {token}"
+        connection.set_tunnel(host, args.target_port, headers=tunnel_headers)
         if args.mode == "good-upload":
             connection.request(
                 "POST",

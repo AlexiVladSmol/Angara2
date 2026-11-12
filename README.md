@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00–M03 приняты и слиты; M04 (CONNECT и TCP-туннели) реализован в ветке `feat/11-m04-connect` и передан на ревью.** Ревизия документов: 0.5. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1 и принимает CONNECT; TLS-вход к прокси, auth, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M04 приняты и слиты; M05 (локальные пользователи, Basic и ACL по identity) реализуется в ветке `feat/14-m05-auth`.** Ревизия документов: 0.6. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP listeners, выполняет forward-proxy для absolute-form HTTP/1.1, принимает CONNECT и проверяет Basic credentials на listener с `auth = "basic"`; TLS-вход к прокси, cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -72,9 +72,12 @@ cargo deny check
 | `angara --version` | Печатает `angara 0.1.0`, код 0 |
 | `angara check --config <path>` | Читает, разбирает и проверяет TOML; код 0 при успехе, без сети |
 | `angara serve --config <path>` | Проверяет config, связывает все listeners, затем обслуживает HTTP/1.1 forward proxy; код 0 при штатной остановке по SIGINT/SIGTERM, 3 при ошибке bind/запуска |
+| `angara users hash` | Читает пароль и подтверждение из TTY без echo и печатает один Argon2id PHC в stdout; без TTY требует явный `--password-stdin` |
+| `angara users hash --password-stdin` | Читает одну ограниченную строку stdin, проверяет UTF-8/NFC и печатает один PHC; пароль не принимается через argv или env |
 | `angara --help` | Печатает справку, код 0 |
 
-Коды: `0` — успех, `1` — ошибка конфигурации, `2` — ошибка аргументов,
+Коды: `0` — успех, `1` — ошибка конфигурации, ввода пароля, хэширования или
+локального users-файла, `2` — ошибка аргументов,
 `3` — ошибка запуска сервера или неожиданное завершение. Ошибки печатаются в
 stderr, не содержат значений config; семантические конфликты описываются
 через пути полей и индексы, а управляющие символы в путях и именах полей
@@ -428,11 +431,213 @@ root, изменения маршрутов или firewall. В PowerShell пу�
 `--noproxy ''` может быть потерян; используйте `curl.exe --proxy ...` с
 `NO_PROXY=nohost.invalid` в окружении.
 
+## M05: локальные пользователи и Basic
+
+M05 добавляет строгий users TOML (`version = 1`, до 1 MiB/1024 записей),
+Argon2id PHC с фиксированным профилем `m=19456,t=2,p=1`, соли 16 и выхода
+32 байта, listener-local Basic и selectors `users` в ACL/routing. Проверка
+пароля выполняется в `spawn_blocking` под общим `max_verifying`; локальный
+407 закрывает соединение без DNS/dial/100 Continue, перегрузка и timeout
+дают 503. Snapshot пользователей читается при `check`/`serve` и применяется
+после restart; auth cache, reload и online CRUD не входят в M05.
+
+На Linux users-файл должен быть regular file с правами без group write и
+любых world-битов (например `0600`/`0640`) и принадлежать effective UID
+сервиса либо root. Проверка выполняется по уже открытому handle; proxy не
+меняет права автоматически. Доверенный административный каталог и сам
+users-файл не должны быть доступны на запись другим пользователям.
+
+Фиксированный профиль Argon2id требует около 19 MiB рабочей памяти на одну
+проверку. При default `max_verifying = 2` одновременно занято около 38 MiB
+плюс overhead; максимум `16` — до 304 MiB плюс overhead. Это настройка
+памяти, а не обещание throughput. Уже начатая blocking-проверка не
+отменяется при timeout/disconnect; она удерживает permit до фактического
+завершения и не публикует поздний результат. Shutdown ограничен общим
+deadline и не ждёт такие проверки отдельным окном.
+
+### Безопасная подготовка users-файла
+
+PHC считается чувствительным: не пишите его в фиксированное имя в `/tmp` и
+не полагайтесь на `umask` для уже существующего файла. Используйте уникальный
+приватный каталог, файл `0600` с момента создания и атомарную замену
+финального файла рядом с ним.
+
+```console
+set -euo pipefail
+umask 077
+tmpdir=$(mktemp -d)
+staging=""
+cleanup() {
+  rm -rf "$tmpdir"
+  [ -z "$staging" ] || rm -f "$staging"
+}
+trap cleanup EXIT HUP INT TERM
+
+angara users hash >"$tmpdir/alice.phc"   # интерактивный ввод и подтверждение
+angara users hash >"$tmpdir/bob.phc"
+
+staging=$(mktemp examples/.m05-users.local.XXXXXX)
+{
+  printf 'version = 1\n\n[[users]]\nusername = "alice"\npassword_hash = "'
+  tr -d '\n' <"$tmpdir/alice.phc"
+  printf '"\ndisabled = false\n\n[[users]]\nusername = "bob"\npassword_hash = "'
+  tr -d '\n' <"$tmpdir/bob.phc"
+  printf '"\ndisabled = false\n'
+} >"$staging"
+chmod 0600 "$staging"
+mv -f "$staging" examples/m05-users.local.toml
+```
+
+`mktemp -d` создаёт приватный каталог; файлы PHC создаются с `0600` под
+`umask 077`. Финальный файл готовится в том же каталоге `examples/`, получает
+`0600` до публикации и заменяет старый путь одной атомарной операцией `mv`;
+запись через существующий файл или симlink не выполняется. `trap` удаляет
+временные файлы при ошибке и сигнале.
+
+### Ручной сценарий: HTTP, CONNECT HTTPS, 407/403, disable + restart
+
+Ниже используются только синтетические пользователи `alice` и `bob`.
+Пароли вводятся интерактивно в `users hash`; в команды и history они не
+попадают. Все временные файлы удаляются `trap`.
+
+```console
+# 1. Users-файл создан командами из предыдущего раздела; блоки выполняются
+#    последовательно в одном shell.
+set -euo pipefail
+# 2. Локальный HTTP origin на 8080.
+HTTP_PID=""
+TLS_PID=""
+PROXY_PID=""
+tlsdir=""
+cleanup_stand() {
+  [ -z "$PROXY_PID" ] || kill -TERM "$PROXY_PID" 2>/dev/null || true
+  [ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null || true
+  [ -z "$TLS_PID" ] || kill "$TLS_PID" 2>/dev/null || true
+  [ -z "$tlsdir" ] || rm -rf "$tlsdir"
+  rm -rf "$tmpdir"
+}
+trap cleanup_stand EXIT HUP INT TERM
+python3 examples/m03-local-origin.py --port 8080 &
+HTTP_PID=$!
+
+# 3. Реальный локальный HTTPS site с временной CA.
+tlsdir=$(mktemp -d)
+python3 tests/fixtures/m04_tls_site.py --dir "$tlsdir" \
+  >"$tlsdir/port.txt" 2>"$tlsdir/site.log" &
+TLS_PID=$!
+for _ in $(seq 1 100); do
+  test -s "$tlsdir/port.txt" && break
+  sleep 0.1
+done
+TLS_PORT=$(sed -n 's/^PORT=//p' "$tlsdir/port.txt")
+test -n "$TLS_PORT"
+
+# 4. Временная копия config: users-файл и TLS-порт.
+install -m 0600 examples/m05-users.local.toml "$tmpdir/users.toml"
+sed -e 's|m05-users.local.toml|users.toml|' \
+    -e "s|ports = \[8080, 8443\]|ports = [8080, $TLS_PORT]|" \
+    -e "s|allowed_ports = \[8443\]|allowed_ports = [$TLS_PORT]|" \
+    examples/m05-auth-local.toml >"$tmpdir/proxy.toml"
+
+angara serve --config "$tmpdir/proxy.toml" &
+PROXY_PID=$!
+for _ in $(seq 1 100); do
+  curl -sS --noproxy '' --proxy http://127.0.0.1:3128 \
+    -o /dev/null http://127.0.0.1:8080/ 2>/dev/null && break
+  sleep 0.1
+done
+
+# 5. Пароли вводятся интерактивно для каждого curl; в argv/history/env
+#    они не попадают. Интерактивный ввод сохраняет допустимые quote,
+#    backslash, colon и spaces без экранирования в config.
+
+# 6. HTTP: alice 200, без credentials 407, bob 403 по ACL.
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user alice -o "$tmpdir/http.txt" \
+  -w '%{http_code}' http://127.0.0.1:8080/)" = "200"
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = "407"
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user bob -o /dev/null -w '%{http_code}' \
+  http://127.0.0.1:8080/)" = "403"
+
+# 7. CONNECT HTTPS с проверкой CA и hostname; 1 MiB download.
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
+  "https://localhost:$TLS_PORT/download" -o "$tmpdir/download.bin"
+test "$(wc -c <"$tmpdir/download.bin")" -eq 1048576
+
+# 8. CONNECT HTTPS upload 1 MiB и сверка SHA-256 с ответом site.
+head -c 1048576 /dev/urandom >"$tmpdir/upload.bin"
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
+  --data-binary @"$tmpdir/upload.bin" "https://localhost:$TLS_PORT/upload" \
+  -o "$tmpdir/upload.txt"
+test "$(cat "$tmpdir/upload.txt")" = \
+  "upload:1048576:$(sha256sum "$tmpdir/upload.bin" | cut -d' ' -f1)"
+
+# 9. Проверка name verification: ожидается exit 60, не 200.
+set +e
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
+  "https://127.0.0.1:$TLS_PORT/" -o /dev/null 2>"$tmpdir/name.err"
+NAME_CODE=$?
+set -e
+test "$NAME_CODE" -eq 60
+
+# 10. Disable alice безопасной заменой и restart.
+sed '0,/disabled = false/s//disabled = true/' "$tmpdir/users.toml" \
+  >"$tmpdir/users.new"
+chmod 0600 "$tmpdir/users.new"
+mv -f "$tmpdir/users.new" "$tmpdir/users.toml"
+kill -TERM "$PROXY_PID"
+wait "$PROXY_PID"
+angara serve --config "$tmpdir/proxy.toml" &
+PROXY_PID=$!
+for _ in $(seq 1 100); do
+  curl --noproxy '' --proxy http://127.0.0.1:3128 \
+    -o /dev/null http://127.0.0.1:8080/ 2>/dev/null && break
+  sleep 0.1
+done
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user alice -o /dev/null -w '%{http_code}' \
+  http://127.0.0.1:8080/)" = "407"
+
+kill -TERM "$PROXY_PID"
+wait "$PROXY_PID"
+PROXY_PID=""
+kill "$HTTP_PID" "$TLS_PID" 2>/dev/null || true
+HTTP_PID=""
+TLS_PID=""
+trap - EXIT HUP INT TERM
+rm -rf "$tmpdir" "$tlsdir"
+```
+
+Пароли и PHC не выводятся в терминал и не передаются через argv.
+`curl --proxy-user alice` запрашивает пароль интерактивно; допустимые M05
+символы `"`, `\`, `:`, пробелы и Unicode вводятся как есть и не проходят
+через quoted curl config или shell history. Для неинтерактивного стенда
+используйте безопасный механизм передачи секрета, который не помещает его
+в argv/env/log. Этот сценарий проверяет HTTP, CONNECT HTTPS через настоящий
+локальный TLS site, 407 без credentials, 403 для аутентифицированного
+пользователя без ACL, а также disable + restart. TLS listener самого proxy
+остаётся M06.
+
+`examples/m05-auth-local.toml` не содержит рабочих credentials. Подробный
+контракт и матрица приёмки — [M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
+
+Проверка `check` читает и структурно валидирует users-файл, но не запускает
+runtime, сеть и Argon2 hashing. Plain Basic разрешён только на loopback bind
+(`127.0.0.0/8`, `::1`) либо при явном `allow_insecure_basic = true`; это не
+делает transport TLS. TLS listener к прокси — M06. Unix-проверка прав и
+owner реализована для Linux; другие ОС не объявляются поддержанными до
+отдельных испытаний.
+
 ## Текущее состояние
 
-M00, M01 и M02 приняты и слиты. M03 реализован в ветке
-`feat/9-m03-http-proxy`; Linux CI выполняет baseline M02 (127 тестов) и новые
-M03-проверки, включая CLI/raw/curl-совместимые и resource checks. Следующий
-этап — CONNECT-туннель M04; слияние M03 выполняет владелец после ревью.
+M00–M04 приняты и слиты. M05 реализован в ветке `feat/14-m05-auth` и передан
+на ревью; Linux CI выполняет прежние M01–M04 проверки, новые M05-тесты,
+`cargo deny` и проверку auth-примера с временным users-файлом. Слияние
+выполняет владелец после ревью.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

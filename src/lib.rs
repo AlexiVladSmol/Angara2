@@ -5,6 +5,7 @@
 //! connection pool and controlled shutdown. CONNECT, TLS and auth are later
 //! stages.
 
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod http;

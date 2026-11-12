@@ -69,6 +69,22 @@ jobs:
             m04_cpu01_connect_path_uses_multiple_workers \
             -- --nocapture
 
+      - name: M05 auth resource and memory evidence
+        run: |
+          cargo test --locked --test m05_limits \
+            -- --nocapture --test-threads=1
+
+      - name: M05 auth admission, CPU and PTY evidence
+        run: |
+          cargo test --locked --test m05_control m05_cpu01 \
+            -- --nocapture
+          cargo test --locked --test m05_control m05_cancel01 \
+            -- --nocapture
+          cargo test --locked --test m05_control m05_ops01_runtime \
+            -- --nocapture
+          cargo test --locked --test m05_auth cli_users_hash_pty \
+            -- --nocapture
+
       - name: Validate example configurations
         run: |
           cargo run --locked -- check --config examples/minimal.toml
@@ -77,6 +93,91 @@ jobs:
           cargo run --locked -- check --config examples/m02-egress-local.toml
           cargo run --locked -- check --config examples/m03-http-local.toml
           cargo run --locked -- check --config examples/m04-connect-local.toml
+
+      - name: Validate M05 auth example with a generated users file
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          umask 077
+          PHC=$(printf '%s\n' 'synthetic-ci-password' | \
+            ./target/debug/angara users hash --password-stdin)
+          {
+            printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
+            printf 'password_hash = "%s"\ndisabled = false\n' "$PHC"
+          } >"$TMP/users.toml"
+          chmod 600 "$TMP/users.toml"
+          sed 's|m05-users.local.toml|users.toml|' \
+            examples/m05-auth-local.toml >"$TMP/proxy.toml"
+          ./target/debug/angara check --config "$TMP/proxy.toml"
+
+      - name: M05 Basic curl smoke through the real proxy
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          ORIGIN_PID=""
+          PROXY_PID=""
+          cleanup() {
+            if [ -n "$PROXY_PID" ]; then kill -TERM "$PROXY_PID" 2>/dev/null || true; fi
+            if [ -n "$ORIGIN_PID" ]; then kill "$ORIGIN_PID" 2>/dev/null || true; fi
+            rm -rf "$TMP"
+          }
+          trap cleanup EXIT
+          umask 077
+          python3 examples/m03-local-origin.py --port 18080 >"$TMP/origin.log" 2>&1 &
+          ORIGIN_PID=$!
+          PHC=$(printf '%s\n' 'synthetic-ci-password' | \
+            ./target/debug/angara users hash --password-stdin)
+          {
+            printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
+            printf 'password_hash = "%s"\ndisabled = false\n' "$PHC"
+          } >"$TMP/users.toml"
+          chmod 600 "$TMP/users.toml"
+          sed -e 's|m05-users.local.toml|users.toml|' \
+            -e 's|ports = \[8080, 8443\]|ports = [18080, 8443]|' \
+            examples/m05-auth-local.toml >"$TMP/proxy.toml"
+          cat >"$TMP/good.conf" <<EOF
+          proxy-user = "alice:synthetic-ci-password"
+          silent
+          show-error
+          fail
+          EOF
+          cat >"$TMP/bad.conf" <<EOF
+          proxy-user = "alice:wrong-password"
+          silent
+          show-error
+          fail
+          EOF
+          chmod 600 "$TMP"/*.conf
+          ./target/debug/angara serve --config "$TMP/proxy.toml" 2>"$TMP/proxy.log" &
+          PROXY_PID=$!
+          for _ in $(seq 1 100); do
+            if curl --noproxy '' --proxy http://127.0.0.1:3128 \
+              --config "$TMP/good.conf" \
+              http://127.0.0.1:18080/ >"$TMP/good.txt" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep -q 'angara m03 local origin' "$TMP/good.txt"
+          set +e
+          NO_AUTH=$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+            -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/)
+          NO_AUTH_CODE=$?
+          BAD_AUTH=$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+            --config "$TMP/bad.conf" -sS -o /dev/null \
+            -w '%{http_code}' http://127.0.0.1:18080/)
+          BAD_AUTH_CODE=$?
+          set -e
+          test "$NO_AUTH_CODE" -eq 0
+          test "$BAD_AUTH_CODE" -eq 22
+          test "$NO_AUTH" = "407"
+          test "$BAD_AUTH" = "407"
+          kill -TERM "$PROXY_PID"
+          wait "$PROXY_PID"
+          kill "$ORIGIN_PID"
+          trap - EXIT
+          rm -rf "$TMP"
 
       - name: Curl smoke through the real proxy
         run: |
