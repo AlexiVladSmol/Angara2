@@ -463,6 +463,7 @@ PHC считается чувствительным: не пишите его в
 финального файла рядом с ним.
 
 ```console
+set -euo pipefail
 umask 077
 tmpdir=$(mktemp -d)
 staging=""
@@ -502,6 +503,7 @@ mv -f "$staging" examples/m05-users.local.toml
 ```console
 # 1. Users-файл создан командами из предыдущего раздела; блоки выполняются
 #    последовательно в одном shell.
+set -euo pipefail
 # 2. Локальный HTTP origin на 8080.
 HTTP_PID=""
 TLS_PID=""
