@@ -77,6 +77,16 @@ fn write(dir: &common::TempDir, name: &str, text: &str) -> PathBuf {
     path
 }
 
+fn secure_key(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod key 0600");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[test]
 fn m06_cfg01_https_is_strict_and_old_http_configs_remain_valid() {
     let dir = common::TempDir::new("m06-cfg01");
@@ -221,6 +231,7 @@ fn m06_cfg02_chain_and_key_errors_reject_the_whole_startup() {
     let mut both = fs::read(&key).expect("proxy key");
     both.extend_from_slice(&fs::read(dir.path().join("site_key.pem")).expect("site key"));
     fs::write(&multiple, both).expect("multiple keys");
+    secure_key(&multiple);
     let mismatch = config_text(
         "127.0.0.1:3129",
         "https",
@@ -294,6 +305,7 @@ fn m06_cfg02_empty_material_and_secret_markers_are_rejected_safely() {
     let marker = "MARKER-PRIVATE-KEY-CONTENT";
     let empty = dir.path().join("empty.pem");
     fs::write(&empty, b"").expect("empty file");
+    secure_key(&empty);
     let marker_chain = dir.path().join("marker-chain.pem");
     fs::write(
         &marker_chain,
@@ -306,6 +318,7 @@ fn m06_cfg02_empty_material_and_secret_markers_are_rejected_safely() {
         format!("-----BEGIN PRIVATE KEY-----\n{marker}\n-----END PRIVATE KEY-----\n"),
     )
     .expect("marker key");
+    secure_key(&marker_key);
 
     for text in [
         config_text("127.0.0.1:3129", "https", &empty, &key, None),
