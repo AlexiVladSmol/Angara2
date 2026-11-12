@@ -4,10 +4,12 @@
 //! snapshot. Errors are safe classes and never include PEM/DER or file content.
 
 use std::fmt;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+
+#[cfg(not(unix))]
+use std::fs::File;
 
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{
