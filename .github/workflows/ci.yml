@@ -255,15 +255,33 @@ jobs:
             ./target/debug/angara serve --config "$TMP/m06.toml" \
             2>"$TMP/proxy.log" &
           PROXY_PID=$!
+          READY=0
           for _ in $(seq 1 100); do
             if curl -fsS --noproxy '' --proxy https://localhost:3129 \
               --proxy-cacert "$TMP/pki/proxy_ca.pem" \
               --proxy-user "alice:synthetic-ci-password" \
               http://127.0.0.1:18080/ >"$TMP/http.txt" 2>/dev/null; then
+              READY=1
               break
             fi
             sleep 0.1
           done
+          if [ "$READY" -ne 1 ]; then
+            echo "M06 proxy stderr:"
+            cat "$TMP/proxy.err"
+            echo "M06 proxy TLS preflight:"
+            echo | openssl s_client -connect 127.0.0.1:3129 \
+              -servername localhost -tls1_2 \
+              -CAfile "$TMP/pki/proxy_ca.pem" -brief 2>&1 || true
+            echo "M06 curl verbose:"
+            curl -v --noproxy '' --proxy https://localhost:3129 \
+              --proxy-cacert "$TMP/pki/proxy_ca.pem" \
+              --proxy-user "alice:synthetic-ci-password" \
+              http://127.0.0.1:18080/ >"$TMP/ready.out" 2>"$TMP/ready.err" || true
+            tail -80 "$TMP/ready.err"
+            cat "$TMP/ready.out"
+            exit 1
+          fi
           grep -q 'angara m03 local origin' "$TMP/http.txt"
           set +e
           NO_AUTH=$(curl -sS -o /dev/null -w '%{http_code}' --noproxy '' \
