@@ -1268,6 +1268,11 @@ fn users_unknown_key_markers_do_not_reach_check_output() {
         format!(
             "version = 1\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{phc}\"\n\"REVIEW_SYNTHETIC_SECRET_82\" = \"$argon2id$secret\"\n"
         ),
+        "version = 1\nusers = []\n\"prefix`REVIEW_SYNTHETIC_SECRET_83\" = 1\n".to_owned(),
+        "version = 1\nusers = []\n\"users[971135791357913579]\" = 1\n".to_owned(),
+        format!(
+            "version = 1\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{phc}\"\n\"prefix`REVIEW_SYNTHETIC_SECRET_84\" = 1\n"
+        ),
     ];
     for contents in cases {
         write_secure(&dir.path().join("users.toml"), &contents);
@@ -1282,6 +1287,7 @@ fn users_unknown_key_markers_do_not_reach_check_output() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("REVIEW_SYNTHETIC_SECRET"), "{stderr}");
         assert!(!stderr.contains("$argon2"), "{stderr}");
+        assert!(!stderr.contains("971135791357913579"), "{stderr}");
         assert!(stderr.contains("unknown field"), "{stderr}");
     }
 }

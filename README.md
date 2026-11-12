@@ -547,33 +547,30 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 
-# 5. Защищённые client config 0600; пароль не в argv/history.
-read -rsp 'alice password: ' alice_password; printf '\n'
-printf 'proxy = "http://127.0.0.1:3128"\nproxy-user = "alice:%s"\nnoproxy = ""\nsilent\nshow-error\n' \
-  "$alice_password" >"$tmpdir/alice.curl"
-unset alice_password
-read -rsp 'bob password: ' bob_password; printf '\n'
-printf 'proxy = "http://127.0.0.1:3128"\nproxy-user = "bob:%s"\nnoproxy = ""\nsilent\nshow-error\n' \
-  "$bob_password" >"$tmpdir/bob.curl"
-unset bob_password
-chmod 0600 "$tmpdir"/*.curl
+# 5. Пароли вводятся интерактивно для каждого curl; в argv/history/env
+#    они не попадают. Интерактивный ввод сохраняет допустимые quote,
+#    backslash, colon и spaces без экранирования в config.
 
 # 6. HTTP: alice 200, без credentials 407, bob 403 по ACL.
-test "$(curl --config "$tmpdir/alice.curl" -o "$tmpdir/http.txt" \
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user alice -o "$tmpdir/http.txt" \
   -w '%{http_code}' http://127.0.0.1:8080/)" = "200"
 test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
   -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = "407"
-test "$(curl --config "$tmpdir/bob.curl" -o /dev/null \
-  -w '%{http_code}' http://127.0.0.1:8080/)" = "403"
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user bob -o /dev/null -w '%{http_code}' \
+  http://127.0.0.1:8080/)" = "403"
 
 # 7. CONNECT HTTPS с проверкой CA и hostname; 1 MiB download.
-curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
   "https://localhost:$TLS_PORT/download" -o "$tmpdir/download.bin"
 test "$(wc -c <"$tmpdir/download.bin")" -eq 1048576
 
 # 8. CONNECT HTTPS upload 1 MiB и сверка SHA-256 с ответом site.
 head -c 1048576 /dev/urandom >"$tmpdir/upload.bin"
-curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
   --data-binary @"$tmpdir/upload.bin" "https://localhost:$TLS_PORT/upload" \
   -o "$tmpdir/upload.txt"
 test "$(cat "$tmpdir/upload.txt")" = \
@@ -581,7 +578,8 @@ test "$(cat "$tmpdir/upload.txt")" = \
 
 # 9. Проверка name verification: ожидается exit 60, не 200.
 set +e
-curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+curl --noproxy '' --proxy http://127.0.0.1:3128 --proxy-user alice \
+  --cacert "$tlsdir/ca.pem" \
   "https://127.0.0.1:$TLS_PORT/" -o /dev/null 2>"$tmpdir/name.err"
 NAME_CODE=$?
 set -e
@@ -601,8 +599,9 @@ for _ in $(seq 1 100); do
     -o /dev/null http://127.0.0.1:8080/ 2>/dev/null && break
   sleep 0.1
 done
-test "$(curl --config "$tmpdir/alice.curl" -o /dev/null \
-  -w '%{http_code}' http://127.0.0.1:8080/)" = "407"
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  --proxy-user alice -o /dev/null -w '%{http_code}' \
+  http://127.0.0.1:8080/)" = "407"
 
 kill -TERM "$PROXY_PID"
 wait "$PROXY_PID"
@@ -614,12 +613,15 @@ trap - EXIT HUP INT TERM
 rm -rf "$tmpdir" "$tlsdir"
 ```
 
-Пароли и PHC не выводятся в терминал и не передаются через argv. Для
-`curl` используется защищённый временный config; `curl --proxy-user` без
-пароля допустим для ручного ввода, но `user:password` в argv запрещён.
-Этот сценарий проверяет HTTP, CONNECT HTTPS через настоящий локальный TLS
-site, 407 без credentials, 403 для аутентифицированного пользователя без
-ACL, а также disable + restart. TLS listener самого proxy остаётся M06.
+Пароли и PHC не выводятся в терминал и не передаются через argv.
+`curl --proxy-user alice` запрашивает пароль интерактивно; допустимые M05
+символы `"`, `\`, `:`, пробелы и Unicode вводятся как есть и не проходят
+через quoted curl config или shell history. Для неинтерактивного стенда
+используйте безопасный механизм передачи секрета, который не помещает его
+в argv/env/log. Этот сценарий проверяет HTTP, CONNECT HTTPS через настоящий
+локальный TLS site, 407 без credentials, 403 для аутентифицированного
+пользователя без ACL, а также disable + restart. TLS listener самого proxy
+остаётся M06.
 
 `examples/m05-auth-local.toml` не содержит рабочих credentials. Подробный
 контракт и матрица приёмки — [M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
