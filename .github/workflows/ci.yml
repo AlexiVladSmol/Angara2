@@ -290,7 +290,10 @@ jobs:
             cat "$TMP/ready.out"
             exit 1
           fi
+          echo "M06 stage: http response bytes=$(wc -c <"$TMP/http.txt")"
+          cat "$TMP/http.txt"
           grep -q 'angara m03 local origin' "$TMP/http.txt"
+          echo "M06 stage: http 200 ok"
           set +e
           NO_AUTH=$(curl -sS -o /dev/null -w '%{http_code}' --noproxy '' \
             --proxy https://localhost:3129 \
@@ -304,16 +307,19 @@ jobs:
             http://127.0.0.1:18081/)
           ACL_CODE=$?
           set -e
+          echo "M06 stage: noauth=$NO_AUTH code=$NO_AUTH_CODE acl=$ACL_DENIED code=$ACL_CODE"
           test "$NO_AUTH_CODE" -eq 0
           test "$ACL_CODE" -eq 0
           test "$NO_AUTH" = "407"
           test "$ACL_DENIED" = "403"
+          echo "M06 stage: auth checks ok"
           curl -fsS --noproxy '' --proxy https://localhost:3129 \
             --proxy-cacert "$TMP/pki/proxy_ca.pem" \
             --proxy-user "alice:synthetic-ci-password" \
             --cacert "$TMP/site/ca.pem" "https://localhost:$SITE_PORT/" \
             -o "$TMP/site.txt"
           grep -q 'tls-ok' "$TMP/site.txt"
+          echo "M06 stage: layered CONNECT ok"
           head -c 1048576 /dev/urandom >"$TMP/upload.bin"
           curl -fsS --noproxy '' --proxy https://localhost:3129 \
             --proxy-cacert "$TMP/pki/proxy_ca.pem" \
@@ -322,12 +328,14 @@ jobs:
             --data-binary @"$TMP/upload.bin" \
             "https://localhost:$SITE_PORT/upload" -o "$TMP/upload.txt"
           grep -q 'upload:1048576' "$TMP/upload.txt"
+          echo "M06 stage: layered upload ok"
           curl -fsS --noproxy '' --proxy https://localhost:3129 \
             --proxy-cacert "$TMP/pki/proxy_ca.pem" \
             --proxy-user "alice:synthetic-ci-password" \
             --cacert "$TMP/site/ca.pem" \
             "https://localhost:$SITE_PORT/download" -o "$TMP/download.bin"
           test "$(wc -c <"$TMP/download.bin")" -eq 1048576
+          echo "M06 stage: layered download ok"
           set +e
           curl -sS -o /dev/null --noproxy '' --proxy https://localhost:3129 \
             --proxy-cacert "$TMP/site/ca.pem" \
