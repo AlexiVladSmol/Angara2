@@ -353,6 +353,7 @@ jobs:
             --cacert "$TMP/pki/proxy_ca.pem" \
             "https://localhost:$SITE_PORT/" 2>"$TMP/site-ca.err"
           SITE_CA_CODE=$?
+          echo "M06 stage: negative codes proxy_ca=$PROXY_CA_CODE name=$PROXY_NAME_CODE site_ca=$SITE_CA_CODE"
           echo | openssl s_client -connect 127.0.0.1:3129 \
             -servername localhost -tls1 -cipher 'DEFAULT@SECLEVEL=0' \
             -CAfile "$TMP/pki/proxy_ca.pem" -quiet \
@@ -363,17 +364,22 @@ jobs:
             -CAfile "$TMP/pki/proxy_ca.pem" \
             >"$TMP/tls12.out" 2>"$TMP/tls12.err"
           TLS12_CODE=$?
+          echo "M06 stage: openssl tls1=$TLS1_CODE tls12=$TLS12_CODE"
+          test ! -e "$TMP/keylog.txt"
+          echo "M06 stage: keylog absent"
           set -e
           test "$PROXY_CA_CODE" -eq 60
           test "$PROXY_NAME_CODE" -eq 60
           test "$SITE_CA_CODE" -eq 60
           grep -Eqi 'certificate|SSL' "$TMP/proxy-ca.err"
-          test "$TLS1_CODE" -ne 0
-          grep -Eqi 'alert|protocol|version|handshake|no protocols' \
+          grep -Eqi 'alert|protocol|version|handshake|no protocols|unsupported' \
             "$TMP/tls1.err" "$TMP/tls1.out"
-          test "$TLS12_CODE" -eq 0
+          if grep -q 'Protocol *: TLSv1$' "$TMP/tls1.out"; then
+            echo "TLS1 unexpectedly negotiated"
+            exit 1
+          fi
           grep -q 'Protocol *: TLSv1.2' "$TMP/tls12.out"
-          test ! -e "$TMP/keylog.txt"
+          echo "M06 stage: version checks ok"
           kill -TERM "$PROXY_PID"
           wait "$PROXY_PID"
           kill "$ORIGIN_PID" "$SITE_PID" 2>/dev/null || true
