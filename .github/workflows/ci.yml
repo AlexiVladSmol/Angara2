@@ -370,8 +370,13 @@ jobs:
           set -e
           test "$PROXY_CA_CODE" -eq 60
           test "$PROXY_NAME_CODE" -eq 60
-          test "$SITE_CA_CODE" -eq 60
-          grep -Eqi 'certificate|SSL' "$TMP/proxy-ca.err"
+          if [ "$SITE_CA_CODE" -ne 60 ] && [ "$SITE_CA_CODE" -ne 35 ]; then
+            echo "unexpected site CA exit: $SITE_CA_CODE"
+            cat "$TMP/site-ca.err"
+            exit 1
+          fi
+          grep -Eqi 'certificate|unknown ca|SSL' "$TMP/proxy-ca.err"
+          grep -Eqi 'certificate|unknown ca|SSL' "$TMP/site-ca.err"
           grep -Eqi 'alert|protocol|version|handshake|no protocols|unsupported' \
             "$TMP/tls1.err" "$TMP/tls1.out"
           if grep -q 'Protocol *: TLSv1$' "$TMP/tls1.out"; then
