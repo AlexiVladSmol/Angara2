@@ -193,10 +193,17 @@ impl HttpServer {
     /// Stops accepting, drains active work up to the configured deadline, then
     /// forces remaining tracked tasks closed.
     pub async fn shutdown(self) {
-        // One absolute deadline covers every graceful phase. Once it expires,
-        // the remaining tasks are aborted and awaited to actual completion;
-        // cancellation itself is not given a fresh fixed budget.
-        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
+        let deadline = std::time::Instant::now() + self.shutdown_timeout;
+        self.shutdown_until(deadline).await;
+    }
+
+    /// Stops the server before one absolute shutdown deadline.
+    ///
+    /// The deadline is shared with the runtime and CLI; no phase gets a fresh
+    /// full window after it has elapsed.
+    #[doc(hidden)]
+    pub async fn shutdown_until(self, deadline: std::time::Instant) {
+        let deadline = tokio::time::Instant::from_std(deadline);
         self._proxy.begin_shutdown();
         let _ = self.drain.send(true);
         if !self.tasks.wait_until(deadline).await {

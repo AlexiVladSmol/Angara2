@@ -455,28 +455,172 @@ users-файл не должны быть доступны на запись д�
 завершения и не публикует поздний результат. Shutdown ограничен общим
 deadline и не ждёт такие проверки отдельным окном.
 
+### Безопасная подготовка users-файла
+
+PHC считается чувствительным: не пишите его в фиксированное имя в `/tmp` и
+не полагайтесь на `umask` для уже существующего файла. Используйте уникальный
+приватный каталог, файл `0600` с момента создания и атомарную замену
+финального файла рядом с ним.
+
 ```console
 umask 077
-angara users hash > /tmp/alice.phc   # интерактивный ввод и подтверждение
+tmpdir=$(mktemp -d)
+staging=""
+cleanup() {
+  rm -rf "$tmpdir"
+  [ -z "$staging" ] || rm -f "$staging"
+}
+trap cleanup EXIT HUP INT TERM
+
+angara users hash >"$tmpdir/alice.phc"   # интерактивный ввод и подтверждение
+angara users hash >"$tmpdir/bob.phc"
+
+staging=$(mktemp examples/.m05-users.local.XXXXXX)
 {
   printf 'version = 1\n\n[[users]]\nusername = "alice"\npassword_hash = "'
-  tr -d '\n' </tmp/alice.phc
+  tr -d '\n' <"$tmpdir/alice.phc"
+  printf '"\ndisabled = false\n\n[[users]]\nusername = "bob"\npassword_hash = "'
+  tr -d '\n' <"$tmpdir/bob.phc"
   printf '"\ndisabled = false\n'
-} > examples/m05-users.local.toml
-chmod 0600 examples/m05-users.local.toml
-rm -f /tmp/alice.phc
-angara check --config examples/m05-auth-local.toml
-angara serve --config examples/m05-auth-local.toml
-curl --noproxy '' --proxy http://127.0.0.1:3128 \
-  --proxy-user alice http://127.0.0.1:8080/
+} >"$staging"
+chmod 0600 "$staging"
+mv -f "$staging" examples/m05-users.local.toml
 ```
 
-`curl --proxy-user alice` запрашивает пароль интерактивно и не помещает его
-в argv или history. Для неинтерактивного стенда используйте защищённый
-временный curl config `0600` с `proxy-user`; не передавайте пароль через
-`--proxy-user user:password`. `examples/m05-auth-local.toml` не содержит
-рабочих credentials. Подробный контракт и матрица приёмки —
-[M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
+`mktemp -d` создаёт приватный каталог; файлы PHC создаются с `0600` под
+`umask 077`. Финальный файл готовится в том же каталоге `examples/`, получает
+`0600` до публикации и заменяет старый путь одной атомарной операцией `mv`;
+запись через существующий файл или симlink не выполняется. `trap` удаляет
+временные файлы при ошибке и сигнале.
+
+### Ручной сценарий: HTTP, CONNECT HTTPS, 407/403, disable + restart
+
+Ниже используются только синтетические пользователи `alice` и `bob`.
+Пароли вводятся интерактивно в `users hash`; в команды и history они не
+попадают. Все временные файлы удаляются `trap`.
+
+```console
+# 1. Users-файл создан командами из предыдущего раздела; блоки выполняются
+#    последовательно в одном shell.
+# 2. Локальный HTTP origin на 8080.
+HTTP_PID=""
+TLS_PID=""
+PROXY_PID=""
+tlsdir=""
+cleanup_stand() {
+  [ -z "$PROXY_PID" ] || kill -TERM "$PROXY_PID" 2>/dev/null || true
+  [ -z "$HTTP_PID" ] || kill "$HTTP_PID" 2>/dev/null || true
+  [ -z "$TLS_PID" ] || kill "$TLS_PID" 2>/dev/null || true
+  [ -z "$tlsdir" ] || rm -rf "$tlsdir"
+  rm -rf "$tmpdir"
+}
+trap cleanup_stand EXIT HUP INT TERM
+python3 examples/m03-local-origin.py --port 8080 &
+HTTP_PID=$!
+
+# 3. Реальный локальный HTTPS site с временной CA.
+tlsdir=$(mktemp -d)
+python3 tests/fixtures/m04_tls_site.py --dir "$tlsdir" \
+  >"$tlsdir/port.txt" 2>"$tlsdir/site.log" &
+TLS_PID=$!
+for _ in $(seq 1 100); do
+  test -s "$tlsdir/port.txt" && break
+  sleep 0.1
+done
+TLS_PORT=$(sed -n 's/^PORT=//p' "$tlsdir/port.txt")
+test -n "$TLS_PORT"
+
+# 4. Временная копия config: users-файл и TLS-порт.
+install -m 0600 examples/m05-users.local.toml "$tmpdir/users.toml"
+sed -e 's|m05-users.local.toml|users.toml|' \
+    -e "s|ports = \[8080, 8443\]|ports = [8080, $TLS_PORT]|" \
+    -e "s|allowed_ports = \[8443\]|allowed_ports = [$TLS_PORT]|" \
+    examples/m05-auth-local.toml >"$tmpdir/proxy.toml"
+
+angara serve --config "$tmpdir/proxy.toml" &
+PROXY_PID=$!
+for _ in $(seq 1 100); do
+  curl -sS --noproxy '' --proxy http://127.0.0.1:3128 \
+    -o /dev/null http://127.0.0.1:8080/ 2>/dev/null && break
+  sleep 0.1
+done
+
+# 5. Защищённые client config 0600; пароль не в argv/history.
+read -rsp 'alice password: ' alice_password; printf '\n'
+printf 'proxy = "http://127.0.0.1:3128"\nproxy-user = "alice:%s"\nnoproxy = ""\nsilent\nshow-error\n' \
+  "$alice_password" >"$tmpdir/alice.curl"
+unset alice_password
+read -rsp 'bob password: ' bob_password; printf '\n'
+printf 'proxy = "http://127.0.0.1:3128"\nproxy-user = "bob:%s"\nnoproxy = ""\nsilent\nshow-error\n' \
+  "$bob_password" >"$tmpdir/bob.curl"
+unset bob_password
+chmod 0600 "$tmpdir"/*.curl
+
+# 6. HTTP: alice 200, без credentials 407, bob 403 по ACL.
+test "$(curl --config "$tmpdir/alice.curl" -o "$tmpdir/http.txt" \
+  -w '%{http_code}' http://127.0.0.1:8080/)" = "200"
+test "$(curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = "407"
+test "$(curl --config "$tmpdir/bob.curl" -o /dev/null \
+  -w '%{http_code}' http://127.0.0.1:8080/)" = "403"
+
+# 7. CONNECT HTTPS с проверкой CA и hostname; 1 MiB download.
+curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+  "https://localhost:$TLS_PORT/download" -o "$tmpdir/download.bin"
+test "$(wc -c <"$tmpdir/download.bin")" -eq 1048576
+
+# 8. CONNECT HTTPS upload 1 MiB и сверка SHA-256 с ответом site.
+head -c 1048576 /dev/urandom >"$tmpdir/upload.bin"
+curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+  --data-binary @"$tmpdir/upload.bin" "https://localhost:$TLS_PORT/upload" \
+  -o "$tmpdir/upload.txt"
+test "$(cat "$tmpdir/upload.txt")" = \
+  "upload:1048576:$(sha256sum "$tmpdir/upload.bin" | cut -d' ' -f1)"
+
+# 9. Проверка name verification: ожидается exit 60, не 200.
+set +e
+curl --config "$tmpdir/alice.curl" --cacert "$tlsdir/ca.pem" \
+  "https://127.0.0.1:$TLS_PORT/" -o /dev/null 2>"$tmpdir/name.err"
+NAME_CODE=$?
+set -e
+test "$NAME_CODE" -eq 60
+
+# 10. Disable alice безопасной заменой и restart.
+sed '0,/disabled = false/s//disabled = true/' "$tmpdir/users.toml" \
+  >"$tmpdir/users.new"
+chmod 0600 "$tmpdir/users.new"
+mv -f "$tmpdir/users.new" "$tmpdir/users.toml"
+kill -TERM "$PROXY_PID"
+wait "$PROXY_PID"
+angara serve --config "$tmpdir/proxy.toml" &
+PROXY_PID=$!
+for _ in $(seq 1 100); do
+  curl --noproxy '' --proxy http://127.0.0.1:3128 \
+    -o /dev/null http://127.0.0.1:8080/ 2>/dev/null && break
+  sleep 0.1
+done
+test "$(curl --config "$tmpdir/alice.curl" -o /dev/null \
+  -w '%{http_code}' http://127.0.0.1:8080/)" = "407"
+
+kill -TERM "$PROXY_PID"
+wait "$PROXY_PID"
+PROXY_PID=""
+kill "$HTTP_PID" "$TLS_PID" 2>/dev/null || true
+HTTP_PID=""
+TLS_PID=""
+trap - EXIT HUP INT TERM
+rm -rf "$tmpdir" "$tlsdir"
+```
+
+Пароли и PHC не выводятся в терминал и не передаются через argv. Для
+`curl` используется защищённый временный config; `curl --proxy-user` без
+пароля допустим для ручного ввода, но `user:password` в argv запрещён.
+Этот сценарий проверяет HTTP, CONNECT HTTPS через настоящий локальный TLS
+site, 407 без credentials, 403 для аутентифицированного пользователя без
+ACL, а также disable + restart. TLS listener самого proxy остаётся M06.
+
+`examples/m05-auth-local.toml` не содержит рабочих credentials. Подробный
+контракт и матрица приёмки — [M05-r1, Issue #14](https://github.com/AlexeiSmol/Angara/issues/14).
 
 Проверка `check` читает и структурно валидирует users-файл, но не запускает
 runtime, сеть и Argon2 hashing. Plain Basic разрешён только на loopback bind

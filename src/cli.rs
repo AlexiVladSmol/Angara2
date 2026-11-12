@@ -301,6 +301,7 @@ where
                     return EXIT_SERVER_ERROR;
                 }
             };
+            let shutdown_timeout = config.limits().shutdown_timeout();
             let config = Arc::new(config);
             let result = runtime.block_on(async move {
                 let signals = match ShutdownSignals::install() {
@@ -316,12 +317,17 @@ where
                     eprintln!("listening: {id} {address}");
                 }
                 signals.wait().await;
-                server.shutdown().await;
-                Ok::<(), crate::http::ServerError>(())
+                let deadline = std::time::Instant::now() + shutdown_timeout;
+                server.shutdown_until(deadline).await;
+                Ok::<std::time::Instant, crate::http::ServerError>(deadline)
             });
             match result {
-                Ok(()) => EXIT_OK,
+                Ok(deadline) => {
+                    runtime.shutdown_until(deadline);
+                    EXIT_OK
+                }
                 Err(error) => {
+                    runtime.shutdown();
                     eprintln!("error: {error}");
                     EXIT_SERVER_ERROR
                 }

@@ -80,6 +80,8 @@ jobs:
             -- --nocapture
           cargo test --locked --test m05_control m05_cancel01 \
             -- --nocapture
+          cargo test --locked --test m05_control m05_ops01_runtime \
+            -- --nocapture
           cargo test --locked --test m05_auth cli_users_hash_pty \
             -- --nocapture
 

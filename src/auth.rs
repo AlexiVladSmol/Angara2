@@ -144,17 +144,16 @@ impl UsersSnapshot {
             toml::de::Deserializer::parse(text).map_err(|error| UsersFileError::Toml {
                 position: error.span().map(|span| line_column(text, span.start)),
                 path: None,
-                message: crate::config::sanitize_message(error.message()),
+                message: sanitize_users_message(error.message()),
             })?;
         let raw: RawUsersFile =
             serde_path_to_error::deserialize(deserializer).map_err(|error| {
                 let path = error.path().to_string();
-                let path = (path != ".").then_some(path);
                 let inner = error.into_inner();
                 UsersFileError::Toml {
                     position: inner.span().map(|span| line_column(text, span.start)),
-                    path,
-                    message: crate::config::sanitize_message(inner.message()),
+                    path: sanitize_users_path(&path),
+                    message: sanitize_users_message(inner.message()),
                 }
             })?;
 
@@ -474,6 +473,79 @@ fn line_column(input: &str, offset: usize) -> (usize, usize) {
         }
     }
     (line, column)
+}
+
+const USERS_FIELDS: [&str; 5] = ["version", "users", "username", "password_hash", "disabled"];
+
+fn sanitize_users_path(path: &str) -> Option<String> {
+    if path.is_empty() || path == "." {
+        return None;
+    }
+    let mut sanitized = String::new();
+    for (index, segment) in path.split('.').enumerate() {
+        if index > 0 {
+            sanitized.push('.');
+        }
+        let (name, brackets) = match segment.find('[') {
+            Some(position) => (&segment[..position], &segment[position..]),
+            None => (segment, ""),
+        };
+        if !brackets.is_empty()
+            && !(brackets.starts_with('[')
+                && brackets.ends_with(']')
+                && brackets[1..brackets.len() - 1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                && brackets.len() > 2)
+        {
+            return None;
+        }
+        if USERS_FIELDS.contains(&name) {
+            sanitized.push_str(name);
+        } else {
+            sanitized.push_str("<unknown>");
+        }
+        sanitized.push_str(brackets);
+    }
+    Some(sanitized)
+}
+
+fn sanitize_users_message(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len().min(512));
+    let mut characters = message.chars();
+    while let Some(character) = characters.next() {
+        if character == '`' {
+            let mut token = String::new();
+            for inner in characters.by_ref() {
+                if inner == '`' {
+                    break;
+                }
+                token.push(inner);
+            }
+            if USERS_FIELDS.contains(&token.as_str()) {
+                sanitized.push('`');
+                sanitized.push_str(&token);
+                sanitized.push('`');
+            } else {
+                sanitized.push_str("`<redacted>`");
+            }
+        } else if character == '"' {
+            sanitized.push_str("\"<redacted>\"");
+            let mut escaped = false;
+            for inner in characters.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if inner == '\\' {
+                    escaped = true;
+                } else if inner == '"' {
+                    break;
+                }
+            }
+        } else {
+            sanitized.push(character);
+        }
+    }
+    crate::config::escape_control(&sanitized, 240)
 }
 
 /// A verified identity bound to one loaded snapshot.
@@ -1013,6 +1085,29 @@ mod tests {
     fn basic(user: &str, password: &str) -> HeaderMap {
         let encoded = STANDARD.encode(format!("{user}:{password}"));
         header(&format!("Basic {encoded}"))
+    }
+
+    #[test]
+    fn users_diagnostics_redact_unknown_keys_at_both_levels() {
+        let root = "version = 1\nusers = []\n\"REVIEW_SYNTHETIC_SECRET_71\" = 1\n";
+        let nested = format!(
+            "version = 1\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{DUMMY_PHC}\"\n\"REVIEW_SYNTHETIC_SECRET_72\" = \"$argon2id$secret\"\n"
+        );
+        for text in [root, nested.as_str()] {
+            let error = UsersSnapshot::parse(text).expect_err("unknown key must fail");
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            for (label, rendered) in [("display", &display), ("debug", &debug)] {
+                assert!(
+                    !rendered.contains("REVIEW_SYNTHETIC_SECRET"),
+                    "{label}: {rendered}"
+                );
+                assert!(!rendered.contains("$argon2"), "{label}: {rendered}");
+                assert!(rendered.contains("unknown field"), "{label}: {rendered}");
+            }
+        }
+        let error = UsersSnapshot::parse(root).expect_err("unknown key must fail");
+        assert!(error.to_string().contains("<unknown>"), "{error}");
     }
 
     #[test]

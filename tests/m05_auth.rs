@@ -1249,6 +1249,44 @@ fn cli_users_hash_pty_no_echo_and_confirmation() {
 }
 
 #[test]
+fn users_unknown_key_markers_do_not_reach_check_output() {
+    let dir = common::TempDir::new("m05-users-key-leak");
+    let phc = hash("secret");
+    let config_path = dir.path().join("proxy.toml");
+    write_secure(
+        &config_path,
+        &proxy_config(
+            "users.toml",
+            "127.0.0.1:3128",
+            "",
+            "[[access.rules]]\nid = \"allow\"\naction = \"allow\"\n",
+            443,
+        ),
+    );
+    let cases = [
+        "version = 1\nusers = []\n\"REVIEW_SYNTHETIC_SECRET_81\" = 1\n".to_owned(),
+        format!(
+            "version = 1\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{phc}\"\n\"REVIEW_SYNTHETIC_SECRET_82\" = \"$argon2id$secret\"\n"
+        ),
+    ];
+    for contents in cases {
+        write_secure(&dir.path().join("users.toml"), &contents);
+        let output = Command::new(env!("CARGO_BIN_EXE_angara"))
+            .arg("check")
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .expect("run check");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("REVIEW_SYNTHETIC_SECRET"), "{stderr}");
+        assert!(!stderr.contains("$argon2"), "{stderr}");
+        assert!(stderr.contains("unknown field"), "{stderr}");
+    }
+}
+
+#[test]
 fn m05_example_is_valid_with_a_generated_users_file() {
     let dir = common::TempDir::new("m05-example");
     let config_path = dir.path().join("proxy.toml");

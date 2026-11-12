@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use angara::auth::Argon2Verifier;
 use angara::config::Config;
+use angara::runtime::AngaraRuntime;
 use common::m03::{self, RawClient};
 use common::m05::{self, AuthConfig, RecordingVerifier, VerifierState};
 
@@ -698,4 +699,73 @@ action = "allow"
     assert_eq!(state.calls.load(Ordering::SeqCst), 0);
     assert_eq!(origin.accepts.load(Ordering::SeqCst), 0);
     server.shutdown().await;
+}
+
+#[test]
+fn m05_ops01_runtime_shutdown_uses_the_remaining_server_deadline() {
+    let dir = common::TempDir::new("m05-runtime-deadline");
+    m05::write_users(&dir, &[("alice", &m05::hash("secret"), false)]);
+    let config_path = AuthConfig {
+        shutdown_timeout_ms: 400,
+        ..AuthConfig::default()
+    }
+    .write(&dir);
+    let config = Arc::new(Config::load(&config_path).expect("config"));
+    let runtime = AngaraRuntime::build(&config).expect("runtime");
+    let state = Arc::new(VerifierState::default());
+    let state_for_server = Arc::clone(&state);
+    let started = std::time::Instant::now();
+    let deadline = runtime.block_on(async move {
+        let server = angara::http::HttpServer::bind_ephemeral_with_verifier(
+            Arc::clone(&config),
+            Arc::new(RecordingVerifier::new(
+                Arc::clone(&state_for_server),
+                Duration::from_millis(1_200),
+                Ok(true),
+            )),
+        )
+        .await
+        .expect("bind server");
+        let proxy = server.addresses()[0].1;
+        let mut client = RawClient::connect(proxy).await.expect("client");
+        client
+            .send(&m05::get_request(
+                "127.0.0.1:9".parse().expect("target"),
+                Some(("alice", "secret")),
+                &[],
+            ))
+            .await
+            .expect("send");
+        assert!(
+            m05::wait_until(Duration::from_secs(2), || {
+                state_for_server.started.load(Ordering::SeqCst) == 1
+            })
+            .await,
+            "verifier did not start"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        server.shutdown_until(deadline).await;
+        deadline
+    });
+    let server_elapsed = started.elapsed();
+    let runtime_started = std::time::Instant::now();
+    runtime.shutdown_until(deadline);
+    let runtime_elapsed = runtime_started.elapsed();
+    assert!(
+        runtime_elapsed < Duration::from_millis(200),
+        "runtime was given a fresh shutdown window: {runtime_elapsed:?}"
+    );
+    let finish_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state.finished.load(Ordering::SeqCst) != 1 {
+        assert!(
+            std::time::Instant::now() < finish_deadline,
+            "blocking verification did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+        "M05-OPS-01 server_shutdown_ms={} runtime_shutdown_ms={}",
+        server_elapsed.as_millis(),
+        runtime_elapsed.as_millis()
+    );
 }
