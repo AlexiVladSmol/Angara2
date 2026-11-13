@@ -13,16 +13,21 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
-use crate::config::Config;
+use crate::config::{Config, Transport};
 use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, Proxy};
 use crate::http::headers;
-use crate::http::interim::{InterimHub, SplitIo, writer_loop};
+use crate::http::idle::IdleState;
+use crate::http::interim::{InterimHub, SplitIo, TransportProgress, writer_loop};
 use crate::http::{ConnectionOutput, ExchangeBody, ResponseBody};
+use crate::policy;
+use crate::tls::TLS_APP_BUFFER_BYTES;
 use http_body_util::BodyExt;
 
 /// HTTP server startup error.
@@ -120,7 +125,16 @@ impl HttpServer {
             let local = socket.local_addr().map_err(|_| ServerError {
                 detail: "cannot read listener address",
             })?;
-            listeners.push((listener.id().to_owned(), socket));
+            let tls = match listener.transport() {
+                Transport::Http => None,
+                Transport::Https => {
+                    let prepared = config.prepared_tls(listener.id()).ok_or(ServerError {
+                        detail: "HTTPS listener has no prepared TLS state",
+                    })?;
+                    Some(TlsAcceptor::from(prepared.server_config()))
+                }
+            };
+            listeners.push((listener.id().to_owned(), socket, tls));
             addresses.push((listener.id().to_owned(), local));
         }
 
@@ -137,6 +151,8 @@ impl HttpServer {
         let permits = Arc::new(Semaphore::new(
             config.limits().max_client_connections() as usize
         ));
+        let handshake_permits = Arc::new(Semaphore::new(config.tls().max_handshaking()));
+        let handshake_timeout = config.tls().handshake_timeout();
         let (drain, drain_rx) = watch::channel(false);
         let (force, force_rx) = watch::channel(false);
         let tasks = TaskTracker::new();
@@ -147,9 +163,10 @@ impl HttpServer {
             force_rx.clone(),
         ));
 
-        for (id, listener) in listeners {
+        for (id, listener, tls) in listeners {
             let proxy = Arc::clone(&proxy);
             let permits = Arc::clone(&permits);
+            let handshake_permits = Arc::clone(&handshake_permits);
             let tasks_for_accept = tasks.clone();
             let drain_rx = drain_rx.clone();
             let force_rx = force_rx.clone();
@@ -160,6 +177,9 @@ impl HttpServer {
                     id,
                     proxy,
                     permits,
+                    handshake_permits,
+                    tls,
+                    handshake_timeout,
                     tasks_for_accept,
                     config_for_connection,
                     drain_rx,
@@ -267,6 +287,9 @@ async fn accept_loop(
     listener_id: String,
     proxy: Arc<Proxy>,
     permits: Arc<Semaphore>,
+    handshake_permits: Arc<Semaphore>,
+    tls: Option<TlsAcceptor>,
+    handshake_timeout: Duration,
     tasks: TaskTracker,
     config: Arc<Config>,
     mut drain: watch::Receiver<bool>,
@@ -280,6 +303,7 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        let accepted_at = tokio::time::Instant::now();
                         let Ok(permit) = permits.clone().try_acquire_owned() else {
                             drop(stream);
                             continue;
@@ -289,11 +313,32 @@ async fn accept_loop(
                         let listener_id = listener_id.clone();
                         let force = force.clone();
                         let drain = drain.clone();
+                        let handshake_permits = Arc::clone(&handshake_permits);
+                        let tls = tls.clone();
                         tasks.spawn(async move {
-                            serve_client(
-                                stream, peer, listener_id, proxy, permit, config, drain, force,
-                            )
-                            .await;
+                            if let Some(acceptor) = tls {
+                                serve_tls_client(
+                                    stream,
+                                    peer,
+                                    listener_id,
+                                    proxy,
+                                    permit,
+                                    acceptor,
+                                    accepted_at,
+                                    handshake_permits,
+                                    handshake_timeout,
+                                    config,
+                                    drain,
+                                    force,
+                                )
+                                .await;
+                            } else {
+                                serve_client(
+                                    stream, peer, listener_id, proxy, permit, config, None, drain,
+                                    force,
+                                )
+                                .await;
+                            }
                         });
                     }
                     Err(_) => {
@@ -306,23 +351,94 @@ async fn accept_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve_client(
+async fn serve_tls_client(
     stream: TcpStream,
     peer: SocketAddr,
     listener_id: String,
     proxy: Arc<Proxy>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    acceptor: TlsAcceptor,
+    accepted_at: tokio::time::Instant,
+    handshake_permits: Arc<Semaphore>,
+    handshake_timeout: Duration,
     config: Arc<Config>,
     mut drain: watch::Receiver<bool>,
     mut force: watch::Receiver<bool>,
 ) {
+    if policy::check_source(config.access(), peer.ip()).is_err() {
+        return;
+    }
+    let Ok(handshake_permit) = handshake_permits.try_acquire_owned() else {
+        return;
+    };
+    if *drain.borrow() || *force.borrow() {
+        return;
+    }
+    let idle_timeout = config.limits().idle_timeout();
+    let idle_state = Arc::new(Mutex::new(IdleState::new(idle_timeout)));
+    let tunnel_progress = TunnelProgress::new();
+    let observer = TransportProgress::new(Arc::clone(&idle_state), tunnel_progress);
+    let deadline = accepted_at + handshake_timeout;
+    let accepted = tokio::select! {
+        biased;
+        _ = drain.changed() => None,
+        _ = force.changed() => None,
+        result = tokio::time::timeout_at(deadline, acceptor.accept(observer.observe(stream))) => {
+            result.ok().and_then(Result::ok)
+        }
+    };
+    drop(handshake_permit);
+    let Some(mut stream) = accepted else {
+        return;
+    };
+    stream
+        .get_mut()
+        .1
+        .set_buffer_limit(Some(TLS_APP_BUFFER_BYTES));
+    observer.reset_idle();
+    serve_client(
+        stream,
+        peer,
+        listener_id,
+        proxy,
+        permit,
+        config,
+        Some(observer),
+        drain,
+        force,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_client<S>(
+    stream: S,
+    peer: SocketAddr,
+    listener_id: String,
+    proxy: Arc<Proxy>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    config: Arc<Config>,
+    observer: Option<Arc<TransportProgress>>,
+    mut drain: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let _client_permit = permit;
     let idle_timeout = config.limits().idle_timeout();
+    let idle_state = observer
+        .as_ref()
+        .map(|observer| observer.idle_state())
+        .unwrap_or_else(|| Arc::new(Mutex::new(IdleState::new(idle_timeout))));
+    let tunnel_progress = observer
+        .as_ref()
+        .map(|observer| observer.tunnel_progress())
+        .unwrap_or_else(TunnelProgress::new);
     let tunnel_mode = Arc::new(AtomicBool::new(false));
     let output = ConnectionOutput::new();
-    let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag(
+    let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag_and_idle(
         stream,
-        idle_timeout,
+        Arc::clone(&idle_state),
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
     );
@@ -336,7 +452,6 @@ async fn serve_client(
     let service_output = Arc::clone(&output);
     let tunnel_slot: Arc<Mutex<Option<TunnelSetup>>> = Arc::new(Mutex::new(None));
     let service_slot = Arc::clone(&tunnel_slot);
-    let tunnel_progress = TunnelProgress::new();
     let service = service_fn(move |mut request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
@@ -397,6 +512,8 @@ async fn serve_client(
         bridge_reader,
         interim_receiver,
         idle_timeout,
+        idle_state,
+        observer,
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
         Arc::clone(&tunnel_progress),

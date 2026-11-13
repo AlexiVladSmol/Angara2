@@ -5,11 +5,13 @@
 //! cache, admin API, parent proxy) therefore cannot be mistaken for supported
 //! settings.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::Method;
@@ -19,6 +21,10 @@ use serde::de::{self, Deserializer, Visitor};
 
 use crate::auth::{self, AuthMode, UsersSnapshot};
 use crate::target::{DomainName, parse_method};
+use crate::tls::{PreparedTls, prepare_listener};
+
+/// Prepared TLS snapshots keyed by listener id.
+type PreparedTlsMap = HashMap<String, Arc<PreparedTls>>;
 
 /// The only configuration schema version supported by this build.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -96,6 +102,12 @@ const DEFAULT_AUTH_MAX_VERIFYING: i64 = 2;
 const MIN_AUTH_VERIFY_TIMEOUT_MS: i64 = 100;
 const MAX_AUTH_VERIFY_TIMEOUT_MS: i64 = 30_000;
 const DEFAULT_AUTH_VERIFY_TIMEOUT_MS: i64 = 2_000;
+const MIN_TLS_MAX_HANDSHAKING: i64 = 1;
+const MAX_TLS_MAX_HANDSHAKING: i64 = 256;
+const DEFAULT_TLS_MAX_HANDSHAKING: i64 = 32;
+const MIN_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 100;
+const MAX_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 60_000;
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 5_000;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -119,6 +131,8 @@ pub struct Config {
     egress: Vec<EgressProfile>,
     routing: RoutingConfig,
     auth: Option<AuthConfig>,
+    tls: TlsConfig,
+    prepared_tls: HashMap<String, Arc<PreparedTls>>,
 }
 
 impl Config {
@@ -222,6 +236,34 @@ impl Config {
     /// Finds a listener by its stable identifier.
     pub fn listener(&self, id: &str) -> Option<&Listener> {
         self.listeners.iter().find(|listener| listener.id == id)
+    }
+
+    /// Global TLS handshake limits.
+    pub fn tls(&self) -> &TlsConfig {
+        &self.tls
+    }
+
+    pub(crate) fn prepared_tls(&self, listener_id: &str) -> Option<&Arc<PreparedTls>> {
+        self.prepared_tls.get(listener_id)
+    }
+}
+
+/// Global TLS handshake limits shared by all HTTPS listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsConfig {
+    max_handshaking: usize,
+    handshake_timeout: Duration,
+}
+
+impl TlsConfig {
+    /// Maximum simultaneous TLS handshakes for this server instance.
+    pub fn max_handshaking(&self) -> usize {
+        self.max_handshaking
+    }
+
+    /// Absolute handshake deadline measured from TCP accept.
+    pub fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
     }
 }
 
@@ -704,12 +746,29 @@ impl ConnectConfig {
     }
 }
 
+/// Resolved certificate and key paths for one HTTPS listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsListenerConfig {
+    cert_chain_file: PathBuf,
+    private_key_file: PathBuf,
+}
+
+impl TlsListenerConfig {
+    /// Resolved certificate-chain path.
+    pub fn cert_chain_file(&self) -> &Path {
+        &self.cert_chain_file
+    }
+
+    /// Resolved private-key path.
+    pub fn private_key_file(&self) -> &Path {
+        &self.private_key_file
+    }
+}
+
 /// One listener definition.
 ///
-/// This build supports only the `http` transport. An IPv6 listener is IPv6-only;
-/// the future socket bind must set `IPV6_V6ONLY` so that `[::]` does not capture
-/// IPv4 traffic. Consequently an IPv4 wildcard and an IPv6 wildcard on the same
-/// port are not a configuration conflict.
+/// A listener is either plain HTTP or HTTPS. An IPv6 listener is IPv6-only;
+/// the socket bind sets `IPV6_V6ONLY` so that `[::]` does not capture IPv4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listener {
     id: String,
@@ -717,6 +776,7 @@ pub struct Listener {
     transport: Transport,
     auth: AuthMode,
     allow_insecure_basic: bool,
+    tls: Option<TlsListenerConfig>,
 }
 
 impl Listener {
@@ -744,13 +804,20 @@ impl Listener {
     pub fn allow_insecure_basic(&self) -> bool {
         self.allow_insecure_basic
     }
+
+    /// Prepared certificate/key paths for an HTTPS listener.
+    pub fn tls(&self) -> Option<&TlsListenerConfig> {
+        self.tls.as_ref()
+    }
 }
 
 /// Listener transports supported by this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// Plain HTTP listener (the only listener transport implemented here).
+    /// Plain HTTP listener.
     Http,
+    /// TLS listener carrying HTTP/1.1.
+    Https,
 }
 
 /// A configuration loading or validation error.
@@ -978,7 +1045,6 @@ fn is_future_feature_field(field: &str) -> bool {
             | "parent"
             | "policy"
             | "telemetry"
-            | "tls"
             | "upstream"
             | "users"
     )
@@ -1002,7 +1068,8 @@ fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigErr
     }
 
     let limits = validate_limits(raw.limits)?;
-    let listeners = validate_listeners(raw.listeners)?;
+    let tls = validate_tls(raw.tls)?;
+    let (listeners, prepared_tls) = validate_listeners(raw.listeners, base_dir)?;
     let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
     let auth = validate_auth(raw.auth, base_dir)?;
     for (index, listener) in listeners.iter().enumerate() {
@@ -1013,6 +1080,7 @@ fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigErr
             ));
         }
         if listener.auth == AuthMode::Basic
+            && listener.transport == Transport::Http
             && !listener.allow_insecure_basic
             && !is_loopback_ip(listener.bind.ip())
         {
@@ -1045,6 +1113,8 @@ fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigErr
         egress,
         routing,
         auth,
+        tls,
+        prepared_tls,
     })
 }
 
@@ -1094,6 +1164,15 @@ fn validate_auth(
         verify_timeout: Duration::from_millis(verify_timeout_ms as u64),
         snapshot: std::sync::Arc::new(snapshot),
     }))
+}
+
+fn resolve_path(base_dir: &Path, declared: &str) -> PathBuf {
+    let declared = Path::new(declared);
+    if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        base_dir.join(declared)
+    }
 }
 
 fn is_loopback_ip(ip: IpAddr) -> bool {
@@ -1822,7 +1901,32 @@ fn validate_bind_ip(ip: IpAddr, path: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigError> {
+fn validate_tls(raw: Option<RawTls>) -> Result<TlsConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let max_handshaking = bounded_optional(
+        "tls.max_handshaking",
+        raw.max_handshaking,
+        MIN_TLS_MAX_HANDSHAKING,
+        MAX_TLS_MAX_HANDSHAKING,
+        DEFAULT_TLS_MAX_HANDSHAKING,
+    )?;
+    let handshake_timeout_ms = bounded_optional(
+        "tls.handshake_timeout_ms",
+        raw.handshake_timeout_ms,
+        MIN_TLS_HANDSHAKE_TIMEOUT_MS,
+        MAX_TLS_HANDSHAKE_TIMEOUT_MS,
+        DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+    )?;
+    Ok(TlsConfig {
+        max_handshaking: max_handshaking as usize,
+        handshake_timeout: Duration::from_millis(handshake_timeout_ms as u64),
+    })
+}
+
+fn validate_listeners(
+    raw: Vec<RawListener>,
+    base_dir: Option<&Path>,
+) -> Result<(Vec<Listener>, PreparedTlsMap), ConfigError> {
     if raw.is_empty() {
         return Err(validation("listeners", "at least one listener is required"));
     }
@@ -1834,6 +1938,7 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
     }
 
     let mut listeners = Vec::with_capacity(raw.len());
+    let mut prepared_tls = HashMap::new();
     for (index, listener) in raw.into_iter().enumerate() {
         validate_listener_id(&listener.id, index)?;
         validate_listener_address(listener.bind.0, index)?;
@@ -1844,12 +1949,62 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
                 "is only allowed with auth = \"basic\"",
             ));
         }
+        if listener.transport == Transport::Https && listener.allow_insecure_basic {
+            return Err(validation(
+                format!("listeners[{index}].allow_insecure_basic"),
+                "is meaningless for an HTTPS listener",
+            ));
+        }
+        let tls = match (listener.transport, listener.tls) {
+            (Transport::Http, None) => None,
+            (Transport::Http, Some(_)) => {
+                return Err(validation(
+                    format!("listeners[{index}].tls"),
+                    "is only allowed for transport = \"https\"",
+                ));
+            }
+            (Transport::Https, None) => {
+                return Err(validation(
+                    format!("listeners[{index}].tls"),
+                    "is required for transport = \"https\"",
+                ));
+            }
+            (Transport::Https, Some(tls)) => {
+                if tls.cert_chain_file.is_empty() || tls.private_key_file.is_empty() {
+                    return Err(validation(
+                        format!("listeners[{index}].tls"),
+                        "certificate and private-key paths must not be empty",
+                    ));
+                }
+                let Some(base_dir) = base_dir else {
+                    return Err(validation(
+                        format!("listeners[{index}].tls"),
+                        "requires a configuration file context; use Config::load or Config::parse_with_base_dir",
+                    ));
+                };
+                let cert_chain_file = resolve_path(base_dir, &tls.cert_chain_file);
+                let private_key_file = resolve_path(base_dir, &tls.private_key_file);
+                let prepared =
+                    prepare_listener(&cert_chain_file, &private_key_file).map_err(|error| {
+                        validation(
+                            format!("listeners[{index}].tls.{}", error.field()),
+                            error.to_string(),
+                        )
+                    })?;
+                prepared_tls.insert(listener.id.clone(), Arc::new(prepared));
+                Some(TlsListenerConfig {
+                    cert_chain_file,
+                    private_key_file,
+                })
+            }
+        };
         listeners.push(Listener {
             id: listener.id,
             bind: listener.bind.0,
             transport: listener.transport,
             auth,
             allow_insecure_basic: listener.allow_insecure_basic,
+            tls,
         });
     }
 
@@ -1888,7 +2043,7 @@ fn validate_listeners(raw: Vec<RawListener>) -> Result<Vec<Listener>, ConfigErro
         }
     }
 
-    Ok(listeners)
+    Ok((listeners, prepared_tls))
 }
 
 fn validate_listener_id(id: &str, index: usize) -> Result<(), ConfigError> {
@@ -1955,6 +2110,8 @@ struct RawConfig {
     routing: Option<RawRouting>,
     #[serde(default)]
     auth: Option<RawAuth>,
+    #[serde(default)]
+    tls: Option<RawTls>,
 }
 
 #[derive(Deserialize)]
@@ -1985,6 +2142,24 @@ struct RawListener {
     auth: Option<AuthMode>,
     #[serde(default)]
     allow_insecure_basic: bool,
+    #[serde(default)]
+    tls: Option<RawListenerTls>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    #[serde(default)]
+    max_handshaking: Option<i64>,
+    #[serde(default)]
+    handshake_timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawListenerTls {
+    cert_chain_file: String,
+    private_key_file: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -2164,9 +2339,8 @@ impl<'de> Deserialize<'de> for Transport {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "http" => Ok(Self::Http),
-            _ => Err(de::Error::custom(
-                "unsupported transport; M01 supports only `http`",
-            )),
+            "https" => Ok(Self::Https),
+            _ => Err(de::Error::custom("must be `http` or `https`")),
         }
     }
 }

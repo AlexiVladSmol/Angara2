@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use angara::config::Config;
 use angara::http::HttpServer;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -146,13 +146,13 @@ impl RawResponse {
     }
 }
 
-/// Buffered raw TCP client for exact HTTP/1.1 byte tests.
-pub struct RawClient {
-    stream: TcpStream,
+/// Buffered raw client for exact HTTP/1.1 byte tests.
+pub struct RawClient<S = TcpStream> {
+    stream: S,
     buffer: Vec<u8>,
 }
 
-impl RawClient {
+impl RawClient<TcpStream> {
     pub async fn connect(address: SocketAddr) -> io::Result<Self> {
         let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(address))
             .await
@@ -180,6 +180,26 @@ impl RawClient {
             stream,
             buffer: Vec::new(),
         })
+    }
+}
+
+impl<S> RawClient<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Wraps an already established stream, such as a TLS client stream.
+    pub fn from_stream(stream: S) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Returns the underlying stream. Any bytes already buffered by this
+    /// client are discarded; only use this at a protocol boundary where no
+    /// extra bytes are expected.
+    pub fn into_inner(self) -> S {
+        self.stream
     }
 
     pub async fn send(&mut self, bytes: &[u8]) -> io::Result<()> {

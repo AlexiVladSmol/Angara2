@@ -60,6 +60,7 @@ fn cli_help_prints_usage_and_succeeds() {
         stdout.contains("Bind all listeners and run the HTTP/1.1 proxy"),
         "{stdout}"
     );
+    assert!(stdout.contains("HTTP and HTTPS ingress"), "{stdout}");
     assert!(!stdout.contains("not implemented"), "{stdout}");
 }
 
@@ -522,22 +523,37 @@ fn cli_escapes_control_characters_in_unknown_field_diagnostic() {
 }
 
 #[test]
-fn cli_check_rejects_unknown_transport() {
+fn cli_check_rejects_unknown_transport_and_missing_tls() {
     let dir = TempDir::new("cli-transport");
-    let text = config_with(&ONE_LISTENER.replace("http", "https"), "\"auto\"");
-    let path = dir.write("invalid.toml", &text);
-
+    let unknown = dir.write(
+        "unknown.toml",
+        &config_with(&ONE_LISTENER.replace("http", "quic"), "\"auto\""),
+    );
     let output = angara()
         .arg("check")
         .arg("--config")
-        .arg(path)
+        .arg(&unknown)
         .output()
         .expect("run angara");
-
     assert_eq!(status(&output), 1);
     let error = stderr(&output);
     assert!(error.contains("listeners[0].transport"), "{error}");
-    assert!(error.contains("unsupported transport"), "{error}");
+    assert!(error.contains("http") && error.contains("https"), "{error}");
+
+    let https = dir.write(
+        "https.toml",
+        &config_with(&ONE_LISTENER.replace("http", "https"), "\"auto\""),
+    );
+    let output = angara()
+        .arg("check")
+        .arg("--config")
+        .arg(&https)
+        .output()
+        .expect("run angara");
+    assert_eq!(status(&output), 1);
+    let error = stderr(&output);
+    assert!(error.contains("listeners[0].tls"), "{error}");
+    assert!(error.contains("required"), "{error}");
 }
 
 #[test]
