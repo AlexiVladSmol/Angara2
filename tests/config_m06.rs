@@ -232,6 +232,56 @@ fn m06_cfg02_chain_and_key_errors_reject_the_whole_startup() {
     both.extend_from_slice(&fs::read(dir.path().join("site_key.pem")).expect("site key"));
     fs::write(&multiple, both).expect("multiple keys");
     secure_key(&multiple);
+
+    let mixed_encrypted = dir.path().join("mixed-encrypted.pem");
+    let mut mixed = fs::read(&key).expect("proxy key");
+    mixed.extend_from_slice(
+        &fs::read(dir.path().join("proxy_encrypted_key.pem")).expect("encrypted key"),
+    );
+    fs::write(&mixed_encrypted, mixed).expect("mixed encrypted key");
+    secure_key(&mixed_encrypted);
+
+    let unknown_block = "-----BEGIN ARBITRARY-----\nAAAA\n-----END ARBITRARY-----\n";
+    let mixed_unknown = dir.path().join("mixed-unknown.pem");
+    let mut mixed = fs::read(&key).expect("proxy key");
+    mixed.extend_from_slice(unknown_block.as_bytes());
+    fs::write(&mixed_unknown, mixed).expect("mixed unknown key");
+    secure_key(&mixed_unknown);
+
+    let chain_encrypted = dir.path().join("chain-encrypted.pem");
+    let mut mixed = fs::read(&chain).expect("proxy chain");
+    mixed.extend_from_slice(
+        &fs::read(dir.path().join("proxy_encrypted_key.pem")).expect("encrypted key"),
+    );
+    fs::write(&chain_encrypted, mixed).expect("chain with encrypted block");
+
+    let chain_unknown = dir.path().join("chain-unknown.pem");
+    let mut mixed = fs::read(&chain).expect("proxy chain");
+    mixed.extend_from_slice(unknown_block.as_bytes());
+    fs::write(&chain_unknown, mixed).expect("chain with unknown block");
+
+    let damaged_before = dir.path().join("damaged-before.pem");
+    let mut damaged = b"-----BEGIN CERTIFICATE-----\nAAAA\n".to_vec();
+    damaged.extend_from_slice(&fs::read(&chain).expect("proxy chain"));
+    fs::write(&damaged_before, damaged).expect("damaged before");
+
+    let damaged_after = dir.path().join("damaged-after.pem");
+    let mut damaged = fs::read(&chain).expect("proxy chain");
+    damaged.extend_from_slice(b"not a PEM section\n");
+    fs::write(&damaged_after, damaged).expect("damaged after");
+
+    let damaged_between = dir.path().join("damaged-between.pem");
+    let chain_bytes = fs::read(&chain).expect("proxy chain");
+    let first_end = chain_bytes
+        .windows(b"-----END CERTIFICATE-----".len())
+        .position(|window| window == b"-----END CERTIFICATE-----")
+        .expect("chain end")
+        + b"-----END CERTIFICATE-----".len();
+    let mut damaged = chain_bytes[..first_end].to_vec();
+    damaged.extend_from_slice(b"\n-----END CERTIFICATE-----\n");
+    damaged.extend_from_slice(&chain_bytes[first_end..]);
+    fs::write(&damaged_between, damaged).expect("damaged between");
+
     let mismatch = config_text(
         "127.0.0.1:3129",
         "https",
@@ -258,6 +308,34 @@ fn m06_cfg02_chain_and_key_errors_reject_the_whole_startup() {
             config_text("127.0.0.1:3129", "https", &chain, &multiple, None),
             "private key",
         ),
+        (
+            config_text("127.0.0.1:3129", "https", &chain, &mixed_encrypted, None),
+            "private key",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &chain, &mixed_unknown, None),
+            "private key",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &chain_encrypted, &key, None),
+            "certificate chain",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &chain_unknown, &key, None),
+            "certificate chain",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &damaged_before, &key, None),
+            "PEM",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &damaged_after, &key, None),
+            "PEM",
+        ),
+        (
+            config_text("127.0.0.1:3129", "https", &damaged_between, &key, None),
+            "PEM",
+        ),
     ];
     for (text, expected) in cases {
         let path = write(&dir, "invalid.toml", &text);
@@ -271,6 +349,20 @@ fn m06_cfg02_chain_and_key_errors_reject_the_whole_startup() {
         .expect_err("mismatched key")
         .to_string();
     assert!(error.contains("does not match"), "{error}");
+
+    let crlf_chain = dir.path().join("chain-crlf.pem");
+    let mut crlf = Vec::new();
+    for line in chain_bytes.split(|byte| *byte == b'\n') {
+        crlf.extend_from_slice(line);
+        crlf.extend_from_slice(b"\r\n");
+    }
+    fs::write(&crlf_chain, crlf).expect("CRLF chain");
+    let crlf_config = write(
+        &dir,
+        "crlf.toml",
+        &config_text("127.0.0.1:3129", "https", &crlf_chain, &key, None),
+    );
+    Config::load(&crlf_config).expect("CRLF and blank lines remain valid");
 
     let missing = write(
         &dir,

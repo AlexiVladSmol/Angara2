@@ -6,9 +6,10 @@
 //! message; this adapter only orders bounded interim heads before the final
 //! response.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -152,13 +153,28 @@ where
         output: Arc<ConnectionOutput>,
         tunnel: Arc<AtomicBool>,
     ) -> (Self, WriteHalf<R>, DuplexStream) {
+        Self::with_tunnel_flag_and_idle(
+            stream,
+            Arc::new(Mutex::new(IdleState::new(idle_timeout))),
+            output,
+            tunnel,
+        )
+    }
+
+    /// Creates the combined IO with shared idle state and tunnel flag.
+    pub fn with_tunnel_flag_and_idle(
+        stream: R,
+        idle: Arc<Mutex<IdleState>>,
+        output: Arc<ConnectionOutput>,
+        tunnel: Arc<AtomicBool>,
+    ) -> (Self, WriteHalf<R>, DuplexStream) {
         let (read, write) = tokio::io::split(stream);
         let (bridge_writer, bridge_reader) = tokio::io::duplex(64 * 1024);
         (
             Self {
                 read,
                 write: bridge_writer,
-                idle: Arc::new(Mutex::new(IdleState::new(idle_timeout))),
+                idle,
                 output,
                 tunnel,
             },
@@ -274,6 +290,176 @@ fn idle_expired(idle: &Mutex<IdleState>, context: &mut Context<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// Bounded transport progress observer for pending application output.
+///
+/// The writer arms this observer immediately before writing/flushing
+/// application bytes and disarms it afterwards. Positive ciphertext writes to
+/// the underlying transport then count as progress for HTTP idle and CONNECT
+/// relay limits. Handshake/control records or idle polls are not counted.
+#[doc(hidden)]
+pub struct TransportProgress {
+    armed: AtomicBool,
+    epoch: AtomicU64,
+    idle: Arc<Mutex<IdleState>>,
+    tunnel: Arc<TunnelProgress>,
+}
+
+impl TransportProgress {
+    /// Creates an observer bound to the connection idle and tunnel progress.
+    #[doc(hidden)]
+    pub fn new(idle: Arc<Mutex<IdleState>>, tunnel: Arc<TunnelProgress>) -> Arc<Self> {
+        Arc::new(Self {
+            armed: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+            idle,
+            tunnel,
+        })
+    }
+
+    /// Wraps a transport so ciphertext writes are observed.
+    #[doc(hidden)]
+    pub fn observe<T>(self: &Arc<Self>, inner: T) -> ObservedIo<T> {
+        ObservedIo {
+            inner,
+            progress: Arc::clone(self),
+        }
+    }
+
+    /// Shared connection idle state.
+    #[doc(hidden)]
+    pub fn idle_state(&self) -> Arc<Mutex<IdleState>> {
+        Arc::clone(&self.idle)
+    }
+
+    /// Shared CONNECT relay progress.
+    #[doc(hidden)]
+    pub fn tunnel_progress(&self) -> Arc<TunnelProgress> {
+        Arc::clone(&self.tunnel)
+    }
+
+    /// Enables progress observation for pending application output.
+    #[doc(hidden)]
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// Disables progress observation after application output is flushed.
+    #[doc(hidden)]
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    /// Starts connection idle clocks after a TLS handshake.
+    #[doc(hidden)]
+    pub fn reset_idle(&self) {
+        idle_progress(&self.idle);
+    }
+
+    /// Monotonic count of observed positive transport writes.
+    #[doc(hidden)]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    fn record(&self) {
+        if self.armed.load(Ordering::Acquire) {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+            idle_progress(&self.idle);
+            self.tunnel.hit();
+        }
+    }
+}
+
+/// A transport wrapper that reports positive ciphertext writes.
+#[doc(hidden)]
+pub struct ObservedIo<T> {
+    inner: T,
+    progress: Arc<TransportProgress>,
+}
+
+impl<T> ObservedIo<T> {
+    /// Creates an observed transport.
+    #[doc(hidden)]
+    pub fn new(inner: T, progress: Arc<TransportProgress>) -> Self {
+        Self { inner, progress }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ObservedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ObservedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    this.progress.record();
+                }
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+/// Bounds a wait by absence of observed transport progress.
+async fn stall_bounded<F, T>(
+    future: F,
+    idle_timeout: Duration,
+    idle: &Mutex<IdleState>,
+    progress: Option<&TransportProgress>,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let Some(progress) = progress else {
+        return match tokio::time::timeout(idle_timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "idle client transport timeout",
+            )),
+        };
+    };
+    let mut future = std::pin::pin!(future);
+    loop {
+        let observed = progress.epoch();
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = tokio::time::sleep(idle_timeout) => {
+                if progress.epoch() == observed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "idle client transport timeout",
+                    ));
+                }
+                idle_progress(idle);
+            }
+        }
+    }
+}
+
 /// Single owner of the client write half.
 ///
 /// Interim heads are biased ahead of hyper's final bytes. The duplex bridge
@@ -285,6 +471,7 @@ pub async fn writer_loop<W>(
     mut interim: mpsc::Receiver<Bytes>,
     idle_timeout: Duration,
     idle: Arc<Mutex<IdleState>>,
+    observer: Option<Arc<TransportProgress>>,
     output: Arc<ConnectionOutput>,
     tunnel: Arc<AtomicBool>,
     progress: Arc<TunnelProgress>,
@@ -292,6 +479,7 @@ pub async fn writer_loop<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let observer = observer.as_deref();
     let mut buffer = [0_u8; 16 * 1024];
     let mut interim_open = true;
     loop {
@@ -300,8 +488,7 @@ where
             maybe_interim = interim.recv(), if interim_open => {
                 match maybe_interim {
                     Some(bytes) => {
-                        write_all_bounded(&mut socket, &bytes, idle_timeout, &idle, &tunnel, &progress).await?;
-                        flush_bounded(&mut socket, idle_timeout, &idle, &tunnel).await?;
+                        write_and_flush(&mut socket, &bytes, idle_timeout, &idle, &tunnel, &progress, observer).await?;
                         output.flushed();
                     }
                     None => interim_open = false,
@@ -312,14 +499,19 @@ where
                 if read == 0 {
                     break;
                 }
-                write_all_bounded(&mut socket, &buffer[..read], idle_timeout, &idle, &tunnel, &progress).await?;
-                flush_bounded(&mut socket, idle_timeout, &idle, &tunnel).await?;
+                write_and_flush(&mut socket, &buffer[..read], idle_timeout, &idle, &tunnel, &progress, observer).await?;
                 output.consumed(read);
                 output.flushed();
             }
         }
     }
-    let _ = flush_bounded(&mut socket, idle_timeout, &idle, &tunnel).await;
+    if let Some(observer) = observer {
+        observer.arm();
+    }
+    let _ = flush_bounded(&mut socket, idle_timeout, &idle, &tunnel, observer).await;
+    if let Some(observer) = observer {
+        observer.disarm();
+    }
     if tunnel.load(Ordering::Acquire) {
         let _ = socket.shutdown().await;
     } else {
@@ -328,6 +520,43 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn write_and_flush<W>(
+    socket: &mut W,
+    bytes: &[u8],
+    idle_timeout: Duration,
+    idle: &Mutex<IdleState>,
+    tunnel: &AtomicBool,
+    progress: &TunnelProgress,
+    observer: Option<&TransportProgress>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(observer) = observer {
+        observer.arm();
+    }
+    let result = async {
+        write_all_bounded(
+            socket,
+            bytes,
+            idle_timeout,
+            idle,
+            tunnel,
+            progress,
+            observer,
+        )
+        .await?;
+        flush_bounded(socket, idle_timeout, idle, tunnel, observer).await
+    }
+    .await;
+    if let Some(observer) = observer {
+        observer.disarm();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn write_all_bounded<W>(
     socket: &mut W,
     bytes: &[u8],
@@ -335,6 +564,7 @@ async fn write_all_bounded<W>(
     idle: &Mutex<IdleState>,
     tunnel: &AtomicBool,
     progress: &TunnelProgress,
+    observer: Option<&TransportProgress>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -348,16 +578,13 @@ where
             }
             count
         } else {
-            match tokio::time::timeout(idle_timeout, socket.write(&bytes[written..])).await {
-                Ok(Ok(count)) => count,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "idle client write timeout",
-                    ));
-                }
-            }
+            stall_bounded(
+                socket.write(&bytes[written..]),
+                idle_timeout,
+                idle,
+                observer,
+            )
+            .await?
         };
         if count == 0 {
             return Err(io::Error::new(
@@ -376,6 +603,7 @@ async fn flush_bounded<W>(
     idle_timeout: Duration,
     idle: &Mutex<IdleState>,
     tunnel: &AtomicBool,
+    observer: Option<&TransportProgress>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -383,17 +611,10 @@ where
     if tunnel.load(Ordering::Acquire) {
         socket.flush().await
     } else {
-        match tokio::time::timeout(idle_timeout, socket.flush()).await {
-            Ok(result) => {
-                if result.is_ok() {
-                    idle_progress(idle);
-                }
-                result
-            }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "idle client flush timeout",
-            )),
+        let result = stall_bounded(socket.flush(), idle_timeout, idle, observer).await;
+        if result.is_ok() {
+            idle_progress(idle);
         }
+        result
     }
 }

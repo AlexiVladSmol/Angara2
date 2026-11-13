@@ -513,10 +513,10 @@ async fn m06_cancel01_shutdown_bounds_tls_flush_and_new_admission() {
         "shutdown waited for TLS flush/close longer than its absolute bound: {elapsed:?}"
     );
     let closed = tokio::time::timeout(Duration::from_secs(1), client.read_until_eof()).await;
-    assert!(
-        matches!(closed, Ok(Ok(_)) | Ok(Err(_)) | Err(_)),
-        "client connection stayed live after forced shutdown"
-    );
+    match closed {
+        Ok(_) => {}
+        Err(_) => panic!("client connection stayed live after forced shutdown"),
+    }
     assert!(
         m06::connect_tls(address, "localhost", proxy_ca(&dir))
             .await

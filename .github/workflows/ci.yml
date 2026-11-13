@@ -140,6 +140,8 @@ jobs:
             -- --nocapture
           cargo test --locked --test m06_extra m06_time01 \
             -- --nocapture
+          cargo test --locked --test m06_progress \
+            -- --nocapture
 
       - name: M05 Basic curl smoke through the real proxy
         run: |

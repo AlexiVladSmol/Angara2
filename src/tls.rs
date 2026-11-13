@@ -256,6 +256,7 @@ fn effective_uid() -> Option<u32> {
 
 fn parse_certificate_chain(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsPrepError> {
     let field = TlsFileKind::CertificateChain.field();
+    let expected = validate_pem_framing(bytes, TlsFileKind::CertificateChain)?;
     let mut chain = Vec::new();
     for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(bytes) {
         let (kind, der) = item.map_err(|_| TlsPrepError::new(field, TlsErrorClass::InvalidPem))?;
@@ -271,7 +272,7 @@ fn parse_certificate_chain(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>,
         }
         chain.push(CertificateDer::from(der));
     }
-    if chain.is_empty() {
+    if chain.is_empty() || chain.len() != expected {
         return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
     }
     Ok(chain)
@@ -279,6 +280,10 @@ fn parse_certificate_chain(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>,
 
 fn parse_private_key(bytes: &[u8]) -> Result<PrivateKeyDer<'static>, TlsPrepError> {
     let field = TlsFileKind::PrivateKey.field();
+    let expected = validate_pem_framing(bytes, TlsFileKind::PrivateKey)?;
+    if expected != 1 {
+        return Err(TlsPrepError::new(field, TlsErrorClass::InvalidKey));
+    }
     let mut key = None;
     for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(bytes) {
         let (kind, der) = item.map_err(|_| TlsPrepError::new(field, TlsErrorClass::InvalidKey))?;
@@ -298,4 +303,63 @@ fn parse_private_key(bytes: &[u8]) -> Result<PrivateKeyDer<'static>, TlsPrepErro
         return Err(TlsPrepError::new(field, TlsErrorClass::InvalidKey));
     }
     Ok(key)
+}
+
+/// Validates every PEM section and rejects unknown labels, nested or
+/// unterminated markers, and non-whitespace text between blocks.
+fn validate_pem_framing(bytes: &[u8], file_kind: TlsFileKind) -> Result<usize, TlsPrepError> {
+    let field = file_kind.field();
+    let (allowed, unsupported): (&[&[u8]], TlsErrorClass) = match file_kind {
+        TlsFileKind::CertificateChain => (&[b"CERTIFICATE"], TlsErrorClass::InvalidChain),
+        TlsFileKind::PrivateKey => (
+            &[b"RSA PRIVATE KEY", b"PRIVATE KEY", b"EC PRIVATE KEY"],
+            TlsErrorClass::InvalidKey,
+        ),
+    };
+    let mut open: Option<Vec<u8>> = None;
+    let mut sections = 0usize;
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let trimmed = line.trim_ascii();
+        if trimmed.starts_with(b"-----BEGIN ") || trimmed.starts_with(b"-----END ") {
+            if trimmed != line {
+                return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
+            }
+            if let Some(label) = pem_line_label(line, b"-----BEGIN ") {
+                if open.is_some() {
+                    return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
+                }
+                if !allowed.contains(&label) {
+                    return Err(TlsPrepError::new(field, unsupported));
+                }
+                open = Some(label.to_vec());
+            } else if let Some(label) = pem_line_label(line, b"-----END ") {
+                match open.take() {
+                    Some(open) if open.as_slice() == label => sections += 1,
+                    _ => return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem)),
+                }
+            } else {
+                return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
+            }
+        } else if open.is_none() && !trimmed.is_empty() {
+            return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
+        }
+    }
+    if open.is_some() {
+        return Err(TlsPrepError::new(field, TlsErrorClass::InvalidPem));
+    }
+    Ok(sections)
+}
+
+fn pem_line_label<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let rest = line.strip_prefix(prefix)?;
+    let label = rest.strip_suffix(b"-----")?;
+    if label.is_empty()
+        || !label.iter().all(|byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b' ' || *byte == b'-'
+        })
+    {
+        return None;
+    }
+    Some(label)
 }

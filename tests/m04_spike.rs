@@ -58,6 +58,7 @@ fn m04_spike_connect_upgrade_preserves_early_and_origin_first_bytes() {
                 interim_rx,
                 Duration::from_secs(5),
                 idle_state,
+                None,
                 output.clone(),
                 tunnel,
                 progress,

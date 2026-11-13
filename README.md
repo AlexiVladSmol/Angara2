@@ -137,7 +137,10 @@ transport = "http"
   разрешаются относительно каталога config и читаются один раз при загрузке
   snapshot. Chain — 1–16 PEM `CERTIFICATE` (leaf-first), key — ровно один
   поддерживаемый unencrypted PKCS#1/PKCS#8/SEC1 ключ, файл до 1 MiB; rustls
-  проверяет соответствие ключа leaf-сертификату. На Linux key не должен иметь
+  проверяет соответствие ключа leaf-сертификату. Весь PEM input проверяется
+  строго: неизвестные/encrypted блоки, вложенные или незавершённые маркеры и
+  непустой текст вне блоков отвергаются; допускаются обычные whitespace и
+  CRLF. На Linux key не должен иметь
   group-write/world-битов (например `0600`/`0640`), chain — write для
   group/world (например `0600`/`0644`), владелец — effective UID сервиса или
   root.
@@ -695,9 +698,11 @@ HTTP listener 3128 без auth и HTTPS listener 3129 с Basic. `check` и `serv
   TLS bytes. Перегрузка handshake закрывает TCP без plaintext 503; абсолютный
   `handshake_timeout_ms` отсчитывается от accept и не продлевается chunks.
 - Один plaintext writer обслуживает interim/final/CONNECT output. Реальный
-  TLS flush учитывается output barrier; 103/102, final body, CONNECT 200 и
-  early tunnel bytes сохраняют порядок. Буфер приложения — 64 KiB, bridge —
-  64 KiB на направление.
+  TLS flush учитывается output barrier; bounded transport observer считает
+  положительные ciphertext-записи во время pending application output и
+  передаёт их в HTTP idle/tunnel progress, не считая handshake/control-only
+  трафик. 103/102, final body, CONNECT 200 и early tunnel bytes сохраняют
+  порядок. Буфер приложения — 64 KiB, bridge — 64 KiB на направление.
 - TLS1.3 корректный `close_notify` — EOF одного направления: принятые bytes
   дописываются, write side закрывается, reverse drain ограничен прежним
   first-EOF deadline M04. TLS1.2 использует полный closure exchange по
@@ -761,7 +766,7 @@ TLS-in-TLS. Неверная proxy CA или имя дают curl exit 60 до a
 игнорируется: key log не создаётся. Автоматический эквивалент — CI шаг
 «M06 HTTPS proxy curl smoke with two CAs», тесты `tests/m06_tls.rs`,
 `tests/m06_extra.rs`, `tests/config_m06.rs`, `tests/cli_m06.rs`,
-`tests/m06_limits.rs`.
+`tests/m06_progress.rs`, `tests/m06_limits.rs`.
 
 Подробный контракт и матрица приёмки — [M06-r1, Issue #17](https://github.com/AlexeiSmol/Angara/issues/17).
 

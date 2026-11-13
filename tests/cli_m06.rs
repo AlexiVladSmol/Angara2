@@ -96,6 +96,16 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).expect("write test file");
 }
 
+fn secure(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[test]
 fn cli_m06_check_and_serve_reject_bad_pair_before_bind() {
     let dir = common::TempDir::new("cli-m06-bad-pair");
@@ -127,6 +137,38 @@ fn cli_m06_check_and_serve_reject_bad_pair_before_bind() {
         assert!(!error.contains("BEGIN PRIVATE KEY"), "{error}");
         assert!(!error.contains("MII"), "{error}");
     }
+
+    let mixed_key = dir.path().join("mixed-key.pem");
+    let mut mixed = fs::read(dir.path().join("proxy_key.pem")).expect("proxy key");
+    mixed.extend_from_slice(
+        &fs::read(dir.path().join("proxy_encrypted_key.pem")).expect("encrypted key"),
+    );
+    fs::write(&mixed_key, mixed).expect("mixed key");
+    secure(&mixed_key);
+    let mixed_config = dir.path().join("mixed.toml");
+    write(
+        &mixed_config,
+        &config_text(
+            &format!("127.0.0.1:{port}"),
+            &dir.path().join("proxy_chain.pem"),
+            &mixed_key,
+            None,
+        ),
+    );
+    let output = angara()
+        .arg("check")
+        .arg("--config")
+        .arg(&mixed_config)
+        .output()
+        .expect("run angara check");
+    assert_eq!(status(&output), 1);
+    let error = stderr(&output);
+    assert!(
+        error.contains("listeners[0].tls.private_key_file"),
+        "{error}"
+    );
+    assert!(error.contains("private key"), "{error}");
+    assert!(!error.contains("ENCRYPTED PRIVATE KEY"), "{error}");
 
     std::net::TcpListener::bind(("127.0.0.1", port))
         .expect("serve rejected the config before binding a socket");

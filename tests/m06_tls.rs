@@ -650,8 +650,12 @@ async fn m06_eof01_tls12_closure_and_tls13_response_close() {
         let response = client.read_response().await.expect("response");
         assert_eq!(response.head.status, 200);
         assert_eq!(response.text(), "closed");
+        let trailing = client
+            .read_until_eof()
+            .await
+            .expect("normal close must end with TLS close_notify");
         assert!(
-            client.read_until_eof().await.unwrap_or_default().is_empty(),
+            trailing.is_empty(),
             "unexpected bytes after a complete close response"
         );
     }
@@ -896,13 +900,19 @@ async fn m06_time01_header_clock_starts_after_tls_handshake() {
     .expect("TLS handshake");
     let started = std::time::Instant::now();
     let closed = tokio::time::timeout(Duration::from_secs(2), client.read_head()).await;
-    assert!(
-        closed.map(|result| result.is_err()).unwrap_or(true),
-        "HTTP header clock did not close an idle TLS connection"
-    );
+    match closed {
+        Ok(Ok(head)) => panic!("HTTP header clock returned a response: {head:?}"),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("HTTP header clock did not close the idle TLS connection"),
+    }
     assert!(
         started.elapsed() >= Duration::from_millis(200),
         "header clock closed before its configured bound: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "header clock exceeded its upper bound: {:?}",
         started.elapsed()
     );
     assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -968,10 +978,11 @@ async fn m06_cancel01_pending_handshake_is_bounded_by_shutdown() {
     );
     let mut byte = [0_u8; 1];
     let closed = tokio::time::timeout(Duration::from_millis(500), pending.read(&mut byte)).await;
-    assert!(
-        matches!(closed, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-        "pending handshake socket remained live"
-    );
+    match closed {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("pending handshake socket produced unexpected bytes"),
+        Err(_) => panic!("pending handshake socket remained live after shutdown"),
+    }
 }
 
 #[tokio::test]
@@ -1011,13 +1022,11 @@ async fn m06_limit01_handshake_budget_is_shared_and_does_not_queue() {
     raw.send(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .expect("raw send");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(400), raw.read_head())
-            .await
-            .map(|result| result.is_err())
-            .unwrap_or(true),
-        "handshake overload produced a plaintext HTTP response"
-    );
+    match tokio::time::timeout(Duration::from_secs(3), raw.read_head()).await {
+        Ok(Ok(head)) => panic!("handshake overload produced HTTP: {head:?}"),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("handshake overload connection stayed open"),
+    }
 
     drop(held);
     let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"recovered"))
@@ -1056,17 +1065,22 @@ async fn m06_tls03_partial_client_hello_uses_absolute_handshake_deadline() {
     .replace("handshake_timeout_ms = 2000", "handshake_timeout_ms = 250");
     let (server, address) = start_proxy_with_config(&dir, &text).await;
 
-    // Plain HTTP is not silently interpreted as TLS.
+    // Plain HTTP is not silently interpreted as TLS, and the server must
+    // actively close the rejected connection.
     let mut raw = RawClient::connect(address).await.expect("raw");
     raw.send(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .expect("raw send");
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(Duration::from_secs(2), raw.read_head()).await {
+        Ok(Ok(head)) => panic!("plain HTTP received on TLS port: {head:?}"),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("plain HTTP on TLS port was not closed"),
+    }
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), raw.read_head())
-            .await
-            .map(|result| result.is_err())
-            .unwrap_or(true),
-        "plain HTTP received an HTTP response on TLS port"
+        started.elapsed() < Duration::from_millis(1500),
+        "plain HTTP rejection exceeded the handshake deadline: {:?}",
+        started.elapsed()
     );
 
     // A fragmented/incomplete ClientHello does not extend the absolute
@@ -1083,13 +1097,19 @@ async fn m06_tls03_partial_client_hello_uses_absolute_handshake_deadline() {
     }
     let mut byte = [0_u8; 1];
     let closed = tokio::time::timeout(Duration::from_secs(2), slow.read(&mut byte)).await;
-    assert!(
-        matches!(closed, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-        "partial ClientHello did not close"
-    );
+    match closed {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("partial ClientHello produced unexpected bytes"),
+        Err(_) => panic!("partial ClientHello did not close"),
+    }
     assert!(
         started.elapsed() >= Duration::from_millis(200),
         "handshake closed before its deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "handshake exceeded its absolute deadline: {:?}",
         started.elapsed()
     );
     assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);

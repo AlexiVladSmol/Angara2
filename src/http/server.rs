@@ -23,7 +23,8 @@ use crate::config::{Config, Transport};
 use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, Proxy};
 use crate::http::headers;
-use crate::http::interim::{InterimHub, SplitIo, writer_loop};
+use crate::http::idle::IdleState;
+use crate::http::interim::{InterimHub, SplitIo, TransportProgress, writer_loop};
 use crate::http::{ConnectionOutput, ExchangeBody, ResponseBody};
 use crate::policy;
 use crate::tls::TLS_APP_BUFFER_BYTES;
@@ -333,7 +334,8 @@ async fn accept_loop(
                                 .await;
                             } else {
                                 serve_client(
-                                    stream, peer, listener_id, proxy, permit, config, drain, force,
+                                    stream, peer, listener_id, proxy, permit, config, None, drain,
+                                    force,
                                 )
                                 .await;
                             }
@@ -372,12 +374,16 @@ async fn serve_tls_client(
     if *drain.borrow() || *force.borrow() {
         return;
     }
+    let idle_timeout = config.limits().idle_timeout();
+    let idle_state = Arc::new(Mutex::new(IdleState::new(idle_timeout)));
+    let tunnel_progress = TunnelProgress::new();
+    let observer = TransportProgress::new(Arc::clone(&idle_state), tunnel_progress);
     let deadline = accepted_at + handshake_timeout;
     let accepted = tokio::select! {
         biased;
         _ = drain.changed() => None,
         _ = force.changed() => None,
-        result = tokio::time::timeout_at(deadline, acceptor.accept(stream)) => {
+        result = tokio::time::timeout_at(deadline, acceptor.accept(observer.observe(stream))) => {
             result.ok().and_then(Result::ok)
         }
     };
@@ -389,6 +395,7 @@ async fn serve_tls_client(
         .get_mut()
         .1
         .set_buffer_limit(Some(TLS_APP_BUFFER_BYTES));
+    observer.reset_idle();
     serve_client(
         stream,
         peer,
@@ -396,6 +403,7 @@ async fn serve_tls_client(
         proxy,
         permit,
         config,
+        Some(observer),
         drain,
         force,
     )
@@ -410,6 +418,7 @@ async fn serve_client<S>(
     proxy: Arc<Proxy>,
     permit: tokio::sync::OwnedSemaphorePermit,
     config: Arc<Config>,
+    observer: Option<Arc<TransportProgress>>,
     mut drain: watch::Receiver<bool>,
     mut force: watch::Receiver<bool>,
 ) where
@@ -417,15 +426,22 @@ async fn serve_client<S>(
 {
     let _client_permit = permit;
     let idle_timeout = config.limits().idle_timeout();
+    let idle_state = observer
+        .as_ref()
+        .map(|observer| observer.idle_state())
+        .unwrap_or_else(|| Arc::new(Mutex::new(IdleState::new(idle_timeout))));
+    let tunnel_progress = observer
+        .as_ref()
+        .map(|observer| observer.tunnel_progress())
+        .unwrap_or_else(TunnelProgress::new);
     let tunnel_mode = Arc::new(AtomicBool::new(false));
     let output = ConnectionOutput::new();
-    let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag(
+    let (io, write_half, bridge_reader) = SplitIo::with_tunnel_flag_and_idle(
         stream,
-        idle_timeout,
+        Arc::clone(&idle_state),
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
     );
-    let idle_state = io.idle_state();
     let (hub, interim_receiver) = InterimHub::new();
     let client = ClientInfo {
         peer: peer.ip(),
@@ -436,7 +452,6 @@ async fn serve_client<S>(
     let service_output = Arc::clone(&output);
     let tunnel_slot: Arc<Mutex<Option<TunnelSetup>>> = Arc::new(Mutex::new(None));
     let service_slot = Arc::clone(&tunnel_slot);
-    let tunnel_progress = TunnelProgress::new();
     let service = service_fn(move |mut request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
@@ -498,6 +513,7 @@ async fn serve_client<S>(
         interim_receiver,
         idle_timeout,
         idle_state,
+        observer,
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
         Arc::clone(&tunnel_progress),
