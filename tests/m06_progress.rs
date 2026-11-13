@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,15 +27,17 @@ struct SlowWriter<T> {
     chunk: usize,
     interval: Duration,
     next: std::pin::Pin<Box<Sleep>>,
+    stall_after: Arc<AtomicUsize>,
 }
 
 impl<T> SlowWriter<T> {
-    fn new(inner: T, chunk: usize, interval: Duration) -> Self {
+    fn new(inner: T, chunk: usize, interval: Duration, stall_after: Arc<AtomicUsize>) -> Self {
         Self {
             inner,
             chunk,
             interval,
             next: Box::pin(sleep(interval)),
+            stall_after,
         }
     }
 }
@@ -57,6 +59,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for SlowWriter<T> {
         buffer: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if this.stall_after.load(Ordering::Acquire) == 0 {
+            return std::task::Poll::Pending;
+        }
         if this.next.as_mut().poll(context).is_pending() {
             return std::task::Poll::Pending;
         }
@@ -64,6 +69,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for SlowWriter<T> {
         match std::pin::Pin::new(&mut this.inner).poll_write(context, &buffer[..length]) {
             std::task::Poll::Ready(Ok(written)) => {
                 if written > 0 {
+                    let remaining = this.stall_after.load(Ordering::Acquire);
+                    if remaining != usize::MAX {
+                        this.stall_after
+                            .store(remaining.saturating_sub(1), Ordering::Release);
+                    }
                     this.next.as_mut().reset(Instant::now() + this.interval);
                 }
                 std::task::Poll::Ready(Ok(written))
@@ -95,6 +105,7 @@ struct TlsPair {
     observer: Arc<TransportProgress>,
     idle: Arc<Mutex<IdleState>>,
     tunnel: Arc<TunnelProgress>,
+    stall_after: Arc<AtomicUsize>,
 }
 
 async fn tls_pair(chunk: usize, interval: Duration, idle_ms: u64) -> TlsPair {
@@ -109,7 +120,13 @@ async fn tls_pair(chunk: usize, interval: Duration, idle_ms: u64) -> TlsPair {
     let idle = Arc::new(Mutex::new(IdleState::new(Duration::from_millis(idle_ms))));
     let tunnel = TunnelProgress::new();
     let observer = TransportProgress::new(Arc::clone(&idle), Arc::clone(&tunnel));
-    let server_io = observer.observe(SlowWriter::new(server_io, chunk, interval));
+    let stall_after = Arc::new(AtomicUsize::new(usize::MAX));
+    let server_io = observer.observe(SlowWriter::new(
+        server_io,
+        chunk,
+        interval,
+        Arc::clone(&stall_after),
+    ));
     let server = acceptor.accept(server_io);
     let client = connector.connect(
         ServerName::try_from("localhost").expect("server name"),
@@ -129,6 +146,7 @@ async fn tls_pair(chunk: usize, interval: Duration, idle_ms: u64) -> TlsPair {
         observer,
         idle,
         tunnel,
+        stall_after,
     }
 }
 
@@ -147,6 +165,7 @@ fn spawn_writer(
         observer,
         idle,
         tunnel,
+        stall_after: _,
     } = pair;
     let (read_half, write_half) = tokio::io::split(server);
     drop(read_half);
@@ -208,6 +227,11 @@ async fn m06_r1_partial_ciphertext_progress_survives_pending_flush() {
         "test did not exercise a pending encrypted flush: {:?}",
         started.elapsed()
     );
+    eprintln!(
+        "M06-R1 partial_progress elapsed_ms={} bytes={}",
+        started.elapsed().as_millis(),
+        received.len()
+    );
     feeder.abort();
 }
 
@@ -258,6 +282,71 @@ async fn m06_r1_stalled_ciphertext_flush_is_bounded() {
         started.elapsed() < Duration::from_secs(4),
         "stalled transport exceeded its bound: {:?}",
         started.elapsed()
+    );
+    feeder.abort();
+}
+
+#[tokio::test]
+async fn m06_r1_early_progress_then_stall_uses_last_wire_progress() {
+    let pair = tls_pair(256, Duration::from_millis(20), 1000).await;
+    pair.stall_after.store(1, Ordering::SeqCst);
+    let observer = Arc::clone(&pair.observer);
+    let writer_observer = Arc::clone(&observer);
+    let (read_half, write_half) = tokio::io::split(pair.server);
+    drop(read_half);
+    let (mut bridge_writer, bridge_reader) = tokio::io::duplex(64 * 1024);
+    let (interim_tx, interim_rx) = tokio::sync::mpsc::channel(1);
+    drop(interim_tx);
+    let output = ConnectionOutput::new();
+    let tunnel = Arc::new(AtomicBool::new(false));
+    let idle = pair.idle;
+    let progress = pair.tunnel;
+    let _client = pair.client;
+    let writer = tokio::spawn(async move {
+        writer_loop(
+            write_half,
+            bridge_reader,
+            interim_rx,
+            Duration::from_millis(1000),
+            idle,
+            Some(writer_observer),
+            output,
+            tunnel,
+            progress,
+        )
+        .await
+    });
+    let started = Instant::now();
+    let feeder = tokio::spawn(async move {
+        let _ = bridge_writer.write_all(&vec![0x44; 16 * 1024]).await;
+        let _ = bridge_writer.shutdown().await;
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("stalled writer did not return")
+        .expect("writer join");
+    assert!(
+        matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut),
+        "early progress followed by stall was not bounded: {result:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "stall fired before the last real write deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1600),
+        "stall got a fresh idle window after the early write: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        observer.epoch() >= 1,
+        "test never observed the early transport write"
+    );
+    eprintln!(
+        "M06-R1 early_progress_stall elapsed_ms={} epoch={}",
+        started.elapsed().as_millis(),
+        observer.epoch()
     );
     feeder.abort();
 }

@@ -300,6 +300,7 @@ fn idle_expired(idle: &Mutex<IdleState>, context: &mut Context<'_>) -> bool {
 pub struct TransportProgress {
     armed: AtomicBool,
     epoch: AtomicU64,
+    last: Mutex<tokio::time::Instant>,
     idle: Arc<Mutex<IdleState>>,
     tunnel: Arc<TunnelProgress>,
 }
@@ -311,6 +312,7 @@ impl TransportProgress {
         Arc::new(Self {
             armed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            last: Mutex::new(tokio::time::Instant::now()),
             idle,
             tunnel,
         })
@@ -340,6 +342,10 @@ impl TransportProgress {
     /// Enables progress observation for pending application output.
     #[doc(hidden)]
     pub fn arm(&self) {
+        self.last
+            .lock()
+            .map(|mut last| *last = tokio::time::Instant::now())
+            .ok();
         self.armed.store(true, Ordering::Release);
     }
 
@@ -361,9 +367,20 @@ impl TransportProgress {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// Time of the last actual positive transport write.
+    fn last_progress(&self) -> tokio::time::Instant {
+        match self.last.lock() {
+            Ok(last) => *last,
+            Err(poison) => *poison.into_inner(),
+        }
+    }
+
     fn record(&self) {
         if self.armed.load(Ordering::Acquire) {
             self.epoch.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut last) = self.last.lock() {
+                *last = tokio::time::Instant::now();
+            }
             idle_progress(&self.idle);
             self.tunnel.hit();
         }
@@ -426,7 +443,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ObservedIo<T> {
 async fn stall_bounded<F, T>(
     future: F,
     idle_timeout: Duration,
-    idle: &Mutex<IdleState>,
     progress: Option<&TransportProgress>,
 ) -> io::Result<T>
 where
@@ -443,18 +459,18 @@ where
     };
     let mut future = std::pin::pin!(future);
     loop {
-        let observed = progress.epoch();
+        let last = progress.last_progress();
+        let deadline = last + idle_timeout;
         tokio::select! {
             biased;
             result = &mut future => return result,
-            _ = tokio::time::sleep(idle_timeout) => {
-                if progress.epoch() == observed {
+            _ = tokio::time::sleep_until(deadline) => {
+                if progress.last_progress() <= last {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "idle client transport timeout",
                     ));
                 }
-                idle_progress(idle);
             }
         }
     }
@@ -578,13 +594,7 @@ where
             }
             count
         } else {
-            stall_bounded(
-                socket.write(&bytes[written..]),
-                idle_timeout,
-                idle,
-                observer,
-            )
-            .await?
+            stall_bounded(socket.write(&bytes[written..]), idle_timeout, observer).await?
         };
         if count == 0 {
             return Err(io::Error::new(
@@ -611,7 +621,7 @@ where
     if tunnel.load(Ordering::Acquire) {
         socket.flush().await
     } else {
-        let result = stall_bounded(socket.flush(), idle_timeout, idle, observer).await;
+        let result = stall_bounded(socket.flush(), idle_timeout, observer).await;
         if result.is_ok() {
             idle_progress(idle);
         }
