@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00–M05 приняты и слиты; M06 (HTTPS listeners и TLS-вход к прокси) реализован в ветке `feat/17-m06-tls` и передан на ревью.** Ревизия документов: 0.7. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. `angara serve` открывает настроенные HTTP и HTTPS listeners, выполняет forward-proxy для absolute-form HTTP/1.1, принимает CONNECT и проверяет Basic credentials на listener с `auth = "basic"`; cache и admin API появятся в следующих этапах. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M06 приняты и слиты; M07 (reload, control service, JSON-журналы и метрики) реализован в ветке `feat/20-m07-operations` и передан на ревью.** Ревизия документов: 0.8. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. Согласование требований и слияние PR — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -143,7 +143,10 @@ transport = "http"
   CRLF. На Linux key не должен иметь
   group-write/world-битов (например `0600`/`0640`), chain — write для
   group/world (например `0600`/`0644`), владелец — effective UID сервиса или
-  root.
+  root. `[operations]` и `[observability]` — restart-required optional
+  таблицы: `reload_timeout_ms` 100..60000 (5000), `log_level`
+  `off|error|warn|info`, `log_queue_capacity` 64..8192 (1024),
+  `metrics_enabled`, `metrics_interval_ms` 1000..600000 (30000).
 - `limits`: `max_connections` 1–65535 — общий бюджет исходящих sockets
   (connecting, leased и idle); `max_client_connections` 1–65535 — отдельный
   входящий бюджет принятых клиентских sockets, включая keep-alive idle
@@ -192,7 +195,7 @@ M03 добавляет `hyper` 1.12 (`client`, `http1`, `server`), `hyper-util`
 (`TokioIo`, таймер), `http-body`, `http-body-util`, `bytes`, `socket2` и
 Tokio `macros`/`signal`. M06 добавляет `rustls` 0.23 (ring, `tls12`),
 `tokio-rustls` 0.26, `rustls-pki-types` 1 (PEM parsing) и `x509-parser` 0.18.
-Hyper 1.12.0
+M07 добавляет `arc-swap` 1.9.5 и `serde_json` 1. Hyper 1.12.0
 закреплён с минимальным локальным patch для `OriginalRequestTarget`; см.
 раздел M03 и
 [`vendor/hyper-1.12.0/ANGARA_PATCH.md`](vendor/hyper-1.12.0/ANGARA_PATCH.md).
@@ -211,7 +214,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 
 | Job | Проверки |
 | --- | --- |
-| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
+| `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, M07 reload/control/logging/metrics + resource/load/CPU evidence, `config_m07`/`cli_m07`/`m07_reload`/`m07_limits`, 20 повторов M04 forced-shutdown, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.
@@ -770,12 +773,128 @@ TLS-in-TLS. Неверная proxy CA или имя дают curl exit 60 до a
 
 Подробный контракт и матрица приёмки — [M06-r1, Issue #17](https://github.com/AlexeiSmol/Angara/issues/17).
 
+## M07: эксплуатация, reload, control service и наблюдаемость
+
+M07 добавляет атомарный runtime reload без restart. Один immutable
+`RuntimeSnapshot` публикуется через `ArcSwap`; generation начинается с 1 и
+увеличивается ровно на 1 после полного candidate preparation. Новый HTTP или
+CONNECT exchange захватывает snapshot после exchange gate, поэтому старые
+body/tunnel завершают своё поколение, а следующий keep-alive/pipelined request
+видит новые ACL/users/routing. Одновременно живёт не более 16 опубликованных
+roots; при исчерпании возвращается `GenerationBusy`. Registry хранит только
+`Weak`-ссылки и удаляет освобождённые поколения; сам registry, metrics и
+status не удерживают историю roots.
+
+Подготовка и публикация разделены. Один permit допускает ровно один
+blocking candidate (queue0); файл читается один раз в ограниченный buffer,
+TOML/PHC проверяются вне async workers. Публикация — короткая секция под
+отдельным lifecycle-mutex: expected generation, deadline, `Running` и
+generation cap проверяются вместе с CAS-заменой root. Поэтому `Draining`
+не может быть обойдён поздним candidate, а `SIGTERM` отменяет ещё не
+опубликованный reload.
+
+Hot-reload разрешён только для `access.*`, `routing.*`, `auth.users_file` и
+содержимого users-файла, глобальных `limits.max_connections`/
+`max_client_connections`, `limits.shutdown_timeout_ms`, request-таймаутов
+`transport.total_timeout_ms`/`connect_timeout_ms`/`max_connect_attempts`,
+`http.response_header_timeout_ms`, `connect.allowed_ports`/
+`half_close_timeout_ms`. Workers, listeners/TLS, DNS, egress definitions,
+parser/idle/pool/auth-admission и `[operations]`/`[observability]` требуют
+restart. Mixed hot+restart change отвергается целиком. Reload не открывает
+cert/key: при прежних TLS paths используются prepared Arcs; изменённый путь —
+`RestartRequired`. Startup/check продолжают полностью проверять файлы.
+
+- `ControlState` — внутренний Rust API: `status()`, `metrics()`,
+  `validate_on_disk(generation)`, `reload(expected_generation)`,
+  `shutdown(reason)`. Сетевого admin listener, Unix RPC, `/metrics` и CLI
+  reload без IPC нет. Один preparation job, queue0; чтение/TOML/PHC validation
+  выполняются в `spawn_blocking` под permit, публикация — короткая CAS-секция
+  с expected generation, deadline и lifecycle. Timeout/drop/shutdown не
+  публикует поздний candidate; blocking slot живёт до фактического конца.
+- SIGHUP запускает тот же reload. Во время выполнения максимум один
+  pending-флаг взводится повторными HUP; после завершения выполняется ровно
+  один дополнительный reload, без spawn на каждый signal и без очереди
+  waiter-ов. SIGTERM/SIGINT прерывают незавершённый reload-task до publish и
+  вместе с typed shutdown используют один absolute deadline. Draining
+  запрещает новый accept/exchange/reload publish, закрывает idle origins и
+  даёт активной работе оставшееся время; native DNS/Argon2/file jobs не
+  обещают принудительный abort, но их permits остаются ограниченными.
+- Shared OutboundService/resolver/pool/auth permits/TaskTracker не
+  пересоздаются. Client/outbound caps меняются глобально без убийства старых
+  holders. Pool key содержит generation/listener/user/egress/endpoint; после
+  publish idle origins старого поколения retire, старый lease при возврате
+  закрывается.
+- JSON Lines пишутся только в stderr `serve` из typed allow-list. События:
+  `service_started` (с bounded списком listener bind), `reload_applied`/
+  `reload_rejected`, `shutdown_started`/`service_stopped`, `request_finished`,
+  `tunnel_finished`, `metrics_summary`. `request_finished` появляется после
+  завершения или отмены streaming body, а не сразу после заголовков; HEAD и
+  пустое body дают 0. Поля `request_body_bytes`/`response_body_bytes` считают
+  только DATA-кадры соответствующих body, `tunnel_bytes` — положительные
+  plaintext-чтения обоих направлений CONNECT (ранний payload один раз).
+  Один terminal record на exchange/tunnel, record ≤4096 bytes, bounded queue
+  drop-newest с counters. Username, PHC, credentials, URL/path/query, headers,
+  source/destination IP, TLS material и payload не журналируются.
+- Logging ownership: один CLI-owned stderr worker на процесс, очередь
+  `log_queue_capacity`; producers используют `try_send` и не блокируют
+  network workers. Library `HttpServer` по умолчанию имеет no-op sink и не
+  создаёт thread. Worker намеренно detached: зависший stderr pipe не
+  продлевает shutdown deadline; потеря записей видна в `log_dropped`/
+  `log_sink_errors`. Файловая ротация — задача supervisor M08.
+- `metrics()` и periodic summary дают global counters/gauges/fixed histograms
+  (HTTP exchange, TLS handshake, auth), без user/domain/IP/generation labels;
+  series ≤2048. Histogram bounds в миллисекундах:
+  `1, 5, 10, 25, 50, 100, 500, 1000` плюс overflow bucket; units — ms.
+  Reload не сбрасывает counters. `metrics_enabled=false` отключает
+  histograms/summary, но structural counters, бюджеты и control status
+  работают. `status()` дополнительно отдаёт configured listeners/egress,
+  in-use gauges и последний safe reload outcome без Config/Users Arcs.
+
+Полный стенд — [`examples/m07-operations-local.toml`](examples/m07-operations-local.toml)
+(HTTP+HTTPS/Basic). Безопасный локальный сценарий:
+
+```sh
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+umask 077
+python3 tests/fixtures/m06_pki.py --dir "$TMP/pki"
+mkdir "$TMP/tls"
+cp "$TMP/pki/proxy_chain.pem" "$TMP/tls/proxy-chain.pem"
+cp "$TMP/pki/proxy_key.pem" "$TMP/tls/proxy-key.pem"
+# Пароль вводится no-echo в stdin; не передавайте его через argv/env.
+PHC=$(printf '%s\n' 'synthetic-local-password' | \
+  ./target/debug/angara users hash --password-stdin)
+printf 'version = 1\n\n[[users]]\nusername = "alice"\npassword_hash = "%s"\ndisabled = false\n\n[[users]]\nusername = "bob"\npassword_hash = "%s"\ndisabled = false\n' \
+  "$PHC" "$PHC" >"$TMP/users.local.toml"
+chmod 0600 "$TMP/users.local.toml"
+cp examples/m07-operations-local.toml "$TMP/proxy.toml"
+./target/debug/angara check --config "$TMP/proxy.toml"
+./target/debug/angara serve --config "$TMP/proxy.toml" 2>"$TMP/proxy.jsonl" &
+PID=$!
+# После проверки запросов: измените users/ACL и отправьте HUP.
+kill -HUP "$PID"
+# SIGTERM укладывается в общий deadline даже при нечитаемом stderr pipe.
+kill -TERM "$PID"
+wait "$PID"
+jq -c 'select(.event == "request_finished")' "$TMP/proxy.jsonl"
+```
+
+Новые keep-alive запросы после HUP видят новое поколение; старые CONNECT
+остаются на прежнем и не отзываются немедленно. JSON-строки можно смотреть
+через `journalctl`/перенаправленный stderr; секреты в них не попадают.
+
+M07 test targets: `m07_reload` (snapshot/CAS/static/auth/pool/limits/logging/
+metrics/CONNECT/secret), `config_m07` (strict schema/files), `cli_m07` (real
+SIGHUP/SIGTERM, stalled stderr, storm), `m07_limits` (RES/LOAD/CPU evidence,
+Linux). Полный Linux baseline дополняется явными `http_limits`/`m04_limits`/
+`m06_progress` проверками и 20 повторами M04 forced-shutdown; повторы CI не
+прибавляются к числу основных тестов.
+
 ## Текущее состояние
 
-M00–M05 приняты и слиты. M06 реализован в ветке `feat/17-m06-tls` и передан
-на ревью; Linux CI выполняет прежние M01–M05 проверки, новые M06-тесты,
-resource/load/CPU и handshake evidence, `cargo deny`, проверку HTTPS-примера с
-временным PKI/users-файлом и HTTPS-proxy curl smoke с двумя CA. Слияние
-выполняет владелец после ревью.
+M00–M06 приняты и слиты. M07 реализован в ветке `feat/20-m07-operations` и
+передан на ревью; Linux CI выполняет прежние M01–M06 проверки, новые
+reload/control/logging/metrics тесты, resource/load evidence и 20 повторов
+M04 forced-shutdown. Слияние выполняет владелец после ревью.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

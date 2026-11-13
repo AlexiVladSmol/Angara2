@@ -100,6 +100,20 @@ fn m04_srv01_forced_shutdown_reclaims_active_tunnel_tasks() {
                         );
                         thread::sleep(Duration::from_millis(5));
                     }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        // Forced shutdown may close the TCP socket with RST
+                        // instead of FIN on some kernels. The read error is a
+                        // valid observed close only because the server has
+                        // already returned from its absolute shutdown path.
+                        break;
+                    }
                     Err(error) => panic!("origin read failed: {error}"),
                 }
             }

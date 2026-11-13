@@ -1,0 +1,102 @@
+# Angara M07 — operations lab: reload, JSON logs, metrics and shutdown.
+#
+# Before `angara check --config`, create next to this file:
+#   - users.local.toml with synthetic alice/bob;
+#   - tls/proxy-chain.pem and tls/proxy-key.pem in a private tempdir.
+# Never commit real keys/passwords. See README, M07 section, for commands.
+
+schema_version = 1
+
+[runtime]
+worker_threads = 2
+
+[limits]
+max_connections = 256
+max_client_connections = 128
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[operations]
+reload_timeout_ms = 5000
+
+[observability]
+log_level = "info"
+log_queue_capacity = 1024
+metrics_enabled = true
+metrics_interval_ms = 30000
+
+[auth]
+users_file = "users.local.toml"
+max_verifying = 2
+verify_timeout_ms = 2000
+
+[tls]
+max_handshaking = 32
+handshake_timeout_ms = 5000
+
+[[listeners]]
+id = "proxy-http"
+bind = "127.0.0.1:3128"
+transport = "http"
+auth = "none"
+
+[[listeners]]
+id = "proxy-https"
+bind = "127.0.0.1:3129"
+transport = "https"
+auth = "basic"
+
+[listeners.tls]
+cert_chain_file = "tls/proxy-chain.pem"
+private_key_file = "tls/proxy-key.pem"
+
+[access]
+source_allow = ["127.0.0.0/8"]
+ip_default = "deny"
+
+[[access.rules]]
+id = "http-local"
+action = "allow"
+listeners = ["proxy-http"]
+methods = ["GET", "HEAD", "POST", "CONNECT"]
+ports = [8080, 8443]
+
+[[access.rules]]
+id = "https-users"
+action = "allow"
+listeners = ["proxy-https"]
+users = ["alice", "bob"]
+methods = ["GET", "HEAD", "POST", "CONNECT"]
+ports = [8080, 8443]
+
+[[access.ip_rules]]
+id = "allow-loopback-target"
+action = "allow"
+networks = ["127.0.0.0/8", "::1/128"]
+allow_special = true
+
+[transport]
+total_timeout_ms = 10000
+connect_timeout_ms = 3000
+max_connect_attempts = 3
+max_connecting = 32
+
+[http]
+max_headers = 100
+response_header_timeout_ms = 30000
+pool_max_idle = 16
+pool_max_idle_per_key = 2
+pool_idle_timeout_ms = 15000
+
+[connect]
+allowed_ports = [8443]
+half_close_timeout_ms = 5000
+
+[[egress]]
+id = "system"
+mode = "system"
+
+[routing]
+default_egress = "system"

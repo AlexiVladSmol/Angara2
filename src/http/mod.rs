@@ -23,6 +23,22 @@ pub use server::{HttpServer, ServerError};
 pub type ResponseBody =
     http_body_util::combinators::BoxBody<bytes::Bytes, Box<dyn Error + Send + Sync>>;
 
+/// Terminal outcome observed at the response-body boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyOutcome {
+    /// Every response frame reached the client socket.
+    Success,
+    /// The body failed before its final frame.
+    Failed,
+    /// The exchange was cancelled, dropped or the connection closed.
+    Cancelled,
+}
+
+/// Owned completion callback for one HTTP exchange.
+pub type BodyCompletion = Box<dyn FnOnce(BodyOutcome, u64) + Send + Sync + 'static>;
+
+type ArmedCompletion = Box<dyn FnOnce(BodyOutcome) + Send + Sync + 'static>;
+
 /// Ordered-output barrier for one client connection.
 ///
 /// Hyper writes final response bytes into the bridge and reports flushes; the
@@ -41,6 +57,7 @@ struct OutputState {
     flush_seq: u64,
     armed: Option<OwnedSemaphorePermit>,
     armed_flush: u64,
+    armed_completion: Option<ArmedCompletion>,
     closed: bool,
 }
 
@@ -54,6 +71,7 @@ impl ConnectionOutput {
                 flush_seq: 0,
                 armed: None,
                 armed_flush: 0,
+                armed_completion: None,
                 closed: false,
             }),
             notify: Notify::new(),
@@ -87,19 +105,38 @@ impl ConnectionOutput {
     /// Hands the exchange permit to the barrier. It is dropped only after the
     /// response bytes are flushed and consumed.
     pub fn arm(&self, permit: OwnedSemaphorePermit) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.closed {
+        self.arm_with(permit, None);
+    }
+
+    /// Hands the exchange permit and terminal callback to the barrier.
+    ///
+    /// The callback observes `Success` only after the response bytes were
+    /// flushed and consumed, or `Cancelled` when the connection closes first.
+    pub fn arm_with(&self, permit: OwnedSemaphorePermit, completion: Option<ArmedCompletion>) {
+        let completion = {
+            let Ok(mut state) = self.state.lock() else {
                 drop(permit);
                 return;
+            };
+            if state.closed {
+                drop(permit);
+                completion
+            } else {
+                let previous = state.armed_completion.take();
+                state.armed_completion = completion;
+                state.armed_flush = state.flush_seq;
+                state.armed = Some(permit);
+                previous
             }
-            state.armed_flush = state.flush_seq;
-            state.armed = Some(permit);
+        };
+        if let Some(previous) = completion {
+            previous(BodyOutcome::Cancelled);
         }
         self.notify.notify_one();
     }
 
     fn release_ready(&self) {
-        let permit = {
+        let (permit, completion) = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
@@ -107,12 +144,15 @@ impl ConnectionOutput {
                 && state.flush_seq > state.armed_flush
                 && state.consumed >= state.produced
             {
-                state.armed.take()
+                (state.armed.take(), state.armed_completion.take())
             } else {
-                None
+                (None, None)
             }
         };
         drop(permit);
+        if let Some(completion) = completion {
+            completion(BodyOutcome::Success);
+        }
     }
 
     /// Waits until armed permits can be released.
@@ -129,13 +169,20 @@ impl ConnectionOutput {
 
     /// Releases a pending permit and stops the barrier when the connection ends.
     pub fn close(&self) {
-        let permit = if let Ok(mut state) = self.state.lock() {
+        // The connection task may observe EOF before the release loop gets
+        // scheduled. A body that was already flushed and consumed is still a
+        // successful exchange, not a cancellation.
+        self.release_ready();
+        let (permit, completion) = if let Ok(mut state) = self.state.lock() {
             state.closed = true;
-            state.armed.take()
+            (state.armed.take(), state.armed_completion.take())
         } else {
-            None
+            (None, None)
         };
         drop(permit);
+        if let Some(completion) = completion {
+            completion(BodyOutcome::Cancelled);
+        }
         self.notify.notify_one();
     }
 }
@@ -146,19 +193,25 @@ pub struct ExchangeBody {
     inner: ResponseBody,
     output: Arc<ConnectionOutput>,
     permit: Option<OwnedSemaphorePermit>,
+    completion: Option<BodyCompletion>,
+    bytes: u64,
 }
 
 impl ExchangeBody {
-    /// Wraps a response body with the exchange permit and output barrier.
+    /// Wraps a response body with the exchange permit, output barrier and one
+    /// terminal completion callback.
     pub fn new(
         inner: ResponseBody,
         permit: OwnedSemaphorePermit,
         output: Arc<ConnectionOutput>,
+        completion: Option<BodyCompletion>,
     ) -> Self {
         let mut body = Self {
             inner,
             output,
             permit: Some(permit),
+            completion,
+            bytes: 0,
         };
         if body.inner.is_end_stream() {
             body.arm();
@@ -166,9 +219,35 @@ impl ExchangeBody {
         body
     }
 
+    fn finish(&mut self, outcome: BodyOutcome) {
+        if let Some(completion) = self.completion.take() {
+            completion(outcome, self.bytes);
+        }
+    }
+
     fn arm(&mut self) {
-        if let Some(permit) = self.permit.take() {
-            self.output.arm(permit);
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let completion = self.completion.take();
+        let bytes = self.bytes;
+        let armed = completion.map(|completion| {
+            Box::new(move |outcome: BodyOutcome| completion(outcome, bytes)) as ArmedCompletion
+        });
+        self.output.arm_with(permit, armed);
+    }
+}
+
+impl Drop for ConnectionOutput {
+    fn drop(&mut self) {
+        let (permit, completion) = if let Ok(mut state) = self.state.lock() {
+            (state.armed.take(), state.armed_completion.take())
+        } else {
+            (None, None)
+        };
+        drop(permit);
+        if let Some(completion) = completion {
+            completion(BodyOutcome::Cancelled);
         }
     }
 }
@@ -183,6 +262,9 @@ impl Body for ExchangeBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(context) {
             Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes = self.bytes.saturating_add(data.len() as u64);
+                }
                 let final_frame = self.inner.is_end_stream() || frame.trailers_ref().is_some();
                 if final_frame {
                     self.arm();
@@ -194,6 +276,7 @@ impl Body for ExchangeBody {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
+                self.finish(BodyOutcome::Failed);
                 self.permit.take();
                 Poll::Ready(Some(Err(error)))
             }
@@ -213,8 +296,12 @@ impl Body for ExchangeBody {
 impl Drop for ExchangeBody {
     fn drop(&mut self) {
         // Dropping before a final frame aborts the exchange; do not delay the
-        // gate for a response that will not be completed.
-        self.permit.take();
+        // gate for a response that will not be completed. Once armed, the
+        // barrier owns the completion and reports flush vs connection close.
+        if self.permit.is_some() {
+            self.finish(BodyOutcome::Cancelled);
+            self.permit.take();
+        }
     }
 }
 

@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::auth;
 use crate::config::Config;
+use crate::control::{ControlState, ReloadOutcome};
 use crate::http::HttpServer;
+use crate::logging::{Event, LogRecord, Logger, Outcome, spawn_stderr_worker};
 use crate::runtime::AngaraRuntime;
 
 /// Successful command.
@@ -275,6 +277,7 @@ where
     let Some(path) = config_path else {
         return usage_error("не указан --config");
     };
+    let path = std::path::absolute(&path).unwrap_or(path);
 
     let config = match Config::load(&path) {
         Ok(config) => config,
@@ -302,7 +305,7 @@ where
                     return EXIT_SERVER_ERROR;
                 }
             };
-            let shutdown_timeout = config.limits().shutdown_timeout();
+            let observability = config.observability().clone();
             let config = Arc::new(config);
             let result = runtime.block_on(async move {
                 let signals = match ShutdownSignals::install() {
@@ -313,13 +316,46 @@ where
                         ));
                     }
                 };
-                let server = HttpServer::bind(config).await?;
-                for (id, address) in server.addresses() {
-                    eprintln!("listening: {id} {address}");
+                let server = HttpServer::bind_with_path(config, path).await?;
+                let telemetry = server.telemetry();
+                let logger = if observability.log_level() == crate::config::LogLevel::Off {
+                    Logger::disabled(telemetry)
+                } else {
+                    let (logger, receiver) = Logger::channel(
+                        observability.log_queue_capacity(),
+                        observability.log_level(),
+                        telemetry.clone(),
+                    );
+                    spawn_stderr_worker(receiver, telemetry);
+                    logger
+                };
+                server.set_logger(logger.clone());
+                let generation = server.control().status().generation;
+                let mut started = LogRecord::new(Event::ServiceStarted);
+                started.generation = Some(generation);
+                started.listeners = Some(
+                    server
+                        .addresses()
+                        .iter()
+                        .map(|(id, address)| format!("{id}={address}"))
+                        .collect(),
+                );
+                logger.log(started);
+                let control = server.control();
+                let mut driver = ReloadDriver::new(signals, Arc::clone(&control));
+                loop {
+                    match driver.next().await {
+                        DriverEvent::Shutdown => break,
+                        DriverEvent::Reload(result) => match result {
+                            Ok(outcome) => log_reload(&logger, &outcome),
+                            Err(_) => log_reload(&logger, &ReloadOutcome::Internal),
+                        },
+                    }
                 }
-                signals.wait().await;
-                let deadline = std::time::Instant::now() + shutdown_timeout;
+                let deadline = std::time::Instant::now() + control.shutdown_timeout();
+                logger.log(LogRecord::new(Event::ShutdownStarted));
                 server.shutdown_until(deadline).await;
+                logger.log(LogRecord::new(Event::ServiceStopped));
                 Ok::<std::time::Instant, crate::http::ServerError>(deadline)
             });
             match result {
@@ -341,6 +377,13 @@ where
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+enum SignalEvent {
+    Shutdown,
+    Hangup,
 }
 
 #[cfg(unix)]
@@ -349,13 +392,15 @@ impl ShutdownSignals {
         Ok(Self {
             interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
             terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
         })
     }
 
-    async fn wait(mut self) {
+    async fn next(&mut self) -> SignalEvent {
         tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => SignalEvent::Shutdown,
+            _ = self.terminate.recv() => SignalEvent::Shutdown,
+            _ = self.hangup.recv() => SignalEvent::Hangup,
         }
     }
 }
@@ -369,9 +414,129 @@ impl ShutdownSignals {
         Ok(Self)
     }
 
-    async fn wait(self) {
+    async fn next(&mut self) -> SignalEvent {
         let _ = tokio::signal::ctrl_c().await;
+        SignalEvent::Shutdown
     }
+}
+
+enum DriverEvent {
+    Shutdown,
+    Reload(Result<ReloadOutcome, tokio::task::JoinError>),
+}
+
+/// Coalesces SIGHUP into at most one pending reload and lets SIGTERM abort an
+/// in-flight reload before it can publish.
+struct ReloadDriver {
+    signals: ShutdownSignals,
+    control: Arc<ControlState>,
+    task: Option<tokio::task::JoinHandle<ReloadOutcome>>,
+    pending: bool,
+}
+
+impl ReloadDriver {
+    fn new(signals: ShutdownSignals, control: Arc<ControlState>) -> Self {
+        Self {
+            signals,
+            control,
+            task: None,
+            pending: false,
+        }
+    }
+
+    fn start(&mut self) {
+        let control = Arc::clone(&self.control);
+        let expected = control.status().generation;
+        self.task = Some(tokio::spawn(async move { control.reload(expected).await }));
+    }
+
+    async fn next(&mut self) -> DriverEvent {
+        loop {
+            if let Some(task) = self.task.as_mut() {
+                tokio::select! {
+                    biased;
+                    event = self.signals.next() => match event {
+                        SignalEvent::Shutdown => {
+                            if let Some(task) = self.task.take() {
+                                task.abort();
+                            }
+                            return DriverEvent::Shutdown;
+                        }
+                        SignalEvent::Hangup => {
+                            self.pending = true;
+                        }
+                    },
+                    result = task => {
+                        self.task = None;
+                        let event = DriverEvent::Reload(result);
+                        if self.pending {
+                            self.pending = false;
+                            self.start();
+                        }
+                        return event;
+                    }
+                }
+            } else {
+                match self.signals.next().await {
+                    SignalEvent::Shutdown => return DriverEvent::Shutdown,
+                    SignalEvent::Hangup => self.start(),
+                }
+            }
+        }
+    }
+}
+
+fn log_reload(logger: &Logger, outcome: &ReloadOutcome) {
+    let mut record = LogRecord::new(Event::ReloadApplied);
+    match outcome {
+        ReloadOutcome::Applied { generation } => {
+            record.generation = Some(*generation);
+            record.outcome = Some(Outcome::Success);
+        }
+        ReloadOutcome::Valid { generation } => {
+            record.generation = Some(*generation);
+            record.outcome = Some(Outcome::Success);
+            record.event = Event::ReloadRejected;
+        }
+        ReloadOutcome::Invalid { .. } => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::Invalid);
+        }
+        ReloadOutcome::RestartRequired { .. } => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::RestartRequired);
+        }
+        ReloadOutcome::Conflict { current } => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::Conflict);
+            record.generation = Some(*current);
+        }
+        ReloadOutcome::Busy => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::Busy);
+        }
+        ReloadOutcome::GenerationBusy => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::GenerationBusy);
+        }
+        ReloadOutcome::TimedOut => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::TimedOut);
+        }
+        ReloadOutcome::Cancelled => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::Cancelled);
+        }
+        ReloadOutcome::ShuttingDown => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::ShuttingDown);
+        }
+        ReloadOutcome::Internal => {
+            record.event = Event::ReloadRejected;
+            record.outcome = Some(Outcome::Failed);
+        }
+    }
+    logger.log(record);
 }
 
 fn usage_error(message: &str) -> u8 {

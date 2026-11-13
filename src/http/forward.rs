@@ -1,8 +1,8 @@
 //! One HTTP/1.1 forwarding transaction.
 
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use http::header::{CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -23,9 +23,13 @@ use crate::http::interim::InterimSender;
 use crate::http::pool::{
     Lease, LeaseRequestBody, LeaseResponseBody, OriginPool, PoolBody, PooledSender,
 };
+use crate::limits::CapController;
+use crate::logging::{Event, LogRecord, Logger, Outcome, Reason};
 use crate::outbound::{OutboundError, OutboundService, RequestContext};
 use crate::policy::{self, RequestMeta};
+use crate::snapshot::SnapshotStore;
 use crate::target::{self, CanonicalTarget, TargetError};
+use crate::telemetry::Telemetry;
 
 const MIN_CONNECTION_BUFFER: usize = 64 * 1024;
 const HEADER_BUFFER_MARGIN: usize = 16 * 1024;
@@ -43,23 +47,62 @@ pub struct ClientInfo {
     pub peer: IpAddr,
     /// Stable configured listener ID.
     pub listener_id: String,
+    /// Server-created connection ID.
+    pub connection_id: u64,
+    /// Server-created request ID for this exchange.
+    pub request_id: u64,
+}
+
+/// Immutable terminal metadata for one HTTP exchange.
+#[derive(Clone, Debug)]
+pub struct ExchangeMeta {
+    generation: u64,
+    started: tokio::time::Instant,
+    connection_id: u64,
+    request_id: u64,
+    listener_id: String,
+    status: StatusCode,
+    request_body_bytes: Arc<AtomicU64>,
+}
+
+impl ExchangeMeta {
+    /// Generation captured before source/auth/policy checks.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Terminal HTTP status.
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Observed request DATA bytes at terminal time.
+    pub fn request_body_bytes(&self) -> u64 {
+        self.request_body_bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// HTTP proxy state shared by all listeners.
 pub struct Proxy {
-    config: Arc<Config>,
+    snapshots: Arc<SnapshotStore>,
     outbound: OutboundService,
     pool: Arc<OriginPool>,
     origin_tasks: Arc<crate::http::OriginTasks>,
     draining: Arc<AtomicBool>,
     auth: Option<AuthService>,
+    telemetry: Arc<Telemetry>,
+    client_caps: Arc<CapController>,
+    logger: Mutex<Logger>,
+    next_id: AtomicU64,
 }
 
 impl Proxy {
     /// Builds proxy state.
     pub fn new(config: Arc<Config>) -> Arc<Self> {
-        let outbound = OutboundService::new(Arc::clone(&config));
-        Self::assemble(config, outbound)
+        let telemetry = Telemetry::with_detailed(config.observability().metrics_enabled());
+        let outbound =
+            OutboundService::new_with_telemetry(Arc::clone(&config), Arc::clone(&telemetry));
+        Self::assemble_with_verifier(config, outbound, telemetry, None)
     }
 
     /// Builds proxy state with injected resolver and dialer for library tests.
@@ -69,39 +112,109 @@ impl Proxy {
         resolver: Arc<dyn crate::resolver::Resolver>,
         dialer: Arc<dyn crate::transport::Dialer>,
     ) -> Arc<Self> {
-        let outbound = OutboundService::with_components(Arc::clone(&config), resolver, dialer);
-        Self::assemble(config, outbound)
-    }
-
-    fn assemble(config: Arc<Config>, outbound: OutboundService) -> Arc<Self> {
-        Self::assemble_with_verifier(config, outbound, None)
+        let telemetry = Telemetry::with_detailed(config.observability().metrics_enabled());
+        let outbound = OutboundService::with_components_and_telemetry(
+            Arc::clone(&config),
+            resolver,
+            dialer,
+            Arc::clone(&telemetry),
+        );
+        Self::assemble_with_verifier(config, outbound, telemetry, None)
     }
 
     fn assemble_with_verifier(
         config: Arc<Config>,
         outbound: OutboundService,
+        telemetry: Arc<Telemetry>,
         verifier: Option<Arc<dyn PasswordVerifier>>,
     ) -> Arc<Self> {
-        let pool = OriginPool::new(&config);
+        let pool = OriginPool::with_telemetry(&config, Arc::clone(&telemetry));
         let auth = match verifier {
-            Some(verifier) => AuthService::from_config_with_verifier(&config, verifier),
-            None => AuthService::from_config(&config),
+            Some(verifier) => AuthService::from_config_with_verifier_and_telemetry(
+                &config,
+                verifier,
+                Some(Arc::clone(&telemetry)),
+            ),
+            None => AuthService::from_config_with_telemetry(&config, Arc::clone(&telemetry)),
         };
+        let snapshots = SnapshotStore::new(Arc::clone(&config));
+        let client_caps = CapController::new(config.limits().max_client_connections() as usize);
+        let logger = Mutex::new(Logger::disabled(Arc::clone(&telemetry)));
         Arc::new(Self {
-            config,
+            snapshots,
             outbound,
             pool,
             origin_tasks: crate::http::OriginTasks::new(),
             draining: Arc::new(AtomicBool::new(false)),
             auth,
+            telemetry,
+            client_caps,
+            logger,
+            next_id: AtomicU64::new(1),
         })
+    }
+
+    /// Replaces the library/no-op logger with a caller-owned sink.
+    pub fn set_logger(&self, logger: Logger) {
+        if let Ok(mut current) = self.logger.lock() {
+            *current = logger;
+        }
+    }
+
+    /// Clone of the current logger handle.
+    pub fn logger(&self) -> Logger {
+        self.logger
+            .lock()
+            .map(|logger| logger.clone())
+            .unwrap_or_else(|_| Logger::disabled(Arc::clone(&self.telemetry)))
+    }
+
+    /// Server-created connection ID.
+    pub fn next_connection_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Server-created request ID.
+    pub fn next_request_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Shared global client admission cap.
+    pub fn client_caps(&self) -> Arc<CapController> {
+        Arc::clone(&self.client_caps)
+    }
+
+    /// Updates caps and retires old idle pool roots after a publish.
+    pub fn apply_published(&self, generation: u64, config: &Config) {
+        self.pool.retire_before(generation);
+        self.client_caps
+            .set_limit(config.limits().max_client_connections() as usize);
+        self.outbound
+            .set_outbound_limit(config.limits().max_connections() as usize);
+    }
+
+    /// Shared telemetry counters.
+    pub fn telemetry(&self) -> Arc<Telemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
+    /// Shared snapshot store used by the control service and accept loops.
+    pub fn snapshots(&self) -> Arc<SnapshotStore> {
+        Arc::clone(&self.snapshots)
+    }
+
+    /// Current configuration generation.
+    pub fn generation(&self) -> u64 {
+        self.snapshots.generation()
     }
 
     /// Test/library API with an injected password verifier.
     #[doc(hidden)]
     pub fn with_verifier(config: Arc<Config>, verifier: Arc<dyn PasswordVerifier>) -> Arc<Self> {
-        let outbound = OutboundService::new(Arc::clone(&config));
-        Self::assemble_with_verifier(config, outbound, Some(verifier))
+        let telemetry = Telemetry::with_detailed(config.observability().metrics_enabled());
+        let outbound =
+            OutboundService::new_with_telemetry(Arc::clone(&config), Arc::clone(&telemetry));
+        Self::assemble_with_verifier(config, outbound, telemetry, Some(verifier))
     }
 
     /// Test/library API with injected components and a password verifier.
@@ -112,8 +225,14 @@ impl Proxy {
         dialer: Arc<dyn crate::transport::Dialer>,
         verifier: Arc<dyn PasswordVerifier>,
     ) -> Arc<Self> {
-        let outbound = OutboundService::with_components(Arc::clone(&config), resolver, dialer);
-        Self::assemble_with_verifier(config, outbound, Some(verifier))
+        let telemetry = Telemetry::with_detailed(config.observability().metrics_enabled());
+        let outbound = OutboundService::with_components_and_telemetry(
+            Arc::clone(&config),
+            resolver,
+            dialer,
+            Arc::clone(&telemetry),
+        );
+        Self::assemble_with_verifier(config, outbound, telemetry, Some(verifier))
     }
 
     /// Number of free password-verification slots across all listeners.
@@ -127,8 +246,9 @@ impl Proxy {
         &self,
         headers: &http::HeaderMap,
         client: &ClientInfo,
+        config: &Config,
     ) -> Result<Option<VerifiedIdentity>, Response<ResponseBody>> {
-        let Some(listener) = self.config.listener(&client.listener_id) else {
+        let Some(listener) = config.listener(&client.listener_id) else {
             return Err(headers::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 true,
@@ -143,7 +263,16 @@ impl Proxy {
                         true,
                     ));
                 };
-                match auth.authenticate_headers(headers).await {
+                let Some(auth_config) = config.auth() else {
+                    return Err(headers::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        true,
+                    ));
+                };
+                match auth
+                    .authenticate_headers_with_snapshot(headers, auth_config.snapshot())
+                    .await
+                {
                     Ok(identity) => Ok(Some(identity)),
                     Err(AuthError::InvalidCredentials) => {
                         Err(headers::proxy_auth_required_response())
@@ -167,6 +296,16 @@ impl Proxy {
     /// Removes expired idle origin sockets.
     pub fn purge_pool(&self) {
         self.pool.purge_expired();
+    }
+
+    /// Retires idle origins from older generations after a successful publish.
+    pub fn retire_before(&self, generation: u64) {
+        self.pool.retire_before(generation);
+    }
+
+    /// Closes every idle origin socket at the start of draining.
+    pub fn clear_idle_origins(&self) {
+        self.pool.clear();
     }
 
     /// Reaps finished origin driver tasks.
@@ -198,6 +337,8 @@ impl Proxy {
         if self.is_draining() {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE));
         }
+        let snapshot = self.snapshots.load();
+        let config = snapshot.config();
         if request.version() != Version::HTTP_11 {
             return Err(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
         }
@@ -256,11 +397,13 @@ impl Proxy {
         if target::check_host_header(&target, host_header).is_err() {
             return Err(error(StatusCode::BAD_REQUEST));
         }
-        if policy::check_source(self.config.access(), client.peer).is_err() {
+        if policy::check_source(config.access(), client.peer).is_err() {
             return Err(error(StatusCode::FORBIDDEN));
         }
-        let identity = self.authenticate(request.headers(), &client).await?;
-        if !self.config.connect().allows_port(target.port()) {
+        let identity = self
+            .authenticate(request.headers(), &client, config)
+            .await?;
+        if !config.connect().allows_port(target.port()) {
             return Err(error(StatusCode::FORBIDDEN));
         }
 
@@ -272,7 +415,14 @@ impl Proxy {
         };
         let plan = match self
             .outbound
-            .prepare_outbound(&context, &Method::CONNECT, &target_text, host_header)
+            .prepare_outbound_with(
+                config,
+                snapshot.generation(),
+                &context,
+                &Method::CONNECT,
+                &target_text,
+                host_header,
+            )
             .await
         {
             Ok(plan) => plan,
@@ -284,7 +434,7 @@ impl Proxy {
                 return Err(headers::error_response(status, close));
             }
         };
-        let origin = match self.outbound.open_plan(&plan).await {
+        let origin = match self.outbound.open_plan_with(config, &plan).await {
             Ok(origin) => origin,
             Err(outbound_error) => {
                 let (status, close) = outbound_status(outbound_error);
@@ -309,23 +459,124 @@ impl Proxy {
         let setup = TunnelSetup {
             on_upgrade,
             origin,
-            deadline: tokio::time::Instant::now() + self.config.limits().idle_timeout(),
+            deadline: tokio::time::Instant::now() + config.limits().idle_timeout(),
+            idle_timeout: config.limits().idle_timeout(),
+            half_close_timeout: config.connect().half_close_timeout(),
+            gauge: crate::http::connect::TunnelGauge::new(Arc::clone(&self.telemetry)),
         };
+        self.telemetry
+            .connect_started
+            .fetch_add(1, Ordering::Relaxed);
         Ok((response, setup))
     }
 
     /// Handles one non-CONNECT client request. All failures before final headers
-    /// become bounded local responses; failures after headers are surfaced as
-    /// body errors so the server closes/evicts the exchange.
+    /// become bounded local responses; the server wraps the returned body and
+    /// calls [`Proxy::log_exchange`] exactly once when that body reaches a
+    /// terminal state.
     pub(crate) async fn handle(
         &self,
         request: Request<Incoming>,
         client: ClientInfo,
         interim: InterimSender,
     ) -> Response<ResponseBody> {
+        let started = tokio::time::Instant::now();
+        self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
+        let snapshot = self.snapshots.load();
+        let request_body_bytes = Arc::new(AtomicU64::new(0));
+        let mut response = if self.is_draining() {
+            headers::error_response(StatusCode::SERVICE_UNAVAILABLE, true)
+        } else {
+            self.handle_inner(
+                request,
+                client.clone(),
+                interim,
+                &snapshot,
+                Arc::clone(&request_body_bytes),
+            )
+            .await
+        };
+        let meta = ExchangeMeta {
+            generation: snapshot.generation(),
+            started,
+            connection_id: client.connection_id,
+            request_id: client.request_id,
+            listener_id: client.listener_id.clone(),
+            status: response.status(),
+            request_body_bytes,
+        };
+        response.extensions_mut().insert(meta);
+        response
+    }
+
+    /// Emits exactly one terminal record and metrics update for an exchange.
+    pub fn log_exchange(
+        &self,
+        meta: ExchangeMeta,
+        outcome: crate::http::BodyOutcome,
+        response_body_bytes: u64,
+    ) {
+        let status = meta.status;
+        match outcome {
+            crate::http::BodyOutcome::Cancelled => {
+                self.telemetry
+                    .http_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::http::BodyOutcome::Success | crate::http::BodyOutcome::Failed => {
+                self.telemetry
+                    .http_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if status.is_success() {
+            self.telemetry.http_2xx.fetch_add(1, Ordering::Relaxed);
+        } else if status.is_redirection() {
+            self.telemetry.http_3xx.fetch_add(1, Ordering::Relaxed);
+        } else if status.is_client_error() {
+            self.telemetry.http_4xx.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.telemetry.http_5xx.fetch_add(1, Ordering::Relaxed);
+        }
+        self.telemetry.observe_http(meta.started.elapsed());
+        let outcome = match outcome {
+            crate::http::BodyOutcome::Success if status.is_server_error() => Outcome::Failed,
+            crate::http::BodyOutcome::Success => Outcome::Success,
+            crate::http::BodyOutcome::Failed => Outcome::Failed,
+            crate::http::BodyOutcome::Cancelled => Outcome::Cancelled,
+        };
+        let request_body_bytes = meta.request_body_bytes();
+        let mut record = LogRecord::new(Event::RequestFinished);
+        record.outcome = Some(outcome);
+        record.reason = Some(match outcome {
+            Outcome::Success => Reason::Completed,
+            Outcome::Cancelled => Reason::ClientClosed,
+            _ => Reason::Error,
+        });
+        record.generation = Some(meta.generation);
+        record.connection_id = Some(meta.connection_id);
+        record.request_id = Some(meta.request_id);
+        record.listener_id = Some(meta.listener_id);
+        record.status = Some(status.as_u16());
+        record.elapsed_ms =
+            Some(u64::try_from(meta.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        record.request_body_bytes = Some(request_body_bytes);
+        record.response_body_bytes = Some(response_body_bytes);
+        self.logger().log(record);
+    }
+
+    async fn handle_inner(
+        &self,
+        request: Request<Incoming>,
+        client: ClientInfo,
+        interim: InterimSender,
+        snapshot: &Arc<crate::snapshot::RuntimeSnapshot>,
+        request_body_bytes: Arc<AtomicU64>,
+    ) -> Response<ResponseBody> {
         if self.is_draining() {
             return headers::error_response(StatusCode::SERVICE_UNAVAILABLE, true);
         }
+        let config = snapshot.config();
         if request.version() != Version::HTTP_11 {
             return headers::error_response(StatusCode::HTTP_VERSION_NOT_SUPPORTED, true);
         }
@@ -401,10 +652,10 @@ impl Proxy {
             None
         };
 
-        if policy::check_source(self.config.access(), client.peer).is_err() {
+        if policy::check_source(config.access(), client.peer).is_err() {
             return headers::error_response(StatusCode::FORBIDDEN, true);
         }
-        let identity = match self.authenticate(request.headers(), &client).await {
+        let identity = match self.authenticate(request.headers(), &client, config).await {
             Ok(identity) => identity,
             Err(response) => return response,
         };
@@ -415,7 +666,7 @@ impl Proxy {
             target: &target,
             identity: identity.as_ref(),
         };
-        if policy::check_request(self.config.access(), &meta).is_err() {
+        if policy::check_request(config.access(), &meta).is_err() {
             return headers::error_response(StatusCode::FORBIDDEN, true);
         }
         let context = match identity {
@@ -466,7 +717,14 @@ impl Proxy {
 
         let plan = match self
             .outbound
-            .prepare_outbound(&context, &method, &target_text, host_header)
+            .prepare_outbound_with(
+                config,
+                snapshot.generation(),
+                &context,
+                &method,
+                &target_text,
+                host_header,
+            )
             .await
         {
             Ok(plan) => plan,
@@ -481,7 +739,7 @@ impl Proxy {
 
         let lease = match self.pool.checkout(&plan) {
             Some(lease) => lease,
-            None => match self.open_new_connection(&plan).await {
+            None => match self.open_new_connection(&plan, config).await {
                 Ok(lease) => lease,
                 Err(error) => {
                     let (status, close) = outbound_status(error);
@@ -499,7 +757,9 @@ impl Proxy {
         if request_had_content_length && let Some(length) = body_length {
             headers::set_content_length(&mut request_headers, length);
         }
-        let request_body = LeaseRequestBody::new(body, lease.clone(), request_nominations).boxed();
+        let request_body =
+            LeaseRequestBody::new(body, lease.clone(), request_nominations, request_body_bytes)
+                .boxed();
         let origin_form = if method == Method::OPTIONS && options_without_path(&target_text) {
             "*"
         } else {
@@ -525,7 +785,7 @@ impl Proxy {
                 return headers::error_response(StatusCode::BAD_GATEWAY, true);
             }
         };
-        let response_timeout = self.config.http().response_header_timeout();
+        let response_timeout = config.http().response_header_timeout();
         let result =
             tokio::time::timeout(response_timeout, sender.send_request(upstream_request)).await;
         match result {
@@ -609,14 +869,15 @@ impl Proxy {
     async fn open_new_connection(
         &self,
         plan: &crate::outbound::OutboundPlan,
+        config: &Config,
     ) -> Result<Lease, OutboundError> {
-        let connected = self.outbound.open_plan(plan).await?;
+        let connected = self.outbound.open_plan_with(config, plan).await?;
         let endpoint = connected.endpoint().endpoint();
-        let stream = crate::http::idle::IdleIo::new(connected, self.config.limits().idle_timeout());
+        let stream = crate::http::idle::IdleIo::new(connected, config.limits().idle_timeout());
         let handshake = client_http1::Builder::new()
-            .max_headers(self.config.http().max_headers())
-            .max_header_size(self.config.limits().max_header_bytes() as usize)
-            .max_buf_size(connection_buffer_size(&self.config))
+            .max_headers(config.http().max_headers())
+            .max_header_size(config.limits().max_header_bytes() as usize)
+            .max_buf_size(connection_buffer_size(config))
             .handshake::<_, PoolBody>(TokioIo::new(stream))
             .await;
         let (sender, connection) = match handshake {

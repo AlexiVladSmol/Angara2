@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::outbound::Connected;
+use crate::telemetry::Telemetry;
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 
@@ -20,6 +21,71 @@ pub(crate) struct TunnelSetup {
     pub(crate) on_upgrade: OnUpgrade,
     pub(crate) origin: Connected,
     pub(crate) deadline: Instant,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) half_close_timeout: Duration,
+    pub(crate) gauge: TunnelGauge,
+}
+
+/// RAII CONNECT lifecycle accounting. `finish` records the observed end
+/// reason; dropping without an explicit finish records a cancellation.
+pub(crate) struct TunnelGauge {
+    telemetry: Arc<Telemetry>,
+    finished: bool,
+}
+
+impl TunnelGauge {
+    pub(crate) fn new(telemetry: Arc<Telemetry>) -> Self {
+        telemetry.connect_active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            telemetry,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, end: &TunnelEnd) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.telemetry.connect_active.fetch_sub(1, Ordering::AcqRel);
+        self.telemetry
+            .connect_finished
+            .fetch_add(1, Ordering::Relaxed);
+        match end {
+            TunnelEnd::Complete { .. } => {
+                self.telemetry
+                    .connect_complete
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TunnelEnd::Idle => {
+                self.telemetry.connect_idle.fetch_add(1, Ordering::Relaxed);
+            }
+            TunnelEnd::HalfCloseTimeout => {
+                self.telemetry
+                    .connect_timeout
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TunnelEnd::Io => {
+                self.telemetry.connect_error.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Drop for TunnelGauge {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.telemetry.connect_active.fetch_sub(1, Ordering::AcqRel);
+        self.telemetry
+            .connect_finished
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .connect_cancelled
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// How a tunnel session ended.
@@ -109,7 +175,7 @@ where
             writer.shutdown().await?;
             return Ok(());
         }
-        progress.hit();
+        progress.add_bytes(read as u64);
         write_all_progress(&mut writer, &buffer[..read], &progress).await?;
     }
 }
@@ -174,6 +240,7 @@ async fn wait_drain(state: Arc<CopyState>, half_close_timeout: Duration) {
 #[doc(hidden)]
 pub struct TunnelProgress {
     sequence: AtomicU64,
+    bytes: AtomicU64,
     notify: Notify,
 }
 
@@ -183,6 +250,7 @@ impl TunnelProgress {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sequence: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
             notify: Notify::new(),
         })
     }
@@ -190,6 +258,16 @@ impl TunnelProgress {
     pub(crate) fn hit(&self) {
         self.sequence.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
+    }
+
+    pub(crate) fn add_bytes(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.hit();
+    }
+
+    /// Observed plaintext bytes across both directions.
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
     }
 }
 

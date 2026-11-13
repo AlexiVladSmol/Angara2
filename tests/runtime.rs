@@ -49,7 +49,7 @@ fn cpu01_fixed_workers_report_requested_count_and_run_concurrent_tasks() {
         sum
     });
 
-    assert_eq!(sum, (0..64_u64).map(|value| value * 2).sum());
+    assert_eq!(sum, (0..64_u64).map(|value| value * 2).sum::<u64>());
     runtime.shutdown();
 }
 

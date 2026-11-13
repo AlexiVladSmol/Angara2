@@ -5,20 +5,23 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http::Method;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::auth::{AuthMode, VerifiedIdentity};
 use crate::config::{Config, EgressMode};
+use crate::limits::{CapController, CapPermit};
 use crate::policy::{self, PolicyError, RequestMeta};
 use crate::resolver::{ResolveError, Resolver, SystemResolver};
 use crate::routing::{self, RoutingError};
 use crate::target::{self, CanonicalTarget, Host};
+use crate::telemetry::Telemetry;
 use crate::transport::{DialError, Dialer, TcpDialer};
 
 /// Trusted client context supplied by the accepting layer.
@@ -118,8 +121,17 @@ impl AuthorizedEndpoint {
 /// value closes the stream and returns the connection budget.
 pub struct Connected {
     stream: TcpStream,
-    _permit: OwnedSemaphorePermit,
+    _permit: CapPermit,
     endpoint: AuthorizedEndpoint,
+    telemetry: Arc<Telemetry>,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.telemetry
+            .outbound_active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl Connected {
@@ -321,14 +333,45 @@ impl OutboundPlan {
 /// Composed target → source → ACL → routing → DNS → IP policy → dial pipeline.
 ///
 /// Clones share the same resolver, dialer and resource budgets.
+struct DnsGauge(Arc<Telemetry>);
+
+impl DnsGauge {
+    fn new(telemetry: Arc<Telemetry>) -> Self {
+        telemetry.dns_active.fetch_add(1, Ordering::AcqRel);
+        Self(telemetry)
+    }
+}
+
+impl Drop for DnsGauge {
+    fn drop(&mut self) {
+        self.0.dns_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ConnectingGauge(Arc<Telemetry>);
+
+impl ConnectingGauge {
+    fn new(telemetry: Arc<Telemetry>) -> Self {
+        telemetry.outbound_connecting.fetch_add(1, Ordering::AcqRel);
+        Self(telemetry)
+    }
+}
+
+impl Drop for ConnectingGauge {
+    fn drop(&mut self) {
+        self.0.outbound_connecting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone)]
 pub struct OutboundService {
     config: Arc<Config>,
     resolver: Arc<dyn Resolver>,
     dialer: Arc<dyn Dialer>,
-    outbound_permits: Arc<Semaphore>,
+    outbound_permits: Arc<CapController>,
     connecting_permits: Arc<Semaphore>,
     generation: u64,
+    telemetry: Arc<Telemetry>,
 }
 
 impl OutboundService {
@@ -336,7 +379,15 @@ impl OutboundService {
     pub fn new(config: Arc<Config>) -> Self {
         let resolver = Arc::new(SystemResolver::new(*config.dns()));
         let dialer = Arc::new(TcpDialer);
-        Self::with_components(config, resolver, dialer)
+        let telemetry = Telemetry::new();
+        Self::with_components_and_telemetry(config, resolver, dialer, telemetry)
+    }
+
+    /// Builds a production service sharing caller-owned telemetry.
+    pub fn new_with_telemetry(config: Arc<Config>, telemetry: Arc<Telemetry>) -> Self {
+        let resolver = Arc::new(SystemResolver::new(*config.dns()));
+        let dialer = Arc::new(TcpDialer);
+        Self::with_components_and_telemetry(config, resolver, dialer, telemetry)
     }
 
     /// Builds a service with injected resolver and dialer.
@@ -345,7 +396,18 @@ impl OutboundService {
         resolver: Arc<dyn Resolver>,
         dialer: Arc<dyn Dialer>,
     ) -> Self {
-        let outbound_permits = Arc::new(Semaphore::new(config.limits().max_connections() as usize));
+        let telemetry = Telemetry::new();
+        Self::with_components_and_telemetry(config, resolver, dialer, telemetry)
+    }
+
+    /// Builds a service with injected components and shared telemetry.
+    pub fn with_components_and_telemetry(
+        config: Arc<Config>,
+        resolver: Arc<dyn Resolver>,
+        dialer: Arc<dyn Dialer>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
+        let outbound_permits = CapController::new(config.limits().max_connections() as usize);
         let connecting_permits = Arc::new(Semaphore::new(config.transport().max_connecting()));
         Self {
             config,
@@ -354,7 +416,21 @@ impl OutboundService {
             outbound_permits,
             connecting_permits,
             generation: 1,
+            telemetry,
         }
+    }
+
+    /// Updates the shared global outbound cap after a successful reload.
+    pub fn set_outbound_limit(&self, limit: usize) {
+        self.outbound_permits.set_limit(limit);
+    }
+
+    /// Current outbound cap and holders for status/metrics.
+    pub fn outbound_cap(&self) -> (usize, usize) {
+        (
+            self.outbound_permits.limit(),
+            self.outbound_permits.active(),
+        )
     }
 
     /// Immutable configuration generation used by this service.
@@ -388,15 +464,35 @@ impl OutboundService {
         request_target: &str,
         host_header: Option<&str>,
     ) -> Result<OutboundPlan, OutboundError> {
-        let deadline = Instant::now() + self.config.transport().total_timeout();
+        self.prepare_outbound_with(
+            &self.config,
+            self.generation,
+            context,
+            method,
+            request_target,
+            host_header,
+        )
+        .await
+    }
+
+    /// Snapshot-aware preparation used by the reloadable proxy path.
+    pub async fn prepare_outbound_with(
+        &self,
+        config: &Config,
+        generation: u64,
+        context: &RequestContext,
+        method: &Method,
+        request_target: &str,
+        host_header: Option<&str>,
+    ) -> Result<OutboundPlan, OutboundError> {
+        let deadline = Instant::now() + config.transport().total_timeout();
 
         let target = CanonicalTarget::parse(method, request_target)
             .map_err(|_| OutboundError::InvalidTarget)?;
         target::check_host_header(&target, host_header)
             .map_err(|_| OutboundError::InvalidTarget)?;
 
-        let listener = self
-            .config
+        let listener = config
             .listener(context.listener_id())
             .ok_or(OutboundError::AccessDenied)?;
         let identity = match listener.auth() {
@@ -405,10 +501,7 @@ impl OutboundService {
                 let identity = context
                     .identity()
                     .ok_or(OutboundError::AuthenticationRequired)?;
-                let auth = self
-                    .config
-                    .auth()
-                    .ok_or(OutboundError::AuthenticationRequired)?;
+                let auth = config.auth().ok_or(OutboundError::AuthenticationRequired)?;
                 if !identity.belongs_to(auth.snapshot()) {
                     return Err(OutboundError::AuthenticationRequired);
                 }
@@ -424,12 +517,11 @@ impl OutboundService {
             identity,
         };
 
-        policy::check_source(self.config.access(), context.source()).map_err(map_policy)?;
-        let matched_rule =
-            policy::check_request(self.config.access(), &meta).map_err(map_policy)?;
+        policy::check_source(config.access(), context.source()).map_err(map_policy)?;
+        let matched_rule = policy::check_request(config.access(), &meta).map_err(map_policy)?;
         let matched_rule_id = matched_rule.id().to_owned();
 
-        let egress = routing::select_egress(self.config.routing(), self.config.egress(), &meta)
+        let egress = routing::select_egress(config.routing(), config.egress(), &meta)
             .map_err(map_routing)?
             .clone();
 
@@ -438,19 +530,28 @@ impl OutboundService {
         let addresses = match target.host() {
             Host::Ip(ip) => vec![*ip],
             Host::Domain(domain) => {
-                let addresses = self
-                    .resolver
-                    .resolve(domain.as_str(), deadline)
-                    .await
-                    .map_err(map_resolve)?;
+                let gauge = DnsGauge::new(Arc::clone(&self.telemetry));
+                let result = self.resolver.resolve(domain.as_str(), deadline).await;
+                drop(gauge);
+                let addresses = match result {
+                    Ok(addresses) => addresses,
+                    Err(error) => {
+                        if matches!(error, ResolveError::Timeout | ResolveError::TotalTimeout) {
+                            self.telemetry.dns_timeout.fetch_add(1, Ordering::Relaxed);
+                        } else if !matches!(error, ResolveError::Busy) {
+                            self.telemetry.dns_error.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Err(map_resolve(error));
+                    }
+                };
                 check_deadline(deadline)?;
-                prepare_addresses(addresses, self.config.dns().max_answers())?
+                prepare_addresses(addresses, config.dns().max_answers())?
             }
         };
 
         let mut allowed = Vec::with_capacity(addresses.len());
         for address in addresses {
-            if let Ok(address) = policy::check_ip(self.config.access(), address) {
+            if let Ok(address) = policy::check_ip(config.access(), address) {
                 allowed.push(address);
             }
         }
@@ -479,7 +580,7 @@ impl OutboundService {
             egress,
             matched_rule_id,
             endpoints,
-            generation: self.generation,
+            generation,
             deadline,
             listener_id: context.listener_id().to_owned(),
             identity: identity.map(|identity| identity.username().to_owned()),
@@ -489,17 +590,25 @@ impl OutboundService {
 
     /// Opens a new checked connection for an authorized plan.
     pub async fn open_plan(&self, plan: &OutboundPlan) -> Result<Connected, OutboundError> {
+        self.open_plan_with(&self.config, plan).await
+    }
+
+    /// Snapshot-aware dial used by the reloadable proxy path.
+    pub async fn open_plan_with(
+        &self,
+        config: &Config,
+        plan: &OutboundPlan,
+    ) -> Result<Connected, OutboundError> {
         check_deadline(plan.deadline)?;
         let outbound_permit = self
             .outbound_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| OutboundError::OutboundBusy)?;
+            .try_acquire()
+            .ok_or(OutboundError::OutboundBusy)?;
 
         let attempts = plan
             .endpoints
             .len()
-            .min(self.config.transport().max_connect_attempts());
+            .min(config.transport().max_connect_attempts());
         let mut last_error = None;
         for endpoint in plan.endpoints.iter().copied().take(attempts) {
             check_deadline(plan.deadline)?;
@@ -508,12 +617,13 @@ impl OutboundService {
             if remaining.is_zero() {
                 return Err(OutboundError::TotalTimeout);
             }
-            let attempt_deadline = now + self.config.transport().connect_timeout().min(remaining);
+            let attempt_deadline = now + config.transport().connect_timeout().min(remaining);
             let connecting_permit = self
                 .connecting_permits
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| OutboundError::OutboundBusy)?;
+            let connecting_gauge = ConnectingGauge::new(Arc::clone(&self.telemetry));
 
             match self
                 .dialer
@@ -521,10 +631,14 @@ impl OutboundService {
                 .await
             {
                 Ok(stream) => {
+                    drop(connecting_gauge);
                     drop(connecting_permit);
                     if Instant::now() >= plan.deadline {
                         return Err(OutboundError::TotalTimeout);
                     }
+                    self.telemetry
+                        .outbound_active
+                        .fetch_add(1, Ordering::AcqRel);
                     return Ok(Connected {
                         stream,
                         _permit: outbound_permit,
@@ -535,6 +649,7 @@ impl OutboundService {
                             matched_rule_id: plan.matched_rule_id.clone(),
                             generation: plan.generation,
                         },
+                        telemetry: Arc::clone(&self.telemetry),
                     });
                 }
                 Err(DialError::BindFailed) => {

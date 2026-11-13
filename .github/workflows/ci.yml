@@ -132,6 +132,44 @@ jobs:
           cp examples/m06-https-local.toml "$TMP/m06.toml"
           ./target/debug/angara check --config "$TMP/m06.toml"
 
+      - name: Validate M07 operations example with generated material
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          umask 077
+          python3 tests/fixtures/m06_pki.py --dir "$TMP/pki"
+          mkdir -p "$TMP/tls"
+          cp "$TMP/pki/proxy_chain.pem" "$TMP/tls/proxy-chain.pem"
+          cp "$TMP/pki/proxy_key.pem" "$TMP/tls/proxy-key.pem"
+          chmod 0600 "$TMP/tls/proxy-key.pem"
+          PHC=$(printf '%s\n' 'synthetic-ci-password' | \
+            ./target/debug/angara users hash --password-stdin)
+          {
+            printf 'version = 1\n\n[[users]]\nusername = "alice"\n'
+            printf 'password_hash = "%s"\ndisabled = false\n\n' "$PHC"
+            printf '[[users]]\nusername = "bob"\n'
+            printf 'password_hash = "%s"\ndisabled = false\n' "$PHC"
+          } >"$TMP/users.local.toml"
+          chmod 0600 "$TMP/users.local.toml"
+          cp examples/m07-operations-local.toml "$TMP/m07.toml"
+          ./target/debug/angara check --config "$TMP/m07.toml"
+
+      - name: M07 reload, control and observability tests
+        run: |
+          cargo test --locked --test m07_reload -- --nocapture --test-threads=1
+          cargo test --locked --test config_m07 -- --nocapture
+          cargo test --locked --test cli_m07 -- --nocapture --test-threads=1
+          cargo test --locked --test m07_limits -- --nocapture --test-threads=1
+
+      - name: M04 forced-shutdown stability (20 repeats)
+        run: |
+          for attempt in $(seq 1 20); do
+            cargo test --locked --test m04_server \
+              m04_srv01_forced_shutdown_reclaims_active_tunnel_tasks \
+              -- --nocapture
+          done
+
       - name: M06 TLS resource, load and handshake evidence
         run: |
           cargo test --locked --test m06_limits \
