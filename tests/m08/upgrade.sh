@@ -45,6 +45,7 @@ B_SOURCE=$(sed -n 's/^source_sha=//p' "$TMP/b-manifest.txt")
 B_CANDIDATE=$(sed -n 's/^candidate_id=//p' "$TMP/b-manifest.txt")
 [ "$A_SOURCE" != "$B_SOURCE" ] || fail "A and B source SHAs are identical"
 
+log "upgrade stage: install A"
 "$B_TOP/install.sh" --archive "$ARCHIVE_A" --sha256 "$SHA_A" \
     --expected-source-sha "$A_SOURCE" >"$TMP/install-a.txt"
 systemctl start angara.service
@@ -63,6 +64,7 @@ printf 'A candidate=%s source=%s exe=%s\n' "$A_CANDIDATE" "$A_SOURCE" "$A_EXE"
 
 # Preflight failure: unreadable users file must stop the upgrade before A is
 # touched.  A keeps running with its previous snapshot.
+log "upgrade stage: preflight failure"
 cp /etc/angara/angara.toml "$TMP/angara.saved"
 python3 "$M08_DIR/make_config.py" --output "$TMP/bad-users.toml" --mode functional \
     --http-port 3128 --https-port 0 --extra-port 0 --users-file /etc/angara/users.toml \
@@ -103,6 +105,7 @@ assert_eq "$(systemctl show -p MainPID --value angara.service)" "$A_PID" "reject
 wait_http_code http://127.0.0.1:3128 http://127.0.0.1:9/ 403
 
 # A -> B.
+log "upgrade stage: A -> B"
 "$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
     >"$TMP/upgrade.out" 2>"$TMP/upgrade.err"
 cat "$TMP/upgrade.out"
@@ -121,6 +124,7 @@ printf 'B candidate=%s source=%s exe=%s\n' "$B_CANDIDATE" "$B_SOURCE" "$B_EXE"
 grep -q "current=/opt/angara/releases/$B_CANDIDATE" "$TMP/status-b.txt"
 
 # B -> A rollback.
+log "upgrade stage: B -> A"
 "$ANGARACTL" rollback --confirm >"$TMP/rollback.out" 2>"$TMP/rollback.err"
 cat "$TMP/rollback.out"
 wait_service_active
@@ -136,6 +140,7 @@ assert_eq "$A2_CONFIG_HASH" "$A_CONFIG_HASH" "config hashes after B->A"
 # Post-switch failure and recovery: a syntactically valid but unbindable
 # listener passes check, fails after B is activated, and the same A is
 # recoverable after the test configuration is restored.
+log "upgrade stage: post-switch failure"
 python3 "$M08_DIR/make_config.py" --output "$TMP/unbindable.toml" --mode unbindable \
     --http-port 3128 --https-port 0 --extra-port 0 --workers auto
 install -m 0640 -o root -g angara "$TMP/unbindable.toml" /etc/angara/angara.toml
@@ -150,6 +155,7 @@ cp "$TMP/angara.saved" /etc/angara/angara.toml
 chown root:angara /etc/angara/angara.toml
 chmod 0640 /etc/angara/angara.toml
 systemctl reset-failed angara.service >/dev/null 2>&1 || true
+log "upgrade stage: recover"
 "$ANGARACTL" recover >"$TMP/recover.out" 2>"$TMP/recover.err"
 cat "$TMP/recover.out"
 wait_service_active
@@ -157,6 +163,7 @@ wait_http_code http://127.0.0.1:3128 http://127.0.0.1:9/ 403
 assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" "recovered current"
 
 # Repeat upgrade after recovery works.
+log "upgrade stage: repeat upgrade"
 "$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
     >"$TMP/upgrade-again.out" 2>"$TMP/upgrade-again.err"
 wait_service_active

@@ -47,6 +47,7 @@ def main() -> int:
     parser.add_argument("--auth-https", choices=["none", "basic"], default="basic")
     parser.add_argument("--https-users", default="alice")
     parser.add_argument("--users-file", default="")
+    parser.add_argument("--max-verifying", type=int, default=2)
     parser.add_argument("--tls-cert", default="")
     parser.add_argument("--tls-key", default="")
     parser.add_argument("--workers", default="2")
@@ -154,7 +155,7 @@ default_egress = "system"
             [
                 "[auth]",
                 f"users_file = {q(args.users_file)}",
-                "max_verifying = 2",
+                f"max_verifying = {args.max_verifying}",
                 "verify_timeout_ms = 2000",
                 "",
             ]

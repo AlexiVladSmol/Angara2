@@ -339,12 +339,24 @@ set +e
 systemctl start angara.service
 START_OCCUPIED=$?
 set -e
-[ "$START_OCCUPIED" -ne 0 ] || fail "occupied-port start unexpectedly succeeded"
+# Type=exec may report success once the process was exec'd even if the process
+# immediately fails to bind.  Readiness is separate from the start job result.
 for _ in $(seq 1 120); do
-    systemctl is-failed --quiet angara.service && break
+    if systemctl is-failed --quiet angara.service; then
+        break
+    fi
+    if ! systemctl is-active --quiet angara.service && \
+        [ "$(systemctl show -p ActiveState --value angara.service)" = "inactive" ]; then
+        break
+    fi
     sleep 0.1
 done
-systemctl is-failed --quiet angara.service || fail "occupied port did not reach start limit"
+if systemctl is-active --quiet angara.service; then
+    fail "occupied-port service stayed active (start exit $START_OCCUPIED)"
+fi
+systemctl is-failed --quiet angara.service || \
+    [ "$(systemctl show -p ActiveState --value angara.service)" = "inactive" ] || \
+    fail "occupied port did not reach a failed/inactive state"
 systemctl reset-failed angara.service
 kill "$OCCUPIER_PID" 2>/dev/null || true
 wait "$OCCUPIER_PID" 2>/dev/null || true

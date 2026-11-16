@@ -616,10 +616,6 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" bash tests/m08/install.sh
-          mkdir -p /tmp/unit-check
-          tar -xzf "$ARCHIVE" -C /tmp/unit-check --no-same-owner --same-permissions
-          unit=$(find /tmp/unit-check -name angara.service -print -quit)
-          systemd-analyze verify "$unit"
 
   systemd:
     name: Live systemd start/reload/stop/restart

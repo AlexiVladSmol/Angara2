@@ -44,7 +44,8 @@ python3 "$M08_DIR/make_config.py" --output "$TMP/angara.toml" --mode functional 
     --users-file /etc/angara/users.toml \
     --tls-cert /etc/angara/tls/proxy-chain.pem \
     --tls-key /etc/angara/tls/proxy-key.pem \
-    --workers 2 --https-users alice,bob --shutdown-ms 10000 --reload-ms 5000 \
+    --workers 2 --https-users alice,bob --max-verifying 16 \
+    --shutdown-ms 10000 --reload-ms 5000 \
     --idle-ms 60000 --metrics-interval 60000 \
     --max-connections 512 --max-client-connections 256
 TMPCONF=$(mktemp /etc/angara/.soak.XXXXXX)
