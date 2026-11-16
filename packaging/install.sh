@@ -143,7 +143,7 @@ else
     done <"$WORKDIR/types.txt"
     mkdir -p "$WORKDIR/root"
     tar -xzf "$ARCHIVE" -C "$WORKDIR/root" \
-        --no-same-owner --no-same-permissions --delay-directory-restore
+        --no-same-owner --same-permissions --delay-directory-restore
     mapfile -t top < <(find "$WORKDIR/root" -mindepth 1 -maxdepth 1 -printf '%f\n')
     [ "${#top[@]}" -eq 1 ] || die "archive must contain exactly one top-level directory"
     STAGED_SOURCE="$WORKDIR/root/${top[0]}"

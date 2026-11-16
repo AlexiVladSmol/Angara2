@@ -25,7 +25,8 @@ umask 077
 
 # Extract once for manifest and content checks.
 mkdir -p "$TMP/root"
-tar -xzf "$ARCHIVE" -C "$TMP/root" --no-same-owner --no-same-permissions
+tar -xzf "$ARCHIVE" -C "$TMP/root" \
+    --no-same-owner --same-permissions --delay-directory-restore
 TOP=$(find "$TMP/root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n')
 [ -n "$TOP" ] || fail "archive has no top-level directory"
 [ "$(find "$TMP/root" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] || fail "archive has multiple top-level entries"

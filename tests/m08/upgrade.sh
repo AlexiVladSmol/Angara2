@@ -25,7 +25,7 @@ trap cleanup EXIT HUP INT TERM
 umask 077
 
 mkdir -p "$TMP/b"
-tar -xzf "$ARCHIVE_B" -C "$TMP/b" --no-same-owner --no-same-permissions
+tar -xzf "$ARCHIVE_B" -C "$TMP/b" --no-same-owner --same-permissions
 B_TOP=$(find "$TMP/b" -mindepth 1 -maxdepth 1 -type d -printf '%p\n')
 [ -n "$B_TOP" ] || fail "B archive has no top-level directory"
 python3 "$B_TOP/verify_manifest.py" --root "$B_TOP" >"$TMP/b-manifest.txt"
@@ -35,7 +35,7 @@ python3 "$B_TOP/verify_manifest.py" --root "$B_TOP" >"$TMP/b-manifest.txt"
 # Extract A and read its manifest before installing it.  The A source SHA is
 # not known from B, so the installer is called with the exact extracted value.
 mkdir -p "$TMP/a"
-tar -xzf "$ARCHIVE_A" -C "$TMP/a" --no-same-owner --no-same-permissions
+tar -xzf "$ARCHIVE_A" -C "$TMP/a" --no-same-owner --same-permissions
 A_TOP=$(find "$TMP/a" -mindepth 1 -maxdepth 1 -type d -printf '%p\n')
 [ -n "$A_TOP" ] || fail "A archive has no top-level directory"
 python3 "$A_TOP/verify_manifest.py" --root "$A_TOP" >"$TMP/a-manifest.txt"

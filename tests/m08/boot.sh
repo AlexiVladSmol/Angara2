@@ -29,7 +29,7 @@ umask 077
 
 printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
 mkdir -p "$TMP/release"
-tar -xzf "$ARCHIVE" -C "$TMP/release" --no-same-owner --no-same-permissions
+tar -xzf "$ARCHIVE" -C "$TMP/release" --no-same-owner --same-permissions
 TOP=$(find "$TMP/release" -mindepth 1 -maxdepth 1 -type d -printf '%p\n')
 [ -n "$TOP" ] || fail "archive has no top-level directory"
 SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source_sha=//p')

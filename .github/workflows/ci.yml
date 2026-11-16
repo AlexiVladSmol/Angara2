@@ -545,6 +545,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -616,7 +617,7 @@ jobs:
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" bash tests/m08/install.sh
           mkdir -p /tmp/unit-check
-          tar -xzf "$ARCHIVE" -C /tmp/unit-check
+          tar -xzf "$ARCHIVE" -C /tmp/unit-check --no-same-owner --same-permissions
           unit=$(find /tmp/unit-check -name angara.service -print -quit)
           systemd-analyze verify "$unit"
 
@@ -642,7 +643,7 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           mkdir -p extracted
-          tar -xzf "$ARCHIVE" -C extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
           sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
             --expected-source-sha "$(git rev-parse HEAD)"
@@ -672,7 +673,7 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           mkdir -p extracted
-          tar -xzf "$ARCHIVE" -C extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
           sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
             --expected-source-sha "$(git rev-parse HEAD)"
@@ -711,7 +712,7 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           mkdir -p extracted
-          tar -xzf "$ARCHIVE" -C extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
           sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
             --expected-source-sha "$(git rev-parse HEAD)"
@@ -741,7 +742,7 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           mkdir -p extracted
-          tar -xzf "$ARCHIVE" -C extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
           sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
             --expected-source-sha "$(git rev-parse HEAD)"
@@ -843,7 +844,7 @@ jobs:
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           mkdir -p extracted
-          tar -xzf "$ARCHIVE" -C extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
           sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
             --expected-source-sha "$(git rev-parse HEAD)"
