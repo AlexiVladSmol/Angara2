@@ -254,7 +254,7 @@ allow_special = true
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            if line.contains("listening:") {
+            if line.contains("\"event\":\"service_started\"") {
                 let _ = ready_tx.send(line);
             }
         }

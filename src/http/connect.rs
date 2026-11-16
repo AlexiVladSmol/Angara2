@@ -11,7 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::logging::{Event, LogRecord, Logger, Outcome, Reason};
 use crate::outbound::Connected;
+use crate::telemetry::Telemetry;
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 
@@ -20,6 +22,102 @@ pub(crate) struct TunnelSetup {
     pub(crate) on_upgrade: OnUpgrade,
     pub(crate) origin: Connected,
     pub(crate) deadline: Instant,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) half_close_timeout: Duration,
+    pub(crate) gauge: TunnelGauge,
+}
+
+/// RAII CONNECT lifecycle accounting. `finish` records the observed end
+/// reason; dropping without an explicit finish records a cancellation.
+pub(crate) struct TunnelGauge {
+    telemetry: Arc<Telemetry>,
+    logger: Logger,
+    generation: u64,
+    connection_id: u64,
+    progress: Option<Arc<TunnelProgress>>,
+    finished: bool,
+}
+
+impl TunnelGauge {
+    pub(crate) fn new(
+        telemetry: Arc<Telemetry>,
+        logger: Logger,
+        generation: u64,
+        connection_id: u64,
+    ) -> Self {
+        telemetry.connect_active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            telemetry,
+            logger,
+            generation,
+            connection_id,
+            progress: None,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn attach_progress(&mut self, progress: Arc<TunnelProgress>) {
+        self.progress = Some(progress);
+    }
+
+    pub(crate) fn finish(&mut self, end: &TunnelEnd) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.telemetry.connect_active.fetch_sub(1, Ordering::AcqRel);
+        self.telemetry
+            .connect_finished
+            .fetch_add(1, Ordering::Relaxed);
+        let (outcome, reason) = match end {
+            TunnelEnd::Complete { .. } => {
+                self.telemetry
+                    .connect_complete
+                    .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Success, Reason::Completed)
+            }
+            TunnelEnd::Idle => {
+                self.telemetry.connect_idle.fetch_add(1, Ordering::Relaxed);
+                (Outcome::Cancelled, Reason::Idle)
+            }
+            TunnelEnd::HalfCloseTimeout => {
+                self.telemetry
+                    .connect_timeout
+                    .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Failed, Reason::Timeout)
+            }
+            TunnelEnd::Io => {
+                self.telemetry.connect_error.fetch_add(1, Ordering::Relaxed);
+                (Outcome::Failed, Reason::Error)
+            }
+            TunnelEnd::Cancelled => {
+                self.telemetry
+                    .connect_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Cancelled, Reason::Shutdown)
+            }
+        };
+        let mut record = LogRecord::new(Event::TunnelFinished);
+        record.outcome = Some(outcome);
+        record.reason = Some(reason);
+        record.generation = Some(self.generation);
+        record.connection_id = Some(self.connection_id);
+        record.tunnel_bytes = Some(
+            self.progress
+                .as_ref()
+                .map(|progress| progress.total_bytes())
+                .unwrap_or(0),
+        );
+        self.logger.log(record);
+    }
+}
+
+impl Drop for TunnelGauge {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(&TunnelEnd::Cancelled);
+        }
+    }
 }
 
 /// How a tunnel session ended.
@@ -34,6 +132,8 @@ pub(crate) enum TunnelEnd {
     HalfCloseTimeout,
     /// A socket read/write failed or was reset.
     Io,
+    /// The service was forced down before the tunnel could reach a normal end.
+    Cancelled,
 }
 
 pub(crate) async fn run(
@@ -109,7 +209,7 @@ where
             writer.shutdown().await?;
             return Ok(());
         }
-        progress.hit();
+        progress.add_bytes(read as u64);
         write_all_progress(&mut writer, &buffer[..read], &progress).await?;
     }
 }
@@ -174,6 +274,7 @@ async fn wait_drain(state: Arc<CopyState>, half_close_timeout: Duration) {
 #[doc(hidden)]
 pub struct TunnelProgress {
     sequence: AtomicU64,
+    bytes: AtomicU64,
     notify: Notify,
 }
 
@@ -183,6 +284,7 @@ impl TunnelProgress {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sequence: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
             notify: Notify::new(),
         })
     }
@@ -190,6 +292,16 @@ impl TunnelProgress {
     pub(crate) fn hit(&self) {
         self.sequence.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
+    }
+
+    pub(crate) fn add_bytes(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.hit();
+    }
+
+    /// Observed plaintext bytes across both directions.
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
     }
 }
 

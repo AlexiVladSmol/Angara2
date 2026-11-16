@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,11 +21,13 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, Transport};
 use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
-use crate::http::forward::{ClientInfo, Proxy};
+use crate::http::forward::{ClientInfo, ExchangeMeta, Proxy};
 use crate::http::headers;
 use crate::http::idle::IdleState;
 use crate::http::interim::{InterimHub, SplitIo, TransportProgress, writer_loop};
-use crate::http::{ConnectionOutput, ExchangeBody, ResponseBody};
+use crate::http::{BodyCompletion, BodyOutcome, ConnectionOutput, ExchangeBody, ResponseBody};
+use crate::limits::{CapController, CapPermit};
+use crate::logging::{Event, LogRecord, MetricsSummary};
 use crate::policy;
 use crate::tls::TLS_APP_BUFFER_BYTES;
 use http_body_util::BodyExt;
@@ -54,23 +56,122 @@ impl std::error::Error for ServerError {}
 /// A running HTTP server with all listeners bound.
 pub struct HttpServer {
     addresses: Vec<(String, SocketAddr)>,
+    shutdown: ShutdownHandle,
+    control: std::sync::Arc<crate::control::ControlState>,
+    _proxy: Arc<Proxy>,
+}
+
+/// Cloneable bounded shutdown coordinator shared by CLI signals and control.
+#[derive(Clone)]
+pub struct ShutdownHandle {
     drain: watch::Sender<bool>,
     force: watch::Sender<bool>,
     tasks: TaskTracker,
-    shutdown_timeout: Duration,
-    _proxy: Arc<Proxy>,
+    proxy: Arc<Proxy>,
+    lifecycle: Arc<AtomicU8>,
+    state: Arc<ShutdownState>,
+}
+
+struct ShutdownState {
+    started: AtomicBool,
+    done_tx: watch::Sender<bool>,
+    done_rx: watch::Receiver<bool>,
+}
+
+impl ShutdownHandle {
+    /// Starts the one absolute drain/force deadline. The coordinator is a
+    /// service-owned task, so aborting the caller does not cancel cleanup.
+    /// Repeated calls wait for the same coordinator; the first deadline wins.
+    pub async fn begin(&self, deadline: std::time::Instant) -> bool {
+        if crate::control::Lifecycle::load(&self.lifecycle) == crate::control::Lifecycle::Stopped {
+            let _ = self.state.done_tx.send(true);
+            return false;
+        }
+
+        let leader = !self.state.started.swap(true, Ordering::AcqRel);
+        if leader {
+            let this = self.clone();
+            let deadline = tokio::time::Instant::from_std(deadline);
+            tokio::spawn(async move {
+                this.run(deadline).await;
+            });
+        }
+
+        let mut done = self.state.done_rx.clone();
+        while !*done.borrow() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+        leader
+    }
+
+    async fn run(self, deadline: tokio::time::Instant) {
+        self.proxy.begin_shutdown();
+        self.proxy.clear_idle_origins();
+        let _ = self.drain.send(true);
+        if !self.tasks.wait_until(deadline).await {
+            self.proxy
+                .telemetry()
+                .forced_shutdowns
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = self.force.send(true);
+            self.tasks.abort_all();
+            self.tasks.reap_after_abort().await;
+        }
+        let _ = self.proxy.shutdown_origins().await;
+        crate::control::Lifecycle::Stopped.store(&self.lifecycle);
+        let _ = self.state.done_tx.send(true);
+    }
+
+    /// Best-effort immediate cancellation for Drop.
+    pub fn force_now(&self) {
+        let _ = self.force.send(true);
+        self.tasks.abort_all();
+        crate::control::Lifecycle::Stopped.store(&self.lifecycle);
+        let _ = self.state.done_tx.send(true);
+    }
+
+    /// Current configured shutdown budget. Reload can change this before the
+    /// first shutdown begins; an already-started coordinator keeps its
+    /// original absolute deadline.
+    pub fn timeout(&self) -> Duration {
+        self.proxy
+            .snapshots()
+            .load()
+            .config()
+            .limits()
+            .shutdown_timeout()
+    }
 }
 
 impl HttpServer {
     /// Binds every configured listener before accepting any connection.
     pub async fn bind(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, false, None, None).await
+        Self::bind_inner(config, false, None, None, None).await
+    }
+
+    /// Binds from a real config path and enables typed reload operations.
+    pub async fn bind_with_path(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, false, None, None, Some(config_path)).await
     }
 
     /// Test/library API that binds configured listeners with ephemeral ports.
     #[doc(hidden)]
     pub async fn bind_ephemeral(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, None).await
+        Self::bind_inner(config, true, None, None, None).await
+    }
+
+    /// Ephemeral bind with a config path for reload tests.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_path(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, true, None, None, Some(config_path)).await
     }
 
     /// Test/library API with an injected resolver and dialer.
@@ -80,7 +181,7 @@ impl HttpServer {
         resolver: Arc<dyn crate::resolver::Resolver>,
         dialer: Arc<dyn crate::transport::Dialer>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, Some((resolver, dialer)), None).await
+        Self::bind_inner(config, true, Some((resolver, dialer)), None, None).await
     }
 
     /// Test/library API with an injected password verifier.
@@ -89,7 +190,7 @@ impl HttpServer {
         config: Arc<Config>,
         verifier: Arc<dyn crate::auth::PasswordVerifier>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, Some(verifier)).await
+        Self::bind_inner(config, true, None, Some(verifier), None).await
     }
 
     /// Test/library API with injected components and a password verifier.
@@ -100,7 +201,17 @@ impl HttpServer {
         dialer: Arc<dyn crate::transport::Dialer>,
         verifier: Arc<dyn crate::auth::PasswordVerifier>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, Some((resolver, dialer)), Some(verifier)).await
+        Self::bind_inner(config, true, Some((resolver, dialer)), Some(verifier), None).await
+    }
+
+    /// Test/library API with a startup config path and injected verifier.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_path_and_verifier(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+        verifier: Arc<dyn crate::auth::PasswordVerifier>,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, true, None, Some(verifier), Some(config_path)).await
     }
 
     async fn bind_inner(
@@ -111,6 +222,7 @@ impl HttpServer {
             Arc<dyn crate::transport::Dialer>,
         )>,
         verifier: Option<Arc<dyn crate::auth::PasswordVerifier>>,
+        config_path: Option<std::path::PathBuf>,
     ) -> Result<Self, ServerError> {
         let mut listeners = Vec::new();
         let mut addresses = Vec::new();
@@ -148,9 +260,7 @@ impl HttpServer {
             (None, Some(verifier)) => Proxy::with_verifier(Arc::clone(&config), verifier),
             (None, None) => Proxy::new(Arc::clone(&config)),
         };
-        let permits = Arc::new(Semaphore::new(
-            config.limits().max_client_connections() as usize
-        ));
+        let permits = proxy.client_caps();
         let handshake_permits = Arc::new(Semaphore::new(config.tls().max_handshaking()));
         let handshake_timeout = config.tls().handshake_timeout();
         let (drain, drain_rx) = watch::channel(false);
@@ -162,6 +272,14 @@ impl HttpServer {
             drain_rx.clone(),
             force_rx.clone(),
         ));
+        if config.observability().metrics_enabled() {
+            tasks.spawn(metrics_loop(
+                Arc::clone(&proxy),
+                config.observability().metrics_interval(),
+                drain_rx.clone(),
+                force_rx.clone(),
+            ));
+        }
 
         for (id, listener, tls) in listeners {
             let proxy = Arc::clone(&proxy);
@@ -189,14 +307,54 @@ impl HttpServer {
             });
         }
 
-        Ok(Self {
-            addresses,
+        let lifecycle = Arc::new(AtomicU8::new(0));
+        let (done_tx, done_rx) = watch::channel(false);
+        let shutdown = ShutdownHandle {
             drain,
             force,
             tasks,
-            shutdown_timeout: config.limits().shutdown_timeout(),
+            proxy: Arc::clone(&proxy),
+            lifecycle: Arc::clone(&lifecycle),
+            state: Arc::new(ShutdownState {
+                started: AtomicBool::new(false),
+                done_tx,
+                done_rx,
+            }),
+        };
+        let control = crate::control::ControlState::new(
+            proxy.snapshots(),
+            proxy.telemetry(),
+            Arc::downgrade(&proxy),
+            shutdown.clone(),
+            config_path,
+            lifecycle,
+        );
+        Ok(Self {
+            addresses,
+            shutdown,
+            control,
             _proxy: proxy,
         })
+    }
+
+    /// Typed in-process control handle.
+    pub fn control(&self) -> Arc<crate::control::ControlState> {
+        Arc::clone(&self.control)
+    }
+
+    /// Shared bounded shutdown coordinator.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
+    }
+
+    /// Shared telemetry counters.
+    pub fn telemetry(&self) -> Arc<crate::telemetry::Telemetry> {
+        self._proxy.telemetry()
+    }
+
+    /// Installs the caller-owned logger sink.
+    pub fn set_logger(&self, logger: crate::logging::Logger) {
+        self._proxy.set_logger(logger);
     }
 
     /// Actual listener IDs and local addresses after all binds succeeded.
@@ -213,7 +371,7 @@ impl HttpServer {
     /// Stops accepting, drains active work up to the configured deadline, then
     /// forces remaining tracked tasks closed.
     pub async fn shutdown(self) {
-        let deadline = std::time::Instant::now() + self.shutdown_timeout;
+        let deadline = std::time::Instant::now() + self.shutdown.timeout();
         self.shutdown_until(deadline).await;
     }
 
@@ -223,15 +381,9 @@ impl HttpServer {
     /// full window after it has elapsed.
     #[doc(hidden)]
     pub async fn shutdown_until(self, deadline: std::time::Instant) {
-        let deadline = tokio::time::Instant::from_std(deadline);
-        self._proxy.begin_shutdown();
-        let _ = self.drain.send(true);
-        if !self.tasks.wait_until(deadline).await {
-            let _ = self.force.send(true);
-            self.tasks.abort_all();
-            self.tasks.reap_after_abort().await;
-        }
-        let _ = self._proxy.shutdown_origins().await;
+        self.control
+            .begin_shutdown(crate::control::ShutdownReason::Server);
+        self.shutdown.begin(deadline).await;
     }
 }
 
@@ -240,8 +392,167 @@ impl Drop for HttpServer {
         // Dropping a running server must not leave detached accept loops and
         // open listener sockets behind. Explicit `shutdown` remains the
         // graceful path; this is the bounded last-resort path.
-        let _ = self.force.send(true);
-        self.tasks.abort_all();
+        self.shutdown.force_now();
+    }
+}
+
+/// Completes the final bridge/socket writer after the relay has ended. A relay
+/// `Complete` is only successful when that writer also drains within the
+/// existing first-EOF deadline.
+async fn finalize_tunnel<W>(
+    mut end: TunnelEnd,
+    writer: &mut W,
+    writer_done: bool,
+    idle_timeout: Duration,
+) -> (TunnelEnd, bool)
+where
+    W: Future<Output = std::io::Result<()>> + Unpin,
+{
+    if let TunnelEnd::Complete { drain_deadline } = &end
+        && !writer_done
+    {
+        let drain = match drain_deadline {
+            Some(deadline) => tokio::time::timeout_at(*deadline, writer).await,
+            None => tokio::time::timeout(idle_timeout, writer).await,
+        };
+        match drain {
+            Ok(Ok(())) => return (end, true),
+            Ok(Err(_)) => end = TunnelEnd::Io,
+            Err(_) => end = TunnelEnd::HalfCloseTimeout,
+        }
+    }
+    (end, writer_done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn relay_complete_waits_for_pending_writer_deadline() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+        };
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
+        assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_succeeds_after_writer_drain() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        };
+        let mut writer = Box::pin(async { Ok(()) });
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::Complete { .. }));
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_writer_io_is_failure() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        };
+        let mut writer = Box::pin(async { Err(std::io::Error::other("synthetic writer failure")) });
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_gauge_stays_active_until_writer_timeout() {
+        use crate::http::connect::TunnelGauge;
+        use crate::logging::Logger;
+        use crate::telemetry::Telemetry;
+
+        let telemetry = Telemetry::with_detailed(false);
+        let (logger, receiver) =
+            Logger::channel(8, crate::config::LogLevel::Info, Arc::clone(&telemetry));
+        let mut gauge = TunnelGauge::new(Arc::clone(&telemetry), logger, 3, 7);
+        assert_eq!(telemetry.snapshot().connect_active, 1);
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+        };
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
+        assert!(!done);
+        assert_eq!(telemetry.snapshot().connect_active, 1);
+        gauge.finish(&final_end);
+        let metrics = telemetry.snapshot();
+        assert_eq!(metrics.connect_active, 0);
+        assert_eq!(metrics.connect_finished, 1);
+        assert_eq!(metrics.connect_timeout, 1);
+        assert_eq!(metrics.connect_complete, 0);
+        let record = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tunnel record");
+        let value: serde_json::Value = serde_json::from_str(&record).expect("JSON");
+        assert_eq!(value["event"], "tunnel_finished");
+        assert_eq!(value["outcome"], "failed");
+        assert_eq!(value["reason"], "timeout");
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+struct ClientGauge(Arc<crate::telemetry::Telemetry>);
+
+impl ClientGauge {
+    fn new(telemetry: Arc<crate::telemetry::Telemetry>) -> Self {
+        telemetry.client_active.fetch_add(1, Ordering::AcqRel);
+        Self(telemetry)
+    }
+}
+
+impl Drop for ClientGauge {
+    fn drop(&mut self) {
+        self.0.client_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn metrics_loop(
+    proxy: Arc<Proxy>,
+    interval: Duration,
+    mut drain: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
+) {
+    let period = interval.max(Duration::from_millis(100));
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = drain.changed() => break,
+            _ = force.changed() => break,
+            _ = ticker.tick() => {
+                let telemetry = proxy.telemetry();
+                let root = proxy.snapshots().load();
+                let live_generations = u64::try_from(proxy.snapshots().live_generations())
+                    .unwrap_or(u64::MAX);
+                telemetry
+                    .live_generations
+                    .store(live_generations, Ordering::Relaxed);
+                let snapshot = telemetry.snapshot();
+                let mut record = LogRecord::new(Event::MetricsSummary);
+                record.generation = Some(root.generation());
+                record.metrics = Some(MetricsSummary {
+                    tcp_accepted: snapshot.tcp_accepted,
+                    client_active: snapshot.client_active,
+                    http_completed: snapshot.http_completed,
+                    connect_active: snapshot.connect_active,
+                    generation: root.generation(),
+                    live_generations,
+                    log_dropped: snapshot.log_dropped,
+                });
+                proxy.logger().log(record);
+            }
+        }
     }
 }
 
@@ -286,7 +597,7 @@ async fn accept_loop(
     listener: TcpListener,
     listener_id: String,
     proxy: Arc<Proxy>,
-    permits: Arc<Semaphore>,
+    permits: Arc<CapController>,
     handshake_permits: Arc<Semaphore>,
     tls: Option<TlsAcceptor>,
     handshake_timeout: Duration,
@@ -304,7 +615,15 @@ async fn accept_loop(
                 match accepted {
                     Ok((stream, peer)) => {
                         let accepted_at = tokio::time::Instant::now();
-                        let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        proxy
+                            .telemetry()
+                            .tcp_accepted
+                            .fetch_add(1, Ordering::Relaxed);
+                        let Some(permit) = permits.try_acquire() else {
+                            proxy
+                                .telemetry()
+                                .tcp_rejected
+                                .fetch_add(1, Ordering::Relaxed);
                             drop(stream);
                             continue;
                         };
@@ -315,7 +634,9 @@ async fn accept_loop(
                         let drain = drain.clone();
                         let handshake_permits = Arc::clone(&handshake_permits);
                         let tls = tls.clone();
+                        let telemetry = proxy.telemetry();
                         tasks.spawn(async move {
+                            let _gauge = ClientGauge::new(telemetry);
                             if let Some(acceptor) = tls {
                                 serve_tls_client(
                                     stream,
@@ -356,7 +677,7 @@ async fn serve_tls_client(
     peer: SocketAddr,
     listener_id: String,
     proxy: Arc<Proxy>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: CapPermit,
     acceptor: TlsAcceptor,
     accepted_at: tokio::time::Instant,
     handshake_permits: Arc<Semaphore>,
@@ -365,15 +686,19 @@ async fn serve_tls_client(
     mut drain: watch::Receiver<bool>,
     mut force: watch::Receiver<bool>,
 ) {
-    if policy::check_source(config.access(), peer.ip()).is_err() {
+    if policy::check_source(proxy.snapshots().load().config().access(), peer.ip()).is_err() {
         return;
     }
     let Ok(handshake_permit) = handshake_permits.try_acquire_owned() else {
+        proxy.telemetry().tls_busy.fetch_add(1, Ordering::Relaxed);
         return;
     };
     if *drain.borrow() || *force.borrow() {
         return;
     }
+    let telemetry = proxy.telemetry();
+    let handshake_started = tokio::time::Instant::now();
+    telemetry.tls_active.fetch_add(1, Ordering::AcqRel);
     let idle_timeout = config.limits().idle_timeout();
     let idle_state = Arc::new(Mutex::new(IdleState::new(idle_timeout)));
     let tunnel_progress = TunnelProgress::new();
@@ -388,9 +713,18 @@ async fn serve_tls_client(
         }
     };
     drop(handshake_permit);
+    telemetry.tls_active.fetch_sub(1, Ordering::AcqRel);
+    let timed_out = handshake_started.elapsed() >= handshake_timeout;
     let Some(mut stream) = accepted else {
+        if timed_out {
+            telemetry.tls_timeout.fetch_add(1, Ordering::Relaxed);
+        } else {
+            telemetry.tls_error.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     };
+    telemetry.tls_success.fetch_add(1, Ordering::Relaxed);
+    telemetry.observe_handshake(handshake_started.elapsed());
     stream
         .get_mut()
         .1
@@ -416,7 +750,7 @@ async fn serve_client<S>(
     peer: SocketAddr,
     listener_id: String,
     proxy: Arc<Proxy>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: CapPermit,
     config: Arc<Config>,
     observer: Option<Arc<TransportProgress>>,
     mut drain: watch::Receiver<bool>,
@@ -443,9 +777,12 @@ async fn serve_client<S>(
         Arc::clone(&tunnel_mode),
     );
     let (hub, interim_receiver) = InterimHub::new();
+    let connection_id = proxy.next_connection_id();
     let client = ClientInfo {
         peer: peer.ip(),
         listener_id,
+        connection_id,
+        request_id: 0,
     };
     let service_hub = hub.clone();
     let exchange_gate = Arc::new(Semaphore::new(1));
@@ -466,15 +803,36 @@ async fn serve_client<S>(
                     true,
                 ));
             };
+            let mut request_client = client.clone();
+            request_client.request_id = proxy.next_request_id();
+            let exchange_started = tokio::time::Instant::now();
             let (response, setup) = if request.method() == http::Method::CONNECT {
                 let on_upgrade = hyper::upgrade::on(&mut request);
-                match proxy.handle_connect(request, client, on_upgrade).await {
-                    Ok((response, setup)) => (response, Some(setup)),
-                    Err(response) => (response, None),
+                let connect_snapshot = proxy.snapshots().load();
+                let mut connect_terminal = proxy.connect_terminal(
+                    &request_client,
+                    connect_snapshot.generation(),
+                    exchange_started,
+                );
+                match proxy
+                    .handle_connect(request, request_client, on_upgrade, &connect_snapshot)
+                    .await
+                {
+                    Ok((response, setup)) => {
+                        // Ownership passes to the tunnel gauge only after a
+                        // real 200 handoff.
+                        connect_terminal.disarm();
+                        (response, Some(setup))
+                    }
+                    Err(response) => {
+                        connect_terminal.reject(response.status());
+                        (response, None)
+                    }
                 }
             } else {
-                (proxy.handle(request, client, interim).await, None)
+                (proxy.handle(request, request_client, interim).await, None)
             };
+            let is_connect = setup.is_some();
             if let Some(setup) = setup {
                 let Ok(mut slot) = service_slot.lock() else {
                     return Ok::<_, Infallible>(headers::error_response(
@@ -491,7 +849,18 @@ async fn serve_client<S>(
                 *slot = Some(setup);
             }
             let (parts, body) = response.into_parts();
-            let body: ResponseBody = ExchangeBody::new(body, permit, service_output).boxed();
+            let completion: Option<BodyCompletion> = if is_connect {
+                None
+            } else {
+                parts.extensions.get::<ExchangeMeta>().cloned().map(|meta| {
+                    let proxy = Arc::clone(&proxy);
+                    Box::new(move |outcome: BodyOutcome, bytes: u64| {
+                        proxy.log_exchange(meta, outcome, bytes);
+                    }) as BodyCompletion
+                })
+            };
+            let body: ResponseBody =
+                ExchangeBody::new(body, permit, service_output, completion).boxed();
             Ok::<_, Infallible>(http::Response::from_parts(parts, body))
         }
     });
@@ -548,7 +917,11 @@ async fn serve_client<S>(
                         on_upgrade,
                         origin,
                         deadline,
+                        idle_timeout,
+                        half_close_timeout,
+                        mut gauge,
                     } = setup;
+                    gauge.attach_progress(Arc::clone(&tunnel_progress));
                     let upgraded = tokio::select! {
                         biased;
                         _ = force.changed() => None,
@@ -557,6 +930,8 @@ async fn serve_client<S>(
                         }
                     };
                     let Some(upgraded) = upgraded else {
+                        // The gauge's Drop records the cancelled tunnel.
+                        drop(gauge);
                         drop(writer);
                         output.close();
                         return;
@@ -565,17 +940,19 @@ async fn serve_client<S>(
                         TokioIo::new(upgraded),
                         origin,
                         idle_timeout,
-                        config.connect().half_close_timeout(),
+                        half_close_timeout,
                         Arc::clone(&tunnel_progress),
                     ));
                     let mut writer_done = false;
-                    let outcome = loop {
+                    let mut writer_error = false;
+                    let relay = loop {
                         tokio::select! {
                             biased;
                             _ = force.changed() => break None,
                             result = &mut writer, if !writer_done => {
                                 writer_done = true;
                                 if result.is_err() {
+                                    writer_error = true;
                                     break None;
                                 }
                             }
@@ -583,15 +960,17 @@ async fn serve_client<S>(
                         }
                     };
                     drop(tunnel);
-                    match outcome {
-                        Some(TunnelEnd::Complete { drain_deadline }) if !writer_done => {
-                            if let Some(deadline) = drain_deadline {
-                                let _ = tokio::time::timeout_at(deadline, &mut writer).await;
-                            }
-                            drop(writer);
-                        }
-                        _ => drop(writer),
-                    }
+                    let relay_end = match relay {
+                        Some(end) => end,
+                        None if writer_error => TunnelEnd::Io,
+                        None => TunnelEnd::Cancelled,
+                    };
+                    let (final_end, _) =
+                        finalize_tunnel(relay_end, &mut writer, writer_done, idle_timeout)
+                            .await;
+                    gauge.finish(&final_end);
+                    drop(gauge);
+                    drop(writer);
                     output.close();
                     return;
                 }

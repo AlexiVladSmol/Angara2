@@ -7,8 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,6 +107,17 @@ const DEFAULT_TLS_MAX_HANDSHAKING: i64 = 32;
 const MIN_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 100;
 const MAX_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 60_000;
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: i64 = 5_000;
+const MIN_RELOAD_TIMEOUT_MS: i64 = 100;
+const MAX_RELOAD_TIMEOUT_MS: i64 = 60_000;
+const DEFAULT_RELOAD_TIMEOUT_MS: i64 = 5_000;
+const MIN_LOG_QUEUE_CAPACITY: i64 = 64;
+const MAX_LOG_QUEUE_CAPACITY: i64 = 8_192;
+const DEFAULT_LOG_QUEUE_CAPACITY: i64 = 1_024;
+const MIN_METRICS_INTERVAL_MS: i64 = 1_000;
+const MAX_METRICS_INTERVAL_MS: i64 = 600_000;
+const DEFAULT_METRICS_INTERVAL_MS: i64 = 30_000;
+/// Maximum size of the main TOML document.
+pub const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
 const MAX_UNKNOWN_FIELD_CHARS: usize = 80;
@@ -132,6 +142,8 @@ pub struct Config {
     routing: RoutingConfig,
     auth: Option<AuthConfig>,
     tls: TlsConfig,
+    operations: OperationsConfig,
+    observability: ObservabilityConfig,
     prepared_tls: HashMap<String, Arc<PreparedTls>>,
 }
 
@@ -154,15 +166,53 @@ impl Config {
     /// A relative `[auth].users_file` is resolved against the directory that
     /// contains this configuration file, not the process working directory.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let bytes = read_config_bytes(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
+        })?;
+        let input = String::from_utf8(bytes).map_err(|_| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "configuration is not UTF-8"),
         })?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
         Self::parse_inner(&input, Some(base_dir))
     }
 
+    /// Loads a reload candidate, reusing prepared TLS state from `previous`.
+    ///
+    /// TLS certificate/key files are never opened here. A listener or static
+    /// TLS change is rejected as restart-required before any file is read.
+    pub fn load_for_reload(path: &Path, previous: &Self) -> Result<Self, ConfigError> {
+        let bytes = read_config_bytes(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let input = String::from_utf8(bytes).map_err(|_| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "configuration is not UTF-8"),
+        })?;
+        let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let deserializer = toml::de::Deserializer::parse(&input)
+            .map_err(|error| ConfigError::from_toml(&input, None, error))?;
+        let raw: RawConfig = serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            let path = error.path().to_string();
+            let path = (path != ".").then_some(path);
+            ConfigError::from_toml(&input, path, error.into_inner())
+        })?;
+        let config = validate_with(raw, Some(base_dir), Some(previous))?;
+        if let Some(path) = config.static_mismatch(previous) {
+            return Err(ConfigError::RestartRequired {
+                path: path.to_owned(),
+                message: "restart-required field changed".to_owned(),
+            });
+        }
+        Ok(config)
+    }
+
     fn parse_inner(input: &str, base_dir: Option<&Path>) -> Result<Self, ConfigError> {
+        if input.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(validation("config", "configuration exceeds 1 MiB"));
+        }
         let deserializer = toml::de::Deserializer::parse(input)
             .map_err(|error| ConfigError::from_toml(input, None, error))?;
         let raw: RawConfig = serde_path_to_error::deserialize(deserializer).map_err(|error| {
@@ -171,6 +221,73 @@ impl Config {
             ConfigError::from_toml(input, path, error.into_inner())
         })?;
         validate(raw, base_dir)
+    }
+
+    /// Returns the first restart-required field that differs. Hot-only
+    /// fields (`access`, `routing`, users-file content, live caps and the
+    /// listed timeouts) are intentionally absent.
+    pub(crate) fn static_mismatch(&self, other: &Self) -> Option<&'static str> {
+        if self.schema_version != other.schema_version {
+            return Some("schema_version");
+        }
+        if self.runtime != other.runtime {
+            return Some("runtime");
+        }
+        if !same_listeners(&self.listeners, &other.listeners) {
+            return Some("listeners");
+        }
+        if self.tls != other.tls {
+            return Some("tls");
+        }
+        if self.dns != other.dns {
+            return Some("dns");
+        }
+        if !same_egress(&self.egress, &other.egress) {
+            return Some("egress");
+        }
+        if self.operations != other.operations {
+            return Some("operations");
+        }
+        if self.observability != other.observability {
+            return Some("observability");
+        }
+        if self.http.max_headers() != other.http.max_headers() {
+            return Some("http.max_headers");
+        }
+        if self.http.pool_max_idle() != other.http.pool_max_idle() {
+            return Some("http.pool_max_idle");
+        }
+        if self.http.pool_max_idle_per_key() != other.http.pool_max_idle_per_key() {
+            return Some("http.pool_max_idle_per_key");
+        }
+        if self.http.pool_idle_timeout() != other.http.pool_idle_timeout() {
+            return Some("http.pool_idle_timeout_ms");
+        }
+        if self.transport.max_connecting() != other.transport.max_connecting() {
+            return Some("transport.max_connecting");
+        }
+        if self.limits.max_header_bytes() != other.limits.max_header_bytes() {
+            return Some("limits.max_header_bytes");
+        }
+        if self.limits.header_read_timeout() != other.limits.header_read_timeout() {
+            return Some("limits.header_read_timeout_ms");
+        }
+        if self.limits.idle_timeout() != other.limits.idle_timeout() {
+            return Some("limits.idle_timeout_ms");
+        }
+        match (self.auth.as_ref(), other.auth.as_ref()) {
+            (None, None) => None,
+            (Some(left), Some(right)) => {
+                if left.max_verifying != right.max_verifying {
+                    Some("auth.max_verifying")
+                } else if left.verify_timeout != right.verify_timeout {
+                    Some("auth.verify_timeout_ms")
+                } else {
+                    None
+                }
+            }
+            _ => Some("auth"),
+        }
     }
 
     /// The validated schema version.
@@ -243,9 +360,39 @@ impl Config {
         &self.tls
     }
 
+    /// Reload/control limits.
+    pub fn operations(&self) -> &OperationsConfig {
+        &self.operations
+    }
+
+    /// Operational logging and metrics settings.
+    pub fn observability(&self) -> &ObservabilityConfig {
+        &self.observability
+    }
+
     pub(crate) fn prepared_tls(&self, listener_id: &str) -> Option<&Arc<PreparedTls>> {
         self.prepared_tls.get(listener_id)
     }
+}
+
+fn same_listeners(left: &[Listener], right: &[Listener]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|item| {
+            right
+                .iter()
+                .find(|candidate| candidate.id == item.id)
+                .is_some_and(|candidate| candidate == item)
+        })
+}
+
+fn same_egress(left: &[EgressProfile], right: &[EgressProfile]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|item| {
+            right
+                .iter()
+                .find(|candidate| candidate.id == item.id)
+                .is_some_and(|candidate| candidate == item)
+        })
 }
 
 /// Global TLS handshake limits shared by all HTTPS listeners.
@@ -267,10 +414,68 @@ impl TlsConfig {
     }
 }
 
+/// Reload/control timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationsConfig {
+    reload_timeout: Duration,
+}
+
+impl OperationsConfig {
+    /// Absolute preparation+publication deadline for one reload operation.
+    pub fn reload_timeout(&self) -> Duration {
+        self.reload_timeout
+    }
+}
+
+/// Logging and metrics policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityConfig {
+    log_level: LogLevel,
+    log_queue_capacity: usize,
+    metrics_enabled: bool,
+    metrics_interval: Duration,
+}
+
+impl ObservabilityConfig {
+    /// Configured log level.
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level
+    }
+
+    /// Maximum number of queued log records.
+    pub fn log_queue_capacity(&self) -> usize {
+        self.log_queue_capacity
+    }
+
+    /// Whether detailed metrics are collected and summarized.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
+    }
+
+    /// Periodic metrics summary interval.
+    pub fn metrics_interval(&self) -> Duration {
+        self.metrics_interval
+    }
+}
+
+/// Finite JSON log level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// No operational output worker.
+    Off,
+    /// Errors only.
+    Error,
+    /// Errors and warnings.
+    Warn,
+    /// All configured operational records.
+    Info,
+}
+
 /// Prepared authentication settings and immutable users snapshot.
 pub struct AuthConfig {
     max_verifying: usize,
     verify_timeout: Duration,
+    users_file: PathBuf,
     snapshot: std::sync::Arc<UsersSnapshot>,
 }
 
@@ -288,6 +493,11 @@ impl AuthConfig {
     pub(crate) fn snapshot(&self) -> &std::sync::Arc<UsersSnapshot> {
         &self.snapshot
     }
+
+    /// Resolved users file path used by this snapshot.
+    pub fn users_file(&self) -> &Path {
+        &self.users_file
+    }
 }
 
 impl fmt::Debug for AuthConfig {
@@ -296,13 +506,14 @@ impl fmt::Debug for AuthConfig {
             .debug_struct("AuthConfig")
             .field("max_verifying", &self.max_verifying)
             .field("verify_timeout", &self.verify_timeout)
+            .field("users_file", &self.users_file)
             .field("snapshot", &self.snapshot)
             .finish()
     }
 }
 
 /// Runtime section.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     worker_threads: WorkerThreads,
 }
@@ -355,7 +566,7 @@ impl fmt::Display for WorkerThreads {
 }
 
 /// Bounded resource limits.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Limits {
     max_connections: u32,
     max_client_connections: u32,
@@ -723,7 +934,7 @@ impl HttpConfig {
 }
 
 /// CONNECT tunnel policy.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ConnectConfig {
     allowed_ports: Vec<u16>,
     half_close_timeout: Duration,
@@ -849,6 +1060,13 @@ pub enum ConfigError {
         /// Description of the violated invariant.
         message: String,
     },
+    /// A valid change cannot be applied without restarting the process.
+    RestartRequired {
+        /// Dotted field path.
+        path: String,
+        /// Safe reason.
+        message: String,
+    },
 }
 
 impl ConfigError {
@@ -902,6 +1120,13 @@ impl fmt::Display for ConfigError {
                     "invalid configuration, field `{path}`: {message}"
                 )
             }
+            Self::RestartRequired { path, message } => {
+                let path = escape_control(path, MAX_DIAGNOSTIC_PATH_CHARS);
+                write!(
+                    formatter,
+                    "configuration requires restart, field `{path}`: {message}"
+                )
+            }
         }
     }
 }
@@ -910,7 +1135,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::Toml { .. } | Self::Validation { .. } => None,
+            Self::Toml { .. } | Self::Validation { .. } | Self::RestartRequired { .. } => None,
         }
     }
 }
@@ -1050,7 +1275,106 @@ fn is_future_feature_field(field: &str) -> bool {
     )
 }
 
+fn read_config_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    // Reject directories, devices and FIFOs before opening. O_NONBLOCK below
+    // protects the race where the path is replaced, but a device open can
+    // still have side effects.
+    let initial = std::fs::metadata(path)?;
+    if !initial.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration must be a regular file",
+        ));
+    }
+    if initial.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration exceeds 1 MiB",
+        ));
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration exceeds 1 MiB",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "configuration has unsafe permissions",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if metadata.uid() != 0 {
+            let effective = effective_uid().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot determine effective UID for configuration owner check",
+                )
+            })?;
+            if metadata.uid() != effective {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "configuration owner must be the service UID or root",
+                ));
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    let read = file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if read as u64 > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration exceeds 1 MiB",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _real = fields.next()?;
+        return fields.next()?.parse().ok();
+    }
+    None
+}
+
 fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigError> {
+    validate_with(raw, base_dir, None)
+}
+
+fn validate_with(
+    raw: RawConfig,
+    base_dir: Option<&Path>,
+    previous: Option<&Config>,
+) -> Result<Config, ConfigError> {
     if raw.schema_version != i64::from(SCHEMA_VERSION) {
         return Err(validation(
             "schema_version",
@@ -1069,7 +1393,17 @@ fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigErr
 
     let limits = validate_limits(raw.limits)?;
     let tls = validate_tls(raw.tls)?;
-    let (listeners, prepared_tls) = validate_listeners(raw.listeners, base_dir)?;
+    if let Some(previous) = previous
+        && previous.tls != tls
+    {
+        return Err(ConfigError::RestartRequired {
+            path: "tls".to_owned(),
+            message: "TLS admission settings changed".to_owned(),
+        });
+    }
+    let operations = validate_operations(raw.operations)?;
+    let observability = validate_observability(raw.observability)?;
+    let (listeners, prepared_tls) = validate_listeners(raw.listeners, base_dir, previous)?;
     let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
     let auth = validate_auth(raw.auth, base_dir)?;
     for (index, listener) in listeners.iter().enumerate() {
@@ -1114,6 +1448,8 @@ fn validate(raw: RawConfig, base_dir: Option<&Path>) -> Result<Config, ConfigErr
         routing,
         auth,
         tls,
+        operations,
+        observability,
         prepared_tls,
     })
 }
@@ -1162,6 +1498,7 @@ fn validate_auth(
     Ok(Some(AuthConfig {
         max_verifying: max_verifying as usize,
         verify_timeout: Duration::from_millis(verify_timeout_ms as u64),
+        users_file: resolved,
         snapshot: std::sync::Arc::new(snapshot),
     }))
 }
@@ -1923,9 +2260,62 @@ fn validate_tls(raw: Option<RawTls>) -> Result<TlsConfig, ConfigError> {
     })
 }
 
+fn validate_operations(raw: Option<RawOperations>) -> Result<OperationsConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let reload_timeout_ms = bounded_optional(
+        "operations.reload_timeout_ms",
+        raw.reload_timeout_ms,
+        MIN_RELOAD_TIMEOUT_MS,
+        MAX_RELOAD_TIMEOUT_MS,
+        DEFAULT_RELOAD_TIMEOUT_MS,
+    )?;
+    Ok(OperationsConfig {
+        reload_timeout: Duration::from_millis(reload_timeout_ms as u64),
+    })
+}
+
+fn validate_observability(
+    raw: Option<RawObservability>,
+) -> Result<ObservabilityConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let log_level = match raw.log_level.as_deref() {
+        None | Some("info") => LogLevel::Info,
+        Some("off") => LogLevel::Off,
+        Some("error") => LogLevel::Error,
+        Some("warn") => LogLevel::Warn,
+        Some(_) => {
+            return Err(validation(
+                "observability.log_level",
+                "must be `off`, `error`, `warn` or `info`",
+            ));
+        }
+    };
+    let log_queue_capacity = bounded_optional(
+        "observability.log_queue_capacity",
+        raw.log_queue_capacity,
+        MIN_LOG_QUEUE_CAPACITY,
+        MAX_LOG_QUEUE_CAPACITY,
+        DEFAULT_LOG_QUEUE_CAPACITY,
+    )?;
+    let metrics_interval_ms = bounded_optional(
+        "observability.metrics_interval_ms",
+        raw.metrics_interval_ms,
+        MIN_METRICS_INTERVAL_MS,
+        MAX_METRICS_INTERVAL_MS,
+        DEFAULT_METRICS_INTERVAL_MS,
+    )?;
+    Ok(ObservabilityConfig {
+        log_level,
+        log_queue_capacity: log_queue_capacity as usize,
+        metrics_enabled: raw.metrics_enabled.unwrap_or(true),
+        metrics_interval: Duration::from_millis(metrics_interval_ms as u64),
+    })
+}
+
 fn validate_listeners(
     raw: Vec<RawListener>,
     base_dir: Option<&Path>,
+    previous: Option<&Config>,
 ) -> Result<(Vec<Listener>, PreparedTlsMap), ConfigError> {
     if raw.is_empty() {
         return Err(validation("listeners", "at least one listener is required"));
@@ -1984,18 +2374,52 @@ fn validate_listeners(
                 };
                 let cert_chain_file = resolve_path(base_dir, &tls.cert_chain_file);
                 let private_key_file = resolve_path(base_dir, &tls.private_key_file);
-                let prepared =
-                    prepare_listener(&cert_chain_file, &private_key_file).map_err(|error| {
+                let listener_tls = TlsListenerConfig {
+                    cert_chain_file,
+                    private_key_file,
+                };
+                if let Some(previous) = previous {
+                    let previous_listener = previous.listener(&listener.id).ok_or_else(|| {
+                        ConfigError::RestartRequired {
+                            path: format!("listeners[{index}].id"),
+                            message: "adding an HTTPS listener requires restart".to_owned(),
+                        }
+                    })?;
+                    if previous_listener.transport() != Transport::Https
+                        || previous_listener.bind() != listener.bind.0
+                        || previous_listener.auth() != auth
+                        || previous_listener.allow_insecure_basic() != listener.allow_insecure_basic
+                        || previous_listener.tls() != Some(&listener_tls)
+                    {
+                        return Err(ConfigError::RestartRequired {
+                            path: format!("listeners[{index}]"),
+                            message: "listener or TLS path changed".to_owned(),
+                        });
+                    }
+                    let prepared =
+                        previous
+                            .prepared_tls(&listener.id)
+                            .cloned()
+                            .ok_or_else(|| ConfigError::RestartRequired {
+                                path: format!("listeners[{index}].tls"),
+                                message: "prepared TLS state is unavailable".to_owned(),
+                            })?;
+                    prepared_tls.insert(listener.id.clone(), prepared);
+                    Some(listener_tls)
+                } else {
+                    let prepared = prepare_listener(
+                        &listener_tls.cert_chain_file,
+                        &listener_tls.private_key_file,
+                    )
+                    .map_err(|error| {
                         validation(
                             format!("listeners[{index}].tls.{}", error.field()),
                             error.to_string(),
                         )
                     })?;
-                prepared_tls.insert(listener.id.clone(), Arc::new(prepared));
-                Some(TlsListenerConfig {
-                    cert_chain_file,
-                    private_key_file,
-                })
+                    prepared_tls.insert(listener.id.clone(), Arc::new(prepared));
+                    Some(listener_tls)
+                }
             }
         };
         listeners.push(Listener {
@@ -2112,6 +2536,10 @@ struct RawConfig {
     auth: Option<RawAuth>,
     #[serde(default)]
     tls: Option<RawTls>,
+    #[serde(default)]
+    operations: Option<RawOperations>,
+    #[serde(default)]
+    observability: Option<RawObservability>,
 }
 
 #[derive(Deserialize)]
@@ -2153,6 +2581,26 @@ struct RawTls {
     max_handshaking: Option<i64>,
     #[serde(default)]
     handshake_timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawOperations {
+    #[serde(default)]
+    reload_timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawObservability {
+    #[serde(default)]
+    log_level: Option<String>,
+    #[serde(default)]
+    log_queue_capacity: Option<i64>,
+    #[serde(default)]
+    metrics_enabled: Option<bool>,
+    #[serde(default)]
+    metrics_interval_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]

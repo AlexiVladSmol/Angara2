@@ -126,6 +126,20 @@ impl fmt::Debug for UsersSnapshot {
 }
 
 impl UsersSnapshot {
+    /// Compares the effective username/PHC/disabled records without exposing
+    /// them. Snapshot IDs and dummy entries are intentionally ignored.
+    pub fn same_records(&self, other: &Self) -> bool {
+        if self.users.len() != other.users.len() {
+            return false;
+        }
+        self.users.iter().all(|(username, left)| {
+            other.users.get(username).is_some_and(|right| {
+                left.disabled == right.disabled
+                    && left.password_hash.as_str() == right.password_hash.as_str()
+            })
+        })
+    }
+
     /// Loads and fully validates one users file.
     pub(crate) fn load(path: &Path) -> Result<Self, UsersFileError> {
         let bytes = read_bounded_file(path)?;
@@ -646,6 +660,7 @@ pub struct AuthService {
     permits: Arc<Semaphore>,
     verify_timeout: Duration,
     verifier: Arc<dyn PasswordVerifier>,
+    telemetry: Option<Arc<crate::telemetry::Telemetry>>,
 }
 
 impl fmt::Debug for AuthService {
@@ -661,7 +676,7 @@ impl fmt::Debug for AuthService {
 impl AuthService {
     /// Builds the production service from a prepared configuration.
     pub fn from_config(config: &crate::config::Config) -> Option<Self> {
-        Self::from_config_with_verifier(config, Arc::new(Argon2Verifier))
+        Self::from_config_with_verifier_and_telemetry(config, Arc::new(Argon2Verifier), None)
     }
 
     /// Builds a service with an injected verifier for deterministic tests.
@@ -670,11 +685,33 @@ impl AuthService {
         config: &crate::config::Config,
         verifier: Arc<dyn PasswordVerifier>,
     ) -> Option<Self> {
+        Self::from_config_with_verifier_and_telemetry(config, verifier, None)
+    }
+
+    /// Builds the production proxy auth service with shared telemetry.
+    pub fn from_config_with_telemetry(
+        config: &crate::config::Config,
+        telemetry: Arc<crate::telemetry::Telemetry>,
+    ) -> Option<Self> {
+        Self::from_config_with_verifier_and_telemetry(
+            config,
+            Arc::new(Argon2Verifier),
+            Some(telemetry),
+        )
+    }
+
+    /// Builds a service with an injected verifier and optional telemetry.
+    pub fn from_config_with_verifier_and_telemetry(
+        config: &crate::config::Config,
+        verifier: Arc<dyn PasswordVerifier>,
+        telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    ) -> Option<Self> {
         config.auth().map(|auth| Self {
             snapshot: Arc::clone(auth.snapshot()),
             permits: Arc::new(Semaphore::new(auth.max_verifying())),
             verify_timeout: auth.verify_timeout(),
             verifier,
+            telemetry,
         })
     }
 
@@ -689,32 +726,50 @@ impl AuthService {
         &self,
         headers: &HeaderMap,
     ) -> Result<VerifiedIdentity, AuthError> {
-        let credentials = parse_basic_credentials(headers)?;
-        self.authenticate(credentials).await
+        self.authenticate_headers_with_snapshot(headers, &self.snapshot)
+            .await
     }
 
-    async fn authenticate(
+    /// Verifies credentials against a snapshot supplied by the exchange.
+    pub async fn authenticate_headers_with_snapshot(
+        &self,
+        headers: &HeaderMap,
+        snapshot: &Arc<UsersSnapshot>,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        let credentials = parse_basic_credentials(headers)?;
+        self.authenticate_with_snapshot(credentials, snapshot).await
+    }
+
+    async fn authenticate_with_snapshot(
         &self,
         credentials: BasicCredentials,
+        snapshot: &Arc<UsersSnapshot>,
     ) -> Result<VerifiedIdentity, AuthError> {
-        let enabled = self.snapshot.enabled_user(&credentials.username);
+        let enabled = snapshot.enabled_user(&credentials.username);
         let is_real = enabled.is_some();
         let hash = match enabled {
             Some(record) => record.password_hash.clone(),
-            None => self.snapshot.dummy.clone(),
+            None => snapshot.dummy.clone(),
         };
         let username = credentials.username;
         let password = credentials.password;
         let verifier = Arc::clone(&self.verifier);
         let deadline = tokio::time::Instant::now() + self.verify_timeout;
 
-        let permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AuthError::Busy)?;
+        let permit = self.permits.clone().try_acquire_owned().map_err(|_| {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.auth_busy.fetch_add(1, Ordering::Relaxed);
+            }
+            AuthError::Busy
+        })?;
+        let telemetry = self.telemetry.clone();
+        if let Some(telemetry) = &telemetry {
+            telemetry.auth_active.fetch_add(1, Ordering::AcqRel);
+        }
+        let gauge = AuthGauge(telemetry.clone());
         let task = tokio::task::spawn_blocking(move || {
             let permit: OwnedSemaphorePermit = permit;
+            let _gauge = gauge;
             let result = verifier.verify(hash.as_str(), password.as_str());
             // Release the shared budget only after the verifier and both
             // application-owned secret buffers are gone.
@@ -726,11 +781,39 @@ impl AuthService {
 
         match tokio::time::timeout_at(deadline, task).await {
             Ok(Ok(Ok(true))) if is_real => {
-                Ok(VerifiedIdentity::new(Arc::clone(&self.snapshot), username))
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.auth_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(VerifiedIdentity::new(Arc::clone(snapshot), username))
             }
-            Ok(Ok(Ok(_))) => Err(AuthError::InvalidCredentials),
-            Ok(Ok(Err(_))) | Ok(Err(_)) => Err(AuthError::Internal),
-            Err(_) => Err(AuthError::Timeout),
+            Ok(Ok(Ok(_))) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.auth_invalid.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(AuthError::InvalidCredentials)
+            }
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.auth_invalid.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(AuthError::Internal)
+            }
+            Err(_) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.auth_timeout.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(AuthError::Timeout)
+            }
+        }
+    }
+}
+
+struct AuthGauge(Option<Arc<crate::telemetry::Telemetry>>);
+
+impl Drop for AuthGauge {
+    fn drop(&mut self) {
+        if let Some(telemetry) = &self.0 {
+            telemetry.auth_active.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -1011,6 +1094,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn verified_identity_is_bound_to_exactly_one_users_snapshot() {
+        let first = test_identity("alice");
+        let second = test_identity("alice");
+        assert!(first.belongs_to(&first.snapshot));
+        assert!(!first.belongs_to(&second.snapshot));
+        assert!(!second.belongs_to(&first.snapshot));
+    }
+
     struct MockVerifier {
         calls: Arc<AtomicUsize>,
         delay: Duration,
@@ -1046,6 +1138,7 @@ mod tests {
             permits: Arc::new(Semaphore::new(max_verifying)),
             verify_timeout,
             verifier,
+            telemetry: None,
         }
     }
 

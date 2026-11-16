@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::DnsConfig;
 use crate::target::normalize_ip;
+use crate::telemetry::Telemetry;
 
 /// Future returned by [`Resolver::resolve`].
 pub type ResolveFuture<'a> =
@@ -75,6 +76,7 @@ pub struct SystemResolver {
     permits: Arc<Semaphore>,
     closed: Arc<AtomicBool>,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 impl SystemResolver {
@@ -83,14 +85,30 @@ impl SystemResolver {
         Self::with_lookup(dns, Arc::new(system_lookup))
     }
 
+    /// Creates a production resolver whose actual blocking jobs are counted
+    /// in shared telemetry.
+    pub fn new_with_telemetry(dns: DnsConfig, telemetry: Arc<Telemetry>) -> Self {
+        Self::with_lookup_and_telemetry(dns, Arc::new(system_lookup), Some(telemetry))
+    }
+
     /// Creates a resolver with an injected blocking lookup for tests.
     pub fn with_lookup(dns: DnsConfig, lookup: BlockingLookup) -> Self {
+        Self::with_lookup_and_telemetry(dns, lookup, None)
+    }
+
+    /// Creates a resolver with an injected lookup and optional telemetry.
+    pub fn with_lookup_and_telemetry(
+        dns: DnsConfig,
+        lookup: BlockingLookup,
+        telemetry: Option<Arc<Telemetry>>,
+    ) -> Self {
         Self {
             dns,
             lookup,
             permits: Arc::new(Semaphore::new(dns.max_in_flight())),
             closed: Arc::new(AtomicBool::new(false)),
             handles: Mutex::new(Vec::new()),
+            telemetry,
         }
     }
 
@@ -114,6 +132,21 @@ impl SystemResolver {
             }
             Ok(Err(_)) | Err(_) => false,
         }
+    }
+}
+
+struct DnsJobGauge(Arc<Telemetry>);
+
+impl DnsJobGauge {
+    fn new(telemetry: Arc<Telemetry>) -> Self {
+        telemetry.dns_active.fetch_add(1, Ordering::AcqRel);
+        Self(telemetry)
+    }
+}
+
+impl Drop for DnsJobGauge {
+    fn drop(&mut self) {
+        self.0.dns_active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -145,11 +178,13 @@ impl Resolver for SystemResolver {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let lookup = Arc::clone(&self.lookup);
             let closed = Arc::clone(&self.closed);
+            let telemetry = self.telemetry.clone();
             let host = host.to_owned();
             // The permit lives inside the blocking closure. Dropping this
             // future only drops the receiver; the lookup and its permit stay
             // accounted for until the blocking call actually returns.
             let handle = tokio::task::spawn_blocking(move || {
+                let _gauge = telemetry.map(DnsJobGauge::new);
                 if closed.load(Ordering::Acquire) {
                     let _ = sender.send(Err(ResolveError::Closed));
                     return;
