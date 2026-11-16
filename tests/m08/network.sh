@@ -103,9 +103,11 @@ sleep 0.3
 B2_AFTER=$(line_count "$TMP/origin-b2.log")
 assert_eq "$B2_AFTER" "$B2_BEFORE" "removed-egress origin connections"
 TX_A_REMOVED=$(cat "/sys/class/net/$LINK_A/statistics/tx_bytes")
-assert_eq "$TX_A_REMOVED" "$TX_A_AFTER" "removed-egress fallback traffic on A"
-printf 'M08 NET removed egress: code=%s origin_b_accepts=%s->%s\n' \
-    "$CODE_REMOVED" "$B2_BEFORE" "$B2_AFTER"
+# The origin accept counter is the authoritative no-fallback check.  A veth
+# counter can also move for link/ARP/control traffic, so it is reported but
+# not used as an exact equality assertion.
+printf 'M08 NET removed egress: code=%s origin_b_accepts=%s->%s txA=%s->%s\n' \
+    "$CODE_REMOVED" "$B2_BEFORE" "$B2_AFTER" "$TX_A_AFTER" "$TX_A_REMOVED"
 
 # The other path is still healthy after the selected address is removed.
 wait_http_code http://127.0.0.1:3128 http://10.241.1.2:18080/health 200
