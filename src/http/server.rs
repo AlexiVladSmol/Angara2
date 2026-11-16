@@ -204,6 +204,16 @@ impl HttpServer {
         Self::bind_inner(config, true, Some((resolver, dialer)), Some(verifier), None).await
     }
 
+    /// Test/library API with a startup config path and injected verifier.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_path_and_verifier(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+        verifier: Arc<dyn crate::auth::PasswordVerifier>,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(config, true, None, Some(verifier), Some(config_path)).await
+    }
+
     async fn bind_inner(
         config: Arc<Config>,
         ephemeral: bool,
@@ -383,6 +393,111 @@ impl Drop for HttpServer {
         // open listener sockets behind. Explicit `shutdown` remains the
         // graceful path; this is the bounded last-resort path.
         self.shutdown.force_now();
+    }
+}
+
+/// Completes the final bridge/socket writer after the relay has ended. A relay
+/// `Complete` is only successful when that writer also drains within the
+/// existing first-EOF deadline.
+async fn finalize_tunnel<W>(
+    mut end: TunnelEnd,
+    writer: &mut W,
+    writer_done: bool,
+    idle_timeout: Duration,
+) -> (TunnelEnd, bool)
+where
+    W: Future<Output = std::io::Result<()>> + Unpin,
+{
+    if let TunnelEnd::Complete { drain_deadline } = &end
+        && !writer_done
+    {
+        let drain = match drain_deadline {
+            Some(deadline) => tokio::time::timeout_at(*deadline, writer).await,
+            None => tokio::time::timeout(idle_timeout, writer).await,
+        };
+        match drain {
+            Ok(Ok(())) => return (end, true),
+            Ok(Err(_)) => end = TunnelEnd::Io,
+            Err(_) => end = TunnelEnd::HalfCloseTimeout,
+        }
+    }
+    (end, writer_done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn relay_complete_waits_for_pending_writer_deadline() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+        };
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
+        assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_succeeds_after_writer_drain() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        };
+        let mut writer = Box::pin(async { Ok(()) });
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::Complete { .. }));
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_writer_io_is_failure() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        };
+        let mut writer = Box::pin(async { Err(std::io::Error::other("synthetic writer failure")) });
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_complete_gauge_stays_active_until_writer_timeout() {
+        use crate::http::connect::TunnelGauge;
+        use crate::logging::Logger;
+        use crate::telemetry::Telemetry;
+
+        let telemetry = Telemetry::with_detailed(false);
+        let (logger, receiver) =
+            Logger::channel(8, crate::config::LogLevel::Info, Arc::clone(&telemetry));
+        let mut gauge = TunnelGauge::new(Arc::clone(&telemetry), logger, 3, 7);
+        assert_eq!(telemetry.snapshot().connect_active, 1);
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+        };
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let (final_end, done) =
+            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
+        assert!(!done);
+        assert_eq!(telemetry.snapshot().connect_active, 1);
+        gauge.finish(&final_end);
+        let metrics = telemetry.snapshot();
+        assert_eq!(metrics.connect_active, 0);
+        assert_eq!(metrics.connect_finished, 1);
+        assert_eq!(metrics.connect_timeout, 1);
+        assert_eq!(metrics.connect_complete, 0);
+        let record = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tunnel record");
+        let value: serde_json::Value = serde_json::from_str(&record).expect("JSON");
+        assert_eq!(value["event"], "tunnel_finished");
+        assert_eq!(value["outcome"], "failed");
+        assert_eq!(value["reason"], "timeout");
+        assert!(receiver.try_recv().is_err());
     }
 }
 
@@ -693,18 +808,24 @@ async fn serve_client<S>(
             let exchange_started = tokio::time::Instant::now();
             let (response, setup) = if request.method() == http::Method::CONNECT {
                 let on_upgrade = hyper::upgrade::on(&mut request);
-                let connect_client = request_client.clone();
+                let connect_snapshot = proxy.snapshots().load();
+                let mut connect_terminal = proxy.connect_terminal(
+                    &request_client,
+                    connect_snapshot.generation(),
+                    exchange_started,
+                );
                 match proxy
-                    .handle_connect(request, request_client, on_upgrade)
+                    .handle_connect(request, request_client, on_upgrade, &connect_snapshot)
                     .await
                 {
-                    Ok((response, setup)) => (response, Some(setup)),
+                    Ok((response, setup)) => {
+                        // Ownership passes to the tunnel gauge only after a
+                        // real 200 handoff.
+                        connect_terminal.disarm();
+                        (response, Some(setup))
+                    }
                     Err(response) => {
-                        proxy.log_connect_rejected(
-                            &connect_client,
-                            exchange_started,
-                            response.status(),
-                        );
+                        connect_terminal.reject(response.status());
                         (response, None)
                     }
                 }
@@ -839,30 +960,14 @@ async fn serve_client<S>(
                         }
                     };
                     drop(tunnel);
-                    let mut final_end = match relay {
+                    let relay_end = match relay {
                         Some(end) => end,
                         None if writer_error => TunnelEnd::Io,
                         None => TunnelEnd::Cancelled,
                     };
-                    // A relay Complete is not a successful client transfer
-                    // until the bridge/socket writer has also drained. Reuse
-                    // the first-EOF deadline; a timed-out or failed tail makes
-                    // the terminal outcome failed.
-                    if let TunnelEnd::Complete { drain_deadline } = &final_end
-                        && !writer_done
-                    {
-                        let drain = match drain_deadline {
-                            Some(deadline) => {
-                                tokio::time::timeout_at(*deadline, &mut writer).await
-                            }
-                            None => tokio::time::timeout(idle_timeout, &mut writer).await,
-                        };
-                        match drain {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => final_end = TunnelEnd::Io,
-                            Err(_) => final_end = TunnelEnd::HalfCloseTimeout,
-                        }
-                    }
+                    let (final_end, _) =
+                        finalize_tunnel(relay_end, &mut writer, writer_done, idle_timeout)
+                            .await;
                     gauge.finish(&final_end);
                     drop(gauge);
                     drop(writer);

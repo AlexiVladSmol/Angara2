@@ -122,6 +122,59 @@ impl Drop for ExchangeTerminal {
     }
 }
 
+/// Terminal ownership for a CONNECT request before a tunnel exists. It is
+/// created immediately after the exchange gate and disarmed only on successful
+/// 200 handoff; rejection/cancellation becomes one request terminal.
+pub(crate) struct ConnectTerminal {
+    telemetry: Arc<Telemetry>,
+    logger: Logger,
+    meta: ExchangeMeta,
+    disarmed: bool,
+}
+
+impl ConnectTerminal {
+    pub(crate) fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    pub(crate) fn reject(&mut self, status: StatusCode) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        self.meta.status = Some(status);
+        self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .connect_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        log_terminal_with_reason(
+            &self.telemetry,
+            &self.logger,
+            &self.meta,
+            crate::http::BodyOutcome::Failed,
+            0,
+            Some(Reason::Rejected),
+        );
+    }
+}
+
+impl Drop for ConnectTerminal {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
+        log_terminal_with_reason(
+            &self.telemetry,
+            &self.logger,
+            &self.meta,
+            crate::http::BodyOutcome::Cancelled,
+            0,
+            Some(Reason::ClientClosed),
+        );
+    }
+}
+
 /// HTTP proxy state shared by all listeners.
 pub struct Proxy {
     snapshots: Arc<SnapshotStore>,
@@ -377,12 +430,12 @@ impl Proxy {
         request: Request<Incoming>,
         client: ClientInfo,
         on_upgrade: OnUpgrade,
+        snapshot: &Arc<crate::snapshot::RuntimeSnapshot>,
     ) -> Result<(Response<ResponseBody>, TunnelSetup), Response<ResponseBody>> {
         let error = |status: StatusCode| headers::error_response(status, true);
         if self.is_draining() {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE));
         }
-        let snapshot = self.snapshots.load();
         let config = snapshot.config();
         if request.version() != Version::HTTP_11 {
             return Err(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
@@ -564,6 +617,30 @@ impl Proxy {
         response
     }
 
+    /// Creates the exactly-once terminal guard for a CONNECT request before
+    /// auth/DNS/dial. The generation belongs to the one exchange snapshot.
+    pub(crate) fn connect_terminal(
+        &self,
+        client: &ClientInfo,
+        generation: u64,
+        started: tokio::time::Instant,
+    ) -> ConnectTerminal {
+        ConnectTerminal {
+            telemetry: Arc::clone(&self.telemetry),
+            logger: self.logger(),
+            meta: ExchangeMeta {
+                generation,
+                started,
+                connection_id: client.connection_id,
+                request_id: client.request_id,
+                listener_id: client.listener_id.clone(),
+                status: None,
+                request_body_bytes: Arc::new(AtomicU64::new(0)),
+            },
+            disarmed: false,
+        }
+    }
+
     /// Emits exactly one terminal record and metrics update for an exchange.
     pub fn log_exchange(
         &self,
@@ -578,41 +655,6 @@ impl Proxy {
             outcome,
             response_body_bytes,
         );
-    }
-
-    /// Logs a CONNECT request rejected before a tunnel existed. This is a
-    /// terminal request outcome, not a tunnel event.
-    pub(crate) fn log_connect_rejected(
-        &self,
-        client: &ClientInfo,
-        started: tokio::time::Instant,
-        status: StatusCode,
-    ) {
-        self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
-        self.telemetry
-            .http_completed
-            .fetch_add(1, Ordering::Relaxed);
-        if status.is_client_error() {
-            self.telemetry.http_4xx.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.telemetry.http_5xx.fetch_add(1, Ordering::Relaxed);
-        }
-        self.telemetry.observe_http(started.elapsed());
-        self.telemetry
-            .connect_rejected
-            .fetch_add(1, Ordering::Relaxed);
-        let mut record = LogRecord::new(Event::RequestFinished);
-        record.outcome = Some(Outcome::Failed);
-        record.reason = Some(Reason::Rejected);
-        record.generation = Some(self.snapshots.generation());
-        record.connection_id = Some(client.connection_id);
-        record.request_id = Some(client.request_id);
-        record.listener_id = Some(client.listener_id.clone());
-        record.status = Some(status.as_u16());
-        record.elapsed_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        record.request_body_bytes = Some(0);
-        record.response_body_bytes = Some(0);
-        self.logger().log(record);
     }
 
     async fn handle_inner(
@@ -953,6 +995,17 @@ fn log_terminal(
     outcome: crate::http::BodyOutcome,
     response_body_bytes: u64,
 ) {
+    log_terminal_with_reason(telemetry, logger, meta, outcome, response_body_bytes, None);
+}
+
+fn log_terminal_with_reason(
+    telemetry: &Telemetry,
+    logger: &Logger,
+    meta: &ExchangeMeta,
+    outcome: crate::http::BodyOutcome,
+    response_body_bytes: u64,
+    reason: Option<Reason>,
+) {
     match outcome {
         crate::http::BodyOutcome::Cancelled => {
             telemetry.http_cancelled.fetch_add(1, Ordering::Relaxed);
@@ -986,11 +1039,11 @@ fn log_terminal(
     let request_body_bytes = meta.request_body_bytes();
     let mut record = LogRecord::new(Event::RequestFinished);
     record.outcome = Some(outcome);
-    record.reason = Some(match outcome {
+    record.reason = Some(reason.unwrap_or(match outcome {
         Outcome::Success => Reason::Completed,
         Outcome::Cancelled => Reason::ClientClosed,
         _ => Reason::Error,
-    });
+    }));
     record.generation = Some(meta.generation);
     record.connection_id = Some(meta.connection_id);
     record.request_id = Some(meta.request_id);

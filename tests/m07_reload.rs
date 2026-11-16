@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,9 @@ use angara::config::Config;
 use angara::control::{Lifecycle, ReloadOutcome};
 use angara::http::HttpServer;
 use angara::logging::{Event, LogRecord, Logger};
-use angara::resolver::{ResolveError, Resolver, SystemResolver};
+use angara::resolver::{ResolveError, ResolveFuture, Resolver, SystemResolver};
 use angara::telemetry::Telemetry;
+use angara::transport::{DialError, DialFuture, Dialer};
 use common::TempDir;
 use common::m03::{self, RawClient};
 use common::m04;
@@ -215,6 +216,49 @@ async fn wait_true(value: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("condition did not become true");
+}
+
+async fn wait_usize(value: &AtomicUsize) {
+    for _ in 0..200 {
+        if value.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("counter did not become positive");
+}
+
+struct PendingResolver {
+    entered: Arc<AtomicBool>,
+}
+
+impl Resolver for PendingResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, _deadline: Instant) -> ResolveFuture<'a> {
+        self.entered.store(true, Ordering::Release);
+        Box::pin(async { std::future::pending::<Result<Vec<IpAddr>, ResolveError>>().await })
+    }
+}
+
+struct PendingDialer {
+    entered: Arc<AtomicBool>,
+}
+
+impl Dialer for PendingDialer {
+    fn connect<'a>(
+        &'a self,
+        _endpoint: std::net::SocketAddr,
+        _egress: &'a angara::config::EgressProfile,
+        _deadline: Instant,
+    ) -> DialFuture<'a> {
+        self.entered.store(true, Ordering::Release);
+        Box::pin(async { std::future::pending::<Result<tokio::net::TcpStream, DialError>>().await })
+    }
+}
+
+fn pending_connect_config() -> String {
+    let mut text = m03::config("127.0.0.1:3128");
+    text.push_str("\n[connect]\nallowed_ports = [443]\n");
+    text.replace("shutdown_timeout_ms = 2000", "shutdown_timeout_ms = 100")
 }
 
 fn receive_event(receiver: &std::sync::mpsc::Receiver<String>, event: &str) -> serde_json::Value {
@@ -1492,6 +1536,188 @@ async fn m07_log07_force_shutdown_logs_cancelled_connect_tunnel() {
     assert_eq!(metrics.connect_finished, 1);
     assert_eq!(metrics.connect_cancelled, 1);
     assert_eq!(metrics.connect_complete, 0);
+}
+
+#[tokio::test]
+async fn m07_log08_connect_setup_cancel_during_auth_is_terminal() {
+    let dir = TempDir::new("m07-log08");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let text = config_text(dir.path(), 443, "\"alice\"", 8, 2, 5000, false)
+        .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    let path = dir.path().join("proxy.toml");
+    fs::write(&path, text).expect("config");
+    let state = Arc::new(m05::VerifierState::default());
+    let verifier = m05::RecordingVerifier::accepting(
+        Arc::clone(&state),
+        Duration::from_millis(500),
+        "alice-secret",
+    );
+    let config = Arc::new(Config::load(&path).expect("load"));
+    let server =
+        HttpServer::bind_ephemeral_with_path_and_verifier(config, path, Arc::new(verifier))
+            .await
+            .expect("bind");
+    let address = server.addresses()[0].1;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let auth = m05::authorization("alice", "alice-secret");
+    let mut client = RawClient::connect(address).await.expect("client");
+    client
+        .send(
+            format!(
+                "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nProxy-Authorization: {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("CONNECT");
+    wait_usize(&state.started).await;
+    server.shutdown().await;
+    drop(client);
+    let record = receive_event(&receiver, "request_finished");
+    assert_eq!(record["outcome"], "cancelled");
+    assert_eq!(record["generation"], 1);
+    assert!(record.get("status").is_none());
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.http_started, 1);
+    assert_eq!(metrics.http_cancelled, 1);
+    assert_eq!(metrics.connect_rejected, 0);
+}
+
+#[tokio::test]
+async fn m07_log09_connect_setup_cancel_during_dns_is_terminal() {
+    let config = Arc::new(Config::parse(&pending_connect_config()).expect("config"));
+    let dns_entered = Arc::new(AtomicBool::new(false));
+    let dial_entered = Arc::new(AtomicBool::new(false));
+    let server = HttpServer::bind_ephemeral_with_components(
+        config,
+        Arc::new(PendingResolver {
+            entered: Arc::clone(&dns_entered),
+        }),
+        Arc::new(PendingDialer {
+            entered: Arc::clone(&dial_entered),
+        }),
+    )
+    .await
+    .expect("bind");
+    let address = server.addresses()[0].1;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let mut client = RawClient::connect(address).await.expect("client");
+    client
+        .send(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+        .await
+        .expect("CONNECT");
+    wait_true(&dns_entered).await;
+    server.shutdown().await;
+    drop(client);
+    let record = receive_event(&receiver, "request_finished");
+    assert_eq!(record["outcome"], "cancelled");
+    assert_eq!(record["generation"], 1);
+    assert_eq!(telemetry.snapshot().http_cancelled, 1);
+}
+
+#[tokio::test]
+async fn m07_log10_connect_setup_cancel_during_dial_is_terminal() {
+    let config = Arc::new(Config::parse(&pending_connect_config()).expect("config"));
+    let dns_entered = Arc::new(AtomicBool::new(false));
+    let dial_entered = Arc::new(AtomicBool::new(false));
+    let server = HttpServer::bind_ephemeral_with_components(
+        config,
+        Arc::new(PendingResolver {
+            entered: Arc::clone(&dns_entered),
+        }),
+        Arc::new(PendingDialer {
+            entered: Arc::clone(&dial_entered),
+        }),
+    )
+    .await
+    .expect("bind");
+    let address = server.addresses()[0].1;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let mut client = RawClient::connect(address).await.expect("client");
+    send_connect(&mut client, "127.0.0.1:443".parse().unwrap(), "", "").await;
+    wait_true(&dial_entered).await;
+    server.shutdown().await;
+    drop(client);
+    let record = receive_event(&receiver, "request_finished");
+    assert_eq!(record["outcome"], "cancelled");
+    assert_eq!(record["generation"], 1);
+    assert_eq!(telemetry.snapshot().http_cancelled, 1);
+}
+
+#[tokio::test]
+async fn m07_log11_rejected_connect_uses_its_original_generation() {
+    let dir = TempDir::new("m07-log11");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let g1 = config_text(dir.path(), 9, "\"alice\"", 8, 2, 5000, false)
+        .replace("allowed_ports = [9]", "allowed_ports = [443]")
+        .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    let path = dir.path().join("proxy.toml");
+    fs::write(&path, g1).expect("config g1");
+    let state = Arc::new(m05::VerifierState::default());
+    let verifier = m05::RecordingVerifier::accepting(
+        Arc::clone(&state),
+        Duration::from_millis(500),
+        "alice-secret",
+    );
+    let config = Arc::new(Config::load(&path).expect("load g1"));
+    let server =
+        HttpServer::bind_ephemeral_with_path_and_verifier(config, path.clone(), Arc::new(verifier))
+            .await
+            .expect("bind");
+    let address = server.addresses()[0].1;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let auth = m05::authorization("alice", "alice-secret");
+    let mut first = RawClient::connect(address).await.expect("first");
+    first
+        .send(
+            format!(
+                "CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\nProxy-Authorization: {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("first CONNECT");
+    wait_usize(&state.started).await;
+    let g2 = config_text(dir.path(), 9, "\"alice\"", 8, 2, 5000, false)
+        .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    fs::write(&path, g2).expect("config g2");
+    assert_eq!(
+        server.control().reload(1).await,
+        ReloadOutcome::Applied { generation: 2 }
+    );
+    assert_eq!(first.read_head().await.expect("403").status, 403);
+    let first_record = receive_event(&receiver, "request_finished");
+    assert_eq!(first_record["generation"], 1);
+    assert_eq!(first_record["status"], 403);
+
+    let mut second = RawClient::connect(address).await.expect("second");
+    second
+        .send(
+            format!(
+                "CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\nProxy-Authorization: {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("second CONNECT");
+    let second_status = second.read_head().await.expect("g2 result").status;
+    assert_ne!(second_status, 403);
+    let second_record = receive_event(&receiver, "request_finished");
+    assert_eq!(second_record["generation"], 2);
+    assert_eq!(second_record["status"], second_status);
+    server.shutdown().await;
 }
 
 #[tokio::test]

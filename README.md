@@ -838,7 +838,9 @@ cert/key: при прежних TLS paths используются prepared Arcs
   завершения или отмены streaming body, а не сразу после заголовков; HEAD и
   пустое body дают 0. Exactly-once guard создаётся при admission exchange и
   покрывает auth/DNS/ожидание headers/streaming/force: abort до тела пишет
-  cancelled, а не оставляет `http_started` без outcome. Отвергнутый CONNECT
+  cancelled, а не оставляет `http_started` без outcome. CONNECT terminal
+  создаётся сразу после exchange gate: отмена setup во время auth/DNS/dial
+  пишет request cancellation с generation допущенного snapshot; отказ
   получает `request_finished` со status/reason rejected и не изображает
   открытый tunnel. `tunnel_finished` для CONNECT пишется только после
   фактического writer drain; потеря хвоста даёт failed/timeout, не success.
