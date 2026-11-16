@@ -1221,9 +1221,21 @@ async fn m07_shut02_aborted_caller_does_not_cancel_service_coordinator() {
         }
     });
     wait_lifecycle(&control, Lifecycle::Draining).await;
+    let waiter = tokio::spawn({
+        let control = Arc::clone(&control);
+        async move {
+            control
+                .shutdown(angara::control::ShutdownReason::Control)
+                .await;
+        }
+    });
     tokio::time::sleep(Duration::from_millis(10)).await;
     task.abort();
     assert!(task.await.is_err(), "shutdown caller was not aborted");
+    tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("concurrent shutdown waiter did not observe completion")
+        .expect("concurrent waiter join");
     wait_lifecycle(&control, Lifecycle::Stopped).await;
     for _ in 0..100 {
         if control.status().connect_active == 0 {
