@@ -94,6 +94,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration", type=int, default=3600)
     parser.add_argument("--batch-seconds", type=int, default=300)
+    parser.add_argument("--warmup-seconds", type=int, default=120)
+    parser.add_argument("--warmup-idle", type=int, default=30)
     parser.add_argument("--clients", type=int, default=20)
     parser.add_argument("--proxy-http", default="http://127.0.0.1:3128")
     parser.add_argument("--proxy-https", default="https://127.0.0.1:3129")
@@ -118,47 +120,67 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     batches = max(1, args.duration // args.batch_seconds)
     batch_seconds = args.duration // batches
-    baseline = read_process(args.pid)
     samples: list[dict[str, object]] = []
     reloads = {"applied": 0, "rejected": 0, "errors": []}
     batch_results: list[dict[str, object]] = []
+
+    def load_command(seconds: int, report: Path) -> list[str]:
+        return [
+            sys.executable,
+            str(script_dir / "load.py"),
+            "--clients",
+            str(args.clients),
+            "--duration",
+            str(seconds),
+            "--warmup",
+            "5",
+            "--proxy-http",
+            args.proxy_http,
+            "--proxy-https",
+            args.proxy_https,
+            "--proxy-ca",
+            args.proxy_ca,
+            "--site",
+            args.site,
+            "--site-ca",
+            args.site_ca,
+            "--origin-port",
+            str(args.origin_port),
+            "--site-port",
+            str(args.site_port),
+            "--password-file",
+            args.password_file,
+            "--pid",
+            str(args.pid),
+            "--report",
+            str(report),
+            "--after-wait",
+            "0",
+            "--min-success",
+            "1.0",
+        ]
+
     try:
+        # The threshold is relative to a warmed process, not the cold startup
+        # allocator.  Run the same 20-client auth/TLS mix for two minutes,
+        # let idle work settle, then record the warmed baseline.
+        warmup_report = batch_dir / "warmup.json"
+        warmup_started = time.monotonic()
+        warmup = subprocess.run(
+            load_command(args.warmup_seconds, warmup_report),
+            capture_output=True,
+            text=True,
+        )
+        print(
+            f"soak warmup ok={warmup.returncode == 0} "
+            f"elapsed={time.monotonic() - warmup_started:.1f}s",
+            flush=True,
+        )
+        time.sleep(args.warmup_idle)
+        baseline = read_process(args.pid)
         for batch in range(batches):
             batch_report = batch_dir / f"batch-{batch:02d}.json"
-            command = [
-                sys.executable,
-                str(script_dir / "load.py"),
-                "--clients",
-                str(args.clients),
-                "--duration",
-                str(batch_seconds),
-                "--warmup",
-                "5",
-                "--proxy-http",
-                args.proxy_http,
-                "--proxy-https",
-                args.proxy_https,
-                "--proxy-ca",
-                args.proxy_ca,
-                "--site",
-                args.site,
-                "--site-ca",
-                args.site_ca,
-                "--origin-port",
-                str(args.origin_port),
-                "--site-port",
-                str(args.site_port),
-                "--password-file",
-                args.password_file,
-                "--pid",
-                str(args.pid),
-                "--report",
-                str(batch_report),
-                "--after-wait",
-                "0",
-                "--min-success",
-                "1.0",
-            ]
+            command = load_command(batch_seconds, batch_report)
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             accepted_at = max(10, int(batch_seconds * 0.35))
             rejected_at = max(accepted_at + 10, int(batch_seconds * 0.65))
@@ -226,15 +248,23 @@ def main() -> int:
             and after["fds"] <= baseline["fds"] + 8
             and after["rss_kib"] <= baseline["rss_kib"] + 65536
         )
+        warmup_ok = warmup.returncode == 0
         report = {
             "result": "pass"
-            if threshold_ok
+            if warmup_ok
+            and threshold_ok
             and all(item["ok"] for item in batch_results)
             and not reloads["errors"]
             else "fail",
             "duration_s": args.duration,
             "clients": args.clients,
             "batch_seconds": batch_seconds,
+            "warmup_seconds": args.warmup_seconds,
+            "warmup": {
+                "ok": warmup_ok,
+                "stdout_tail": warmup.stdout[-2000:],
+                "stderr_tail": warmup.stderr[-2000:],
+            },
             "baseline": baseline,
             "peak": peak,
             "after": after,
@@ -244,7 +274,19 @@ def main() -> int:
         }
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps({k: report[k] for k in ("result", "baseline", "peak", "after", "reloads")}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "result": report["result"],
+                    "warmup": report["warmup"],
+                    "baseline": baseline,
+                    "peak": peak,
+                    "after": after,
+                    "reloads": reloads,
+                },
+                indent=2,
+            )
+        )
         return 0 if report["result"] == "pass" else 1
     finally:
         try:

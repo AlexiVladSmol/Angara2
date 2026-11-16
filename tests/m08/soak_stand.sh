@@ -67,6 +67,7 @@ mkdir -p "$TMP/soak"
 
 python3 "$M08_DIR/soak.py" \
     --duration "$DURATION" --batch-seconds 300 --clients 20 \
+    --warmup-seconds 120 --warmup-idle 30 \
     --proxy-http http://127.0.0.1:3128 \
     --proxy-https https://127.0.0.1:3129 \
     --proxy-ca "$TMP/pki/proxy_ca.pem" \
