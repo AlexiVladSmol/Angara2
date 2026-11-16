@@ -103,7 +103,7 @@ fi
 DEST="$TMP/stage"
 "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
     --destdir "$DEST" | tee "$TMP/install-1.txt"
-CANDIDATE=$(sed -n 's/^candidate_id=//p' "$TMP/install-1.txt")
+CANDIDATE=$(sed -n 's/^candidate_id=//p' "$TMP/install-1.txt" | tail -n1)
 [ -n "$CANDIDATE" ] || fail "installer did not print candidate_id"
 [ -f "$DEST/opt/angara/releases/$CANDIDATE/bin/angara" ] || fail "release binary missing"
 [ -L "$DEST/opt/angara/current" ] || fail "current symlink missing"

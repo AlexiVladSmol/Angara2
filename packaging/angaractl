@@ -314,6 +314,10 @@ probe_service() {
 }
 
 start_service() {
+    # An explicit maintenance command may recover a unit that previously hit
+    # its automatic start limit.  The unit's Restart=on-failure policy is still
+    # enforced for unexpected crashes.
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
     systemctl start "$SERVICE" || return 1
     if ! probe_service; then
         journal_tail

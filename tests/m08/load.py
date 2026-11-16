@@ -265,7 +265,13 @@ def main() -> int:
             ] * connect_count
             assignments = assignments[:total]
         users = ["alice", "bob"]
-        count = max(10, int(args.duration * 1000 / max(args.request_delay_ms, 1)))
+        # The origin delay is a floor; local curl process/keep-alive overhead is
+        # observable in the warmup.  Target roughly one request per two delay
+        # windows so a 60 s cohort finishes near its intended wall-clock size.
+        count = max(
+            10,
+            int(args.duration * 1000 / max(args.request_delay_ms * 2, 1)),
+        )
         configs: list[Path] = []
         for index, kind in enumerate(assignments):
             if kind == "http":
@@ -286,7 +292,10 @@ def main() -> int:
             configs.append(path)
 
         # Warmup: a short batch per client, discarded from the reported result.
-        warm_count = max(5, int(args.warmup * 1000 / max(args.request_delay_ms, 1)))
+        warm_count = max(
+            5,
+            int(args.warmup * 1000 / max(args.request_delay_ms * 2, 1)),
+        )
         warm_configs = []
         for index, config in enumerate(configs):
             warm = workdir / f"warm-{index}.conf"
@@ -334,7 +343,7 @@ def main() -> int:
             out_handle.close()
             err_handle.close()
         peak = before
-        deadline = started + args.duration + 60
+        deadline = started + max(args.duration * 3, 180) + 60
         while any(process.poll() is None for process in processes):
             sample = read_process(args.pid)
             if sample is not None:

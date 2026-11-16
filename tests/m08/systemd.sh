@@ -70,7 +70,12 @@ journal_recent() {
     journalctl -u angara.service --since '5 minutes ago' -o cat --no-pager 2>/dev/null || true
 }
 
+reset_failed() {
+    systemctl reset-failed angara.service >/dev/null 2>&1 || true
+}
+
 systemctl enable angara.service >/dev/null 2>&1 || true
+reset_failed
 systemctl start angara.service
 wait_service_active
 systemd-analyze verify /etc/systemd/system/angara.service
@@ -120,6 +125,7 @@ python3 "$M08_DIR/make_config.py" --output "$TMP/allow.toml" --mode functional \
 write_config "$TMP/allow.toml"
 runuser -u angara -- "$BIN" check --config /etc/angara/angara.toml \
     || fail "G1 config is not readable/valid for angara"
+reset_failed
 if ! systemctl restart angara.service; then
     systemctl status angara.service --no-pager >&2 || true
     journalctl -u angara.service -n 80 --no-pager >&2 || true
@@ -237,6 +243,7 @@ wait_service_inactive 20
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "graceful stop result"
 assert_eq "$(systemctl show -p ExecMainStatus --value angara.service)" "0" "graceful stop status"
 ! ss -ltn | grep -q ':3128'
+reset_failed
 systemctl start angara.service
 wait_service_active
 wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
@@ -268,11 +275,13 @@ wait_service_inactive 20
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "forced stop result"
 assert_eq "$(systemctl show -p ExecMainStatus --value angara.service)" "0" "forced stop status"
 ! ss -ltn | grep -q ':3128'
+reset_failed
 systemctl start angara.service
 wait_service_active
 wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
 
 # Crash restart and intentional stop.
+reset_failed
 PID=$(systemctl show -p MainPID --value angara.service)
 kill -KILL "$PID"
 for _ in $(seq 1 100); do
@@ -294,6 +303,7 @@ if systemctl is-active --quiet angara.service; then
 fi
 
 # Configuration error reaches the start limit; recovery uses reset-failed.
+reset_failed
 python3 "$M08_DIR/make_config.py" --output "$TMP/invalid.toml" --mode invalid
 write_config "$TMP/invalid.toml"
 set +e

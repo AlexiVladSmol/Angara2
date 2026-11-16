@@ -84,7 +84,8 @@ assert_eq "$(systemd-run --machine="$MACHINE" --quiet --pipe --wait --collect /b
     "systemd" "container PID 1"
 PID=$(systemctl -M "$MACHINE" show -p MainPID --value angara.service)
 [ "$PID" != "0" ] || fail "container service has no main PID"
-EXE=$(readlink -f "/proc/$PID/exe" 2>/dev/null || true)
+EXE=$(systemd-run --machine="$MACHINE" --quiet --pipe --wait --collect \
+    /bin/bash -c "readlink -f /proc/$PID/exe")
 printf 'boot service pid=%s exe=%s\n' "$PID" "$EXE"
 case "$EXE" in
     *"/releases/"*"/bin/angara") ;;
