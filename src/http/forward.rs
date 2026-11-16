@@ -184,13 +184,18 @@ impl Proxy {
         Arc::clone(&self.client_caps)
     }
 
-    /// Updates caps and retires old idle pool roots after a publish.
-    pub fn apply_published(&self, generation: u64, config: &Config) {
-        self.pool.retire_before(generation);
+    /// Publishes the candidate global caps before the root becomes visible.
+    /// This prevents a post-publish admission under a stale higher cap.
+    pub fn set_published_caps(&self, config: &Config) {
         self.client_caps
             .set_limit(config.limits().max_client_connections() as usize);
         self.outbound
             .set_outbound_limit(config.limits().max_connections() as usize);
+    }
+
+    /// Retires idle origins after a successful root publication.
+    pub fn retire_published_pool(&self, generation: u64) {
+        self.pool.retire_before(generation);
     }
 
     /// Shared telemetry counters.

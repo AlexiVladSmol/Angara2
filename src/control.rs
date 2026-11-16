@@ -326,6 +326,7 @@ impl ControlState {
         };
         let preparation_gauge = PreparationGauge::new(Arc::clone(&self.telemetry));
         let previous = self.snapshots.load();
+        let previous_caps = Arc::clone(&previous);
         let timeout = previous.config().operations().reload_timeout();
         let delay = self
             .test_preparation_delay
@@ -383,15 +384,29 @@ impl ControlState {
                 generation: expected_generation,
             });
         }
+        if expected_generation == u64::MAX {
+            drop(publication);
+            return self.record(ReloadOutcome::Internal);
+        }
+        if self.snapshots.live_generations() >= MAX_LIVE_GENERATIONS {
+            drop(publication);
+            return self.record(ReloadOutcome::GenerationBusy);
+        }
+        let candidate = Arc::new(candidate);
+        let proxy = self.proxy.upgrade();
+        if let Some(proxy) = &proxy {
+            // Caps are global admission state: publish them before the root so
+            // a post-publish request cannot be admitted under a stale higher
+            // cap. A failed publication restores the previous values below.
+            proxy.set_published_caps(&candidate);
+        }
         let published = self
             .snapshots
-            .publish(expected_generation, Arc::new(candidate));
-        drop(publication);
-        match published {
+            .publish(expected_generation, Arc::clone(&candidate));
+        let outcome = match published {
             Ok(generation) => {
-                let root = self.snapshots.load();
-                if let Some(proxy) = self.proxy.upgrade() {
-                    proxy.apply_published(generation, root.config());
+                if let Some(proxy) = &proxy {
+                    proxy.retire_published_pool(generation);
                 }
                 self.telemetry.live_generations.store(
                     u64::try_from(self.snapshots.live_generations()).unwrap_or(u64::MAX),
@@ -399,12 +414,29 @@ impl ControlState {
                 );
                 self.record(ReloadOutcome::Applied { generation })
             }
-            Err(PublishError::Conflict) => self.record(ReloadOutcome::Conflict {
-                current: self.snapshots.generation(),
-            }),
-            Err(PublishError::GenerationBusy) => self.record(ReloadOutcome::GenerationBusy),
-            Err(PublishError::Exhausted) => self.record(ReloadOutcome::Internal),
-        }
+            Err(PublishError::Conflict) => {
+                if let Some(proxy) = &proxy {
+                    proxy.set_published_caps(previous_caps.config());
+                }
+                self.record(ReloadOutcome::Conflict {
+                    current: self.snapshots.generation(),
+                })
+            }
+            Err(PublishError::GenerationBusy) => {
+                if let Some(proxy) = &proxy {
+                    proxy.set_published_caps(previous_caps.config());
+                }
+                self.record(ReloadOutcome::GenerationBusy)
+            }
+            Err(PublishError::Exhausted) => {
+                if let Some(proxy) = &proxy {
+                    proxy.set_published_caps(previous_caps.config());
+                }
+                self.record(ReloadOutcome::Internal)
+            }
+        };
+        drop(publication);
+        outcome
     }
 
     fn record(&self, outcome: ReloadOutcome) -> ReloadOutcome {
