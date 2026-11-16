@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**Статус: M00–M06 приняты и слиты; M07 (reload, control service, JSON-журналы и метрики) реализован в ветке `feat/20-m07-operations` и передан на ревью.** Ревизия документов: 0.8. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. Согласование требований и слияние PR — отдельные действия владельца.
+**Статус: M00–M07 приняты и слиты; M08 (кандидат v0.1, установка из архива, systemd, A→B→A и стендовые проверки) реализуется в ветке `feat/23-m08-release-candidate`.** Ревизия документов: 0.9. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. Согласование требований, слияние PR, лицензия и публичный выпуск — отдельные действия владельца.
 
 ## Участники и работа
 
@@ -215,11 +215,22 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | Job | Проверки |
 | --- | --- |
 | `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, M07 reload/control/logging/metrics + resource/load/CPU evidence, `config_m07`/`cli_m07`/`m07_reload`/`m07_limits`, 20 повторов M04 forced-shutdown, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
+| `release` | release-сборка B из head и A из `911266e...`, `manifest.json`, внешний `SHA256SUMS`, notices, artifact upload |
+| `installer` | `tests/m08/install.sh`: манифест, SHA-256, path traversal/symlink rejection, DESTDIR, повторная установка, `systemd-analyze verify` |
+| `systemd` | реальный systemd: identity/capabilities/sandbox/limits, initial 403, reload accepted/rejected, restart-required, SIGHUP storm, stop/force, crash restart, start limit, occupied port |
+| `functional` | HTTP/HTTPS/Basic/ACL, 407/403, обе TLS-цепочки, TLS-in-TLS CONNECT, secret markers, stop under load; streaming 64 MiB/1 GiB |
+| `network` | два veth + netns, source IP у origin, счётчики, удаление egress-адреса без fallback |
+| `load` | 10/20 клиентов по 60 s, TLS+Basic, HTTP/HTTPS/CONNECT, upload/download/HEAD/Range, 1/2/4 workers, overload |
+| `upgrade` | A→B→A, проверка B до остановки A, backup, `/proc/<pid>/exe`, config hashes, pre/post-switch failure, recover |
+| `boot` | минимальный Ubuntu 24.04 rootfs, `systemctl enable`, systemd-nspawn boot, autostart, readiness 403 |
+| `soak` | 60-минутный 20-клиентный прогон; запускается push-коммитом с маркером `[soak]` |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.
 Внешние actions закреплены commit SHA: `actions/checkout` v7.0.1
-(`3d3c42e5aac5ba805825da76410c181273ba90b1`) и
+(`3d3c42e5aac5ba805825da76410c181273ba90b1`),
+`actions/upload-artifact` v4 (`ea165f8d65b6e75b540449e92b4886f43607fa02`),
+`actions/download-artifact` v4 (`d3f86a106a0bac45b974a628896c90dbdf5c8093`) и
 `EmbarkStudios/cargo-deny-action` v2.1.1
 (`3c6349835b2b7b196a839186cb8b78e02f7b5f25`). Фактические результаты для
 конкретного head SHA указываются в PR.
@@ -907,11 +918,59 @@ Linux). Полный Linux baseline дополняется явными `http_li
 `m06_progress` проверками и 20 повторами M04 forced-shutdown; повторы CI не
 прибавляются к числу основных тестов.
 
+## M08: кандидат v0.1 для Ubuntu Server 24.04
+
+M08 поставляет воспроизводимый архив `angara-0.1.0-linux-x86_64-<sha>.tar.gz`
+с внешним `SHA256SUMS`, манифестом, unit, установщиком, `angaractl`,
+безопасными примерами, руководством администратора и notices зависимостей.
+Установка не требует Rust, Docker или исходников на целевой системе.
+
+```sh
+sha256sum -c SHA256SUMS
+umask 077
+tmp=$(mktemp -d)
+tar -xzf angara-0.1.0-linux-x86_64-<sha>.tar.gz -C "$tmp" \
+  --no-same-owner --no-same-permissions
+sudo "$tmp"/angara-0.1.0-linux-x86_64-<sha>/install.sh \
+  --archive "$PWD/angara-0.1.0-linux-x86_64-<sha>.tar.gz" \
+  --sha256 <sha256> \
+  --expected-source-sha <full-source-sha>
+sudo systemctl enable --now angara.service
+```
+
+Раскладка: версия в `/opt/angara/releases/<candidate-id>`, активная ссылка
+`/opt/angara/current`, CLI `/usr/local/bin/angara`, unit
+`/etc/systemd/system/angara.service`, настройки `/etc/angara` с правами
+`root:angara 0750`, основной TOML `root:angara 0640`. Начальный конфиг
+слушает только loopback `127.0.0.1:3128` и запрещает все запросы: контрольный
+запрос получает 403, origin не открывается. TLS, Basic, пользователи и ACL
+включаются по [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md).
+
+`install.sh` проверяет внешний SHA-256, отклоняет path traversal/ссылки,
+сверяет манифест, идемпотентно сохраняет настройки/users/TLS/drop-in и умеет
+непривилегированный `--destdir`. `angaractl upgrade --archive B --sha256 B
+--confirm` проверяет B бинарником B от пользователя `angara`, делает
+root-only резервную копию `/etc/angara`, останавливает A, атомарно
+переключает `current`, запускает B и проверяет запрос; `angaractl rollback
+--confirm` возвращает A. Настройки, users и TLS при этом не перезаписываются.
+
+Сборка и происхождение описаны в [`docs/RELEASE.md`](docs/RELEASE.md),
+checklist — в [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md), карта
+F01–F11/N01–N09 и 18 M08-ID — в
+[`docs/M08_EVIDENCE.md`](docs/M08_EVIDENCE.md). CI собирает A и B, проверяет
+архив без Rust на отдельном Ubuntu 24.04 runner, реальный systemd,
+boot/enable, A→B→A, два veth/netns, 1/2/4 workers, 10/20 клиентов, 64 MiB и
+1 GiB streaming, перегрузку и 60-минутный soak. Фактические результаты и
+SHA-256 испытанного архива прикладываются к PR/CI run; они не заполняются
+заранее.
+
 ## Текущее состояние
 
-M00–M06 приняты и слиты. M07 реализован в ветке `feat/20-m07-operations` и
-передан на ревью; Linux CI выполняет прежние M01–M06 проверки, новые
-reload/control/logging/metrics тесты, resource/load evidence и 20 повторов
-M04 forced-shutdown. Слияние выполняет владелец после ревью.
+M00–M07 приняты и слиты. M08 реализует кандидат v0.1 в
+`feat/23-m08-release-candidate`: архив/манифест/notices, установщик,
+systemd, A→B→A, стендовые проверки сети/CPU/нагрузки и документацию. Linux CI
+сохраняет полную регрессию M01–M07, 20 повторов M04 forced-shutdown и
+добавляет release/stand jobs. Слияние, лицензия и публичный выпуск остаются
+решениями владельца.
 
 Лицензия не выбрана. Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.

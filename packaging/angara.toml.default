@@ -1,0 +1,49 @@
+# Angara 0.1.0 initial configuration for Ubuntu Server 24.04.
+#
+# This file is intentionally loopback-only and denies every proxied request.
+# No users, TLS material, passwords or private keys are shipped in the archive.
+# Follow docs/ADMIN_GUIDE.md to enable TLS, Basic authentication and an ACL.
+#
+# `angara check --config /etc/angara/angara.toml` validates this file without
+# opening listeners, resolving DNS or connecting to an origin.
+
+schema_version = 1
+
+[runtime]
+worker_threads = "auto"
+
+[limits]
+max_connections = 256
+max_client_connections = 128
+max_header_bytes = 32768
+header_read_timeout_ms = 10000
+idle_timeout_ms = 60000
+shutdown_timeout_ms = 10000
+
+[operations]
+reload_timeout_ms = 5000
+
+[observability]
+log_level = "info"
+log_queue_capacity = 1024
+metrics_enabled = true
+metrics_interval_ms = 30000
+
+[[listeners]]
+id = "proxy-loopback"
+bind = "127.0.0.1:3128"
+transport = "http"
+auth = "none"
+
+[access]
+# Only local clients may connect to the initial listener. There is deliberately
+# no allow rule, so every request is denied with HTTP 403 before DNS or dial.
+source_allow = ["127.0.0.0/8", "::1/128"]
+ip_default = "deny"
+
+[[egress]]
+id = "system"
+mode = "system"
+
+[routing]
+default_egress = "system"

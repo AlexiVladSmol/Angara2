@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# Angara release maintenance: install, activate, upgrade, rollback, status.
+set -euo pipefail
+
+PREFIX=/opt/angara
+SYSCONFDIR=/etc/angara
+UNIT_DIR=/etc/systemd/system
+BINDIR=/usr/local/bin
+SBINDIR=/usr/local/sbin
+VARLIB=/var/lib/angara
+SERVICE=angara.service
+SERVICE_USER=angara
+
+ARCHIVE=
+ARCHIVE_SHA=
+CANDIDATE=
+CONFIRM=0
+NO_PROBE=0
+PURGE=0
+PROBE_PROXY=
+PROBE_URL=http://127.0.0.1:9/
+PROBE_CODE=403,407,502,503,504
+PROBE_CACERT=
+WORKDIR=
+COMMAND=
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        rm -rf "$WORKDIR"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+usage() {
+    cat <<'EOF'
+Usage:
+  angaractl install  --archive <tar.gz> --sha256 <sha> --confirm [options]
+  angaractl upgrade  --archive <tar.gz> --sha256 <sha> --confirm [options]
+  angaractl rollback --confirm [options]
+  angaractl recover [options]
+  angaractl activate --candidate <id> --confirm [options]
+  angaractl status [options]
+  angaractl uninstall --confirm [--purge]
+
+Options:
+  --probe-proxy <url>    Proxy URL for the readiness request.
+  --probe-url <url>      Request URL (default: http://127.0.0.1:9/).
+  --probe-code <codes>   Accepted comma-separated HTTP codes
+                         (default: 403,407,502,503,504).
+  --probe-cacert <file>  CA used to verify an HTTPS proxy listener.
+  --no-probe             Do not perform the HTTP readiness request.
+  --candidate <id>       Release candidate id for activate.
+  --purge                Uninstall also removes /opt/angara, /etc/angara and
+                         /var/lib/angara. The default preserves operator data.
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+    usage
+    exit 2
+fi
+case "$1" in
+    install|upgrade|rollback|recover|activate|status|uninstall) COMMAND=$1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown command: $1" ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --archive) [ "$#" -ge 2 ] || die "--archive needs a value"; ARCHIVE=$2; shift 2 ;;
+        --sha256) [ "$#" -ge 2 ] || die "--sha256 needs a value"; ARCHIVE_SHA=$2; shift 2 ;;
+        --candidate) [ "$#" -ge 2 ] || die "--candidate needs a value"; CANDIDATE=$2; shift 2 ;;
+        --probe-proxy) [ "$#" -ge 2 ] || die "--probe-proxy needs a value"; PROBE_PROXY=$2; shift 2 ;;
+        --probe-url) [ "$#" -ge 2 ] || die "--probe-url needs a value"; PROBE_URL=$2; shift 2 ;;
+        --probe-code) [ "$#" -ge 2 ] || die "--probe-code needs a value"; PROBE_CODE=$2; shift 2 ;;
+        --probe-cacert) [ "$#" -ge 2 ] || die "--probe-cacert needs a value"; PROBE_CACERT=$2; shift 2 ;;
+        --confirm) CONFIRM=1; shift ;;
+        --no-probe) NO_PROBE=1; shift ;;
+        --purge) PURGE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "this command requires root"
+}
+
+require_confirm() {
+    [ "$CONFIRM" -eq 1 ] || die "re-run with --confirm to change the running service"
+}
+
+manifest_field() {
+    python3 - "$1/manifest.json" "$2" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+value = data
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(value)
+PY
+}
+
+stage_archive() {
+    [ -n "$ARCHIVE" ] || die "--archive is required"
+    [ -n "$ARCHIVE_SHA" ] || die "--sha256 is required"
+    [ -f "$ARCHIVE" ] || die "archive does not exist: $ARCHIVE"
+    case "$ARCHIVE_SHA" in
+        *[!0-9a-f]*|'') die "SHA-256 must be 64 lowercase hex characters" ;;
+    esac
+    [ "${#ARCHIVE_SHA}" -eq 64 ] || die "SHA-256 must be 64 characters"
+    printf '%s  %s\n' "$ARCHIVE_SHA" "$ARCHIVE" | sha256sum -c - >/dev/null \
+        || die "archive SHA-256 mismatch"
+    WORKDIR=$(mktemp -d)
+    chmod 0700 "$WORKDIR"
+    tar -tzf "$ARCHIVE" >"$WORKDIR/list.txt"
+    while IFS= read -r entry; do
+        case "$entry" in
+            ''|/*|*\\*|..|../*|*/..|*/../*|*//*)
+                die "unsafe archive path: $entry"
+                ;;
+        esac
+    done <"$WORKDIR/list.txt"
+    tar -tvzf "$ARCHIVE" >"$WORKDIR/types.txt"
+    while IFS= read -r line; do
+        mode=${line%% *}
+        case "$mode" in
+            -*) ;;
+            d*) ;;
+            *) die "archive contains a link or special file: $line" ;;
+        esac
+    done <"$WORKDIR/types.txt"
+    mkdir -p "$WORKDIR/root"
+    tar -xzf "$ARCHIVE" -C "$WORKDIR/root" \
+        --no-same-owner --no-same-permissions --delay-directory-restore
+    mapfile -t top < <(find "$WORKDIR/root" -mindepth 1 -maxdepth 1 -printf '%f\n')
+    [ "${#top[@]}" -eq 1 ] || die "archive must contain exactly one top-level directory"
+    STAGED_SOURCE="$WORKDIR/root/${top[0]}"
+    [ -f "$STAGED_SOURCE/manifest.json" ] || die "release archive has no manifest.json"
+    python3 "$STAGED_SOURCE/verify_manifest.py" --root "$STAGED_SOURCE" --quiet \
+        || die "release archive failed manifest verification"
+    STAGED_CANDIDATE=$(manifest_field "$STAGED_SOURCE" candidate_id)
+    STAGED_SOURCE_SHA=$(manifest_field "$STAGED_SOURCE" source_sha)
+    STAGED_BINARY_SHA=$(manifest_field "$STAGED_SOURCE" binary_sha256)
+}
+
+install_staged_candidate() {
+    local output
+    output=$("$STAGED_SOURCE/install.sh" \
+        --source-dir "$STAGED_SOURCE" \
+        --candidate-only \
+        --no-systemd \
+        --expected-candidate "$STAGED_CANDIDATE")
+    printf '%s\n' "$output"
+    UNIT_CHANGED=$(printf '%s\n' "$output" | sed -n 's/^unit_changed=//p')
+    RELEASE_DIR="$PREFIX/releases/$STAGED_CANDIDATE"
+    [ -d "$RELEASE_DIR" ] || die "staged release was not installed: $RELEASE_DIR"
+    python3 "$RELEASE_DIR/verify_manifest.py" --root "$RELEASE_DIR" --quiet \
+        || die "installed release failed manifest verification"
+}
+
+runuser_check() {
+    local release=$1
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$SERVICE_USER" -- "$release/bin/angara" check \
+            --config "$SYSCONFDIR/angara.toml"
+    else
+        su -s /bin/sh "$SERVICE_USER" -c \
+            "'$release/bin/angara' check --config '$SYSCONFDIR/angara.toml'"
+    fi
+}
+
+preflight_release() {
+    local release=$1
+    [ -f "$SYSCONFDIR/angara.toml" ] || die "missing $SYSCONFDIR/angara.toml"
+    runuser -u "$SERVICE_USER" -- test -r "$SYSCONFDIR/angara.toml" \
+        || die "the service user cannot read $SYSCONFDIR/angara.toml"
+    if ! runuser_check "$release"; then
+        die "candidate $release cannot validate the active configuration"
+    fi
+}
+
+backup_config() {
+    [ -d "$SYSCONFDIR" ] || die "no configuration directory to back up"
+    install -d -m 0700 "$VARLIB/backups"
+    local stamp target
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    target="$VARLIB/backups/angara-etc-$stamp.tar.gz"
+    tar -C "$(dirname "$SYSCONFDIR")" -czf "$target" "$(basename "$SYSCONFDIR")"
+    chmod 0600 "$target"
+    printf '%s\n' "$target"
+}
+
+install_release_metadata() {
+    local release=$1
+    [ -d "$release" ] || die "release directory does not exist: $release"
+    install -m 0644 "$release/systemd/angara.service" "$UNIT_DIR/$SERVICE.new"
+    if [ -e "$UNIT_DIR/$SERVICE" ] && cmp -s "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$SERVICE.new"; then
+        rm -f "$UNIT_DIR/$SERVICE.new"
+        UNIT_METADATA_CHANGED=0
+    else
+        mv -f "$UNIT_DIR/$SERVICE.new" "$UNIT_DIR/$SERVICE"
+        UNIT_METADATA_CHANGED=1
+    fi
+    install -m 0755 "$release/angaractl" "$SBINDIR/angaractl"
+    chown root:root "$SBINDIR/angaractl"
+}
+
+switch_current() {
+    local release=$1
+    ln -sfn "$release" "$PREFIX/current.tmp"
+    mv -Tf "$PREFIX/current.tmp" "$PREFIX/current"
+}
+
+read_current_link() {
+    if [ -L "$PREFIX/current" ]; then
+        readlink "$PREFIX/current"
+    fi
+}
+
+read_previous_link() {
+    if [ -L "$PREFIX/previous" ]; then
+        readlink "$PREFIX/previous"
+    fi
+}
+
+set_previous() {
+    local release=$1
+    ln -sfn "$release" "$PREFIX/previous.tmp"
+    mv -Tf "$PREFIX/previous.tmp" "$PREFIX/previous"
+}
+
+service_active() {
+    systemctl is-active --quiet "$SERVICE"
+}
+
+stop_service() {
+    if service_active; then
+        systemctl stop "$SERVICE" || die "systemctl stop $SERVICE failed"
+    fi
+    if service_active; then
+        die "$SERVICE is still active after stop"
+    fi
+}
+
+default_probe_proxy() {
+    python3 - "$SYSCONFDIR/angara.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+listeners = data.get("listeners") or []
+if not listeners:
+    raise SystemExit("no listener")
+listener = listeners[0]
+bind = listener["bind"]
+transport = listener.get("transport", "http")
+if bind.startswith("["):
+    host, port = bind.rsplit("]:", 1)
+    host = host[1:]
+elif ":" in bind:
+    host, port = bind.rsplit(":", 1)
+else:
+    raise SystemExit("invalid bind")
+if host in ("0.0.0.0", ""):
+    host = "127.0.0.1"
+elif host in ("::", "[::]"):
+    host = "[::1]"
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+scheme = "https" if transport == "https" else "http"
+print(f"{scheme}://{host}:{port}")
+PY
+}
+
+probe_once() {
+    local proxy=$1 code
+    local arguments=(--noproxy '' --proxy "$proxy" --connect-timeout 3 --max-time 5
+        -sS -o /dev/null -w '%{http_code}' "$PROBE_URL")
+    if [ -n "$PROBE_CACERT" ]; then
+        arguments=(--proxy-cacert "$PROBE_CACERT" "${arguments[@]}")
+    fi
+    code=$(curl "${arguments[@]}" 2>/dev/null || true)
+    case ",$PROBE_CODE," in
+        *",$code,"*) return 0 ;;
+    esac
+    return 1
+}
+
+probe_service() {
+    [ "$NO_PROBE" -eq 1 ] && return 0
+    command -v curl >/dev/null 2>&1 \
+        || die "curl is required for the readiness probe; pass --no-probe to skip it"
+    local proxy=$PROBE_PROXY
+    if [ -z "$proxy" ]; then
+        proxy=$(default_probe_proxy) || die "cannot derive a proxy URL from $SYSCONFDIR/angara.toml"
+    fi
+    local attempt
+    for attempt in $(seq 1 60); do
+        if probe_once "$proxy"; then
+            printf 'readiness=ok proxy=%s url=%s\n' "$proxy" "$PROBE_URL"
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+start_service() {
+    systemctl start "$SERVICE" || return 1
+    if ! probe_service; then
+        journal_tail
+        return 1
+    fi
+    return 0
+}
+
+journal_tail() {
+    if command -v journalctl >/dev/null 2>&1; then
+        printf '%s\n' "---- journalctl -u $SERVICE (last 30 lines) ----" >&2
+        journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+    fi
+}
+
+rollback_to() {
+    local target=$1 failed=$2
+    [ -d "$target" ] || return 1
+    if service_active; then
+        systemctl stop "$SERVICE" || true
+    fi
+    install_release_metadata "$target"
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || true
+    fi
+    switch_current "$target"
+    set_previous "$failed"
+    if start_service; then
+        return 0
+    fi
+    return 1
+}
+
+command_install_or_upgrade() {
+    require_root
+    require_confirm
+    stage_archive
+    install_staged_candidate
+    preflight_release "$RELEASE_DIR"
+    local backup old_current
+    backup=$(backup_config)
+    old_current=$(read_current_link || true)
+    printf 'backup=%s\n' "$backup"
+    printf 'candidate=%s\n' "$STAGED_CANDIDATE"
+    printf 'archive_sha256=%s\n' "$ARCHIVE_SHA"
+    printf 'source_sha=%s\n' "$STAGED_SOURCE_SHA"
+    printf 'binary_sha256=%s\n' "$STAGED_BINARY_SHA"
+    printf 'previous=%s\n' "${old_current:-none}"
+
+    if service_active; then
+        stop_service
+    fi
+    if [ "${UNIT_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    if ! switch_current "$RELEASE_DIR"; then
+        if [ -n "$old_current" ]; then
+            switch_current "$old_current" || true
+        fi
+        die "cannot switch /opt/angara/current"
+    fi
+    if [ -n "$old_current" ] && [ "$old_current" != "$RELEASE_DIR" ]; then
+        set_previous "$old_current"
+    fi
+    if start_service; then
+        printf 'active=%s\n' "$STAGED_CANDIDATE"
+        printf 'service=%s\n' "$(systemctl show -p ActiveState --value "$SERVICE")"
+        return 0
+    fi
+
+    printf 'error: candidate %s did not become ready\n' "$STAGED_CANDIDATE" >&2
+    if [ -n "$old_current" ] && [ "$old_current" != "$RELEASE_DIR" ]; then
+        if rollback_to "$old_current" "$RELEASE_DIR"; then
+            printf 'rollback=restored %s\n' "$(basename "$old_current")" >&2
+            printf 'rollback_command=angaractl rollback --confirm\n' >&2
+        else
+            printf 'rollback=FAILED; inspect journal and run: angaractl rollback --confirm\n' >&2
+        fi
+    else
+        printf 'no previous release; service remains stopped\n' >&2
+    fi
+    exit 1
+}
+
+command_rollback() {
+    require_root
+    require_confirm
+    local previous current backup
+    previous=$(read_previous_link || true)
+    [ -n "$previous" ] || die "no previous release is recorded"
+    [ -d "$previous" ] || die "previous release directory is missing: $previous"
+    current=$(read_current_link || true)
+    backup=$(backup_config)
+    preflight_release "$previous"
+    printf 'backup=%s\n' "$backup"
+    if service_active; then
+        stop_service
+    fi
+    install_release_metadata "$previous"
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    switch_current "$previous"
+    if [ -n "$current" ] && [ "$current" != "$previous" ]; then
+        set_previous "$current"
+    fi
+    if ! start_service; then
+        die "rollback target $previous did not become ready"
+    fi
+    printf 'active=%s\n' "$(basename "$previous")"
+    printf 'previous=%s\n' "${current:-none}"
+}
+
+command_activate() {
+    require_root
+    require_confirm
+    [ -n "$CANDIDATE" ] || die "--candidate is required"
+    local release="$PREFIX/releases/$CANDIDATE"
+    [ -d "$release" ] || die "release does not exist: $release"
+    preflight_release "$release"
+    local current backup
+    current=$(read_current_link || true)
+    backup=$(backup_config)
+    printf 'backup=%s\n' "$backup"
+    if service_active; then
+        stop_service
+    fi
+    install_release_metadata "$release"
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    switch_current "$release"
+    if [ -n "$current" ] && [ "$current" != "$release" ]; then
+        set_previous "$current"
+    fi
+    start_service || die "candidate $CANDIDATE did not become ready"
+    printf 'active=%s\n' "$CANDIDATE"
+}
+
+command_recover() {
+    require_root
+    local current backup
+    current=$(read_current_link || true)
+    [ -n "$current" ] || die "no current release is recorded"
+    [ -d "$current" ] || die "current release directory is missing: $current"
+    preflight_release "$current"
+    backup=$(backup_config)
+    printf 'backup=%s\n' "$backup"
+    install_release_metadata "$current"
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    if service_active; then
+        systemctl restart "$SERVICE" || die "systemctl restart $SERVICE failed"
+    else
+        systemctl start "$SERVICE" || die "systemctl start $SERVICE failed"
+    fi
+    probe_service || die "recovered service did not become ready"
+    printf 'active=%s\n' "$(basename "$current")"
+}
+
+command_status() {
+    printf 'service=%s\n' "$SERVICE"
+    printf 'active_state=%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    printf 'unit_state=%s\n' "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+    local pid
+    pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+    printf 'main_pid=%s\n' "${pid:-0}"
+    if [ -n "$pid" ] && [ "$pid" != "0" ] && [ -d "/proc/$pid" ]; then
+        printf 'exe=%s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        printf 'uid=%s\n' "$(awk '/^Uid:/{print $2}' "/proc/$pid/status")"
+        printf 'gid=%s\n' "$(awk '/^Gid:/{print $2}' "/proc/$pid/status")"
+        printf 'groups=%s\n' "$(awk '/^Groups:/{print $2}' "/proc/$pid/status")"
+        printf 'cap_effective=%s\n' "$(awk '/^CapEff:/{print $2}' "/proc/$pid/status")"
+        printf 'threads=%s\n' "$(awk '/^Threads:/{print $2}' "/proc/$pid/status")"
+    fi
+    printf 'current=%s\n' "$(read_current_link || true)"
+    printf 'previous=%s\n' "$(read_previous_link || true)"
+    printf 'release_count=%s\n' "$(find "$PREFIX/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    printf 'config_sha256=%s\n' "$(sha256sum "$SYSCONFDIR/angara.toml" 2>/dev/null | awk '{print $1}')"
+    printf 'unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$SERVICE" 2>/dev/null | awk '{print $1}')"
+    printf 'limits:\n'
+    systemctl show -p LimitNOFILE -p TasksMax -p KillMode -p TimeoutStopUSec -p Restart "$SERVICE" 2>/dev/null || true
+    printf 'listeners:\n'
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        ss -ltnp 2>/dev/null | grep "pid=$pid," || true
+    fi
+}
+
+command_uninstall() {
+    require_root
+    require_confirm
+    if service_active; then
+        stop_service
+    fi
+    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$SERVICE"
+    rm -f "$BINDIR/angara" "$SBINDIR/angaractl"
+    rm -f "$PREFIX/current" "$PREFIX/previous"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    if [ "$PURGE" -eq 1 ]; then
+        rm -rf "$PREFIX" "$SYSCONFDIR" "$VARLIB"
+        printf 'purged=yes\n'
+    else
+        printf 'purged=no\n'
+        printf 'preserved=%s\n' "$SYSCONFDIR"
+        printf 'preserved=%s\n' "$PREFIX/releases"
+    fi
+}
+
+case "$COMMAND" in
+    install) command_install_or_upgrade ;;
+    upgrade) command_install_or_upgrade ;;
+    rollback) command_rollback ;;
+    activate) command_activate ;;
+    recover) command_recover ;;
+    status) command_status ;;
+    uninstall) command_uninstall ;;
+    *) die "unknown command: $COMMAND" ;;
+esac
