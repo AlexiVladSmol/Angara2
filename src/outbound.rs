@@ -333,21 +333,6 @@ impl OutboundPlan {
 /// Composed target → source → ACL → routing → DNS → IP policy → dial pipeline.
 ///
 /// Clones share the same resolver, dialer and resource budgets.
-struct DnsGauge(Arc<Telemetry>);
-
-impl DnsGauge {
-    fn new(telemetry: Arc<Telemetry>) -> Self {
-        telemetry.dns_active.fetch_add(1, Ordering::AcqRel);
-        Self(telemetry)
-    }
-}
-
-impl Drop for DnsGauge {
-    fn drop(&mut self) {
-        self.0.dns_active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 struct ConnectingGauge(Arc<Telemetry>);
 
 impl ConnectingGauge {
@@ -377,15 +362,21 @@ pub struct OutboundService {
 impl OutboundService {
     /// Builds the production service with `SystemResolver` and `TcpDialer`.
     pub fn new(config: Arc<Config>) -> Self {
-        let resolver = Arc::new(SystemResolver::new(*config.dns()));
-        let dialer = Arc::new(TcpDialer);
         let telemetry = Telemetry::new();
+        let resolver = Arc::new(SystemResolver::new_with_telemetry(
+            *config.dns(),
+            Arc::clone(&telemetry),
+        ));
+        let dialer = Arc::new(TcpDialer);
         Self::with_components_and_telemetry(config, resolver, dialer, telemetry)
     }
 
     /// Builds a production service sharing caller-owned telemetry.
     pub fn new_with_telemetry(config: Arc<Config>, telemetry: Arc<Telemetry>) -> Self {
-        let resolver = Arc::new(SystemResolver::new(*config.dns()));
+        let resolver = Arc::new(SystemResolver::new_with_telemetry(
+            *config.dns(),
+            Arc::clone(&telemetry),
+        ));
         let dialer = Arc::new(TcpDialer);
         Self::with_components_and_telemetry(config, resolver, dialer, telemetry)
     }
@@ -530,9 +521,7 @@ impl OutboundService {
         let addresses = match target.host() {
             Host::Ip(ip) => vec![*ip],
             Host::Domain(domain) => {
-                let gauge = DnsGauge::new(Arc::clone(&self.telemetry));
                 let result = self.resolver.resolve(domain.as_str(), deadline).await;
-                drop(gauge);
                 let addresses = match result {
                     Ok(addresses) => addresses,
                     Err(error) => {

@@ -61,7 +61,7 @@ pub struct ExchangeMeta {
     connection_id: u64,
     request_id: u64,
     listener_id: String,
-    status: StatusCode,
+    status: Option<StatusCode>,
     request_body_bytes: Arc<AtomicU64>,
 }
 
@@ -71,14 +71,54 @@ impl ExchangeMeta {
         self.generation
     }
 
-    /// Terminal HTTP status.
-    pub fn status(&self) -> StatusCode {
+    /// Terminal HTTP status when a response was produced.
+    pub fn status(&self) -> Option<StatusCode> {
         self.status
     }
 
     /// Observed request DATA bytes at terminal time.
     pub fn request_body_bytes(&self) -> u64 {
         self.request_body_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Exactly-once terminal guard for an admitted exchange. Until the response
+/// body is armed, dropping the future records a cancellation instead of
+/// leaving `http_started` without an outcome.
+struct ExchangeTerminal {
+    telemetry: Arc<Telemetry>,
+    logger: Logger,
+    meta: ExchangeMeta,
+    disarmed: bool,
+}
+
+impl ExchangeTerminal {
+    fn new(telemetry: Arc<Telemetry>, logger: Logger, meta: ExchangeMeta) -> Self {
+        Self {
+            telemetry,
+            logger,
+            meta,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ExchangeTerminal {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        log_terminal(
+            &self.telemetry,
+            &self.logger,
+            &self.meta,
+            crate::http::BodyOutcome::Cancelled,
+            0,
+        );
     }
 }
 
@@ -461,13 +501,19 @@ impl Proxy {
                         .boxed(),
                 )
             });
+        let tunnel_generation = origin.endpoint().generation();
         let setup = TunnelSetup {
             on_upgrade,
             origin,
             deadline: tokio::time::Instant::now() + config.limits().idle_timeout(),
             idle_timeout: config.limits().idle_timeout(),
             half_close_timeout: config.connect().half_close_timeout(),
-            gauge: crate::http::connect::TunnelGauge::new(Arc::clone(&self.telemetry)),
+            gauge: crate::http::connect::TunnelGauge::new(
+                Arc::clone(&self.telemetry),
+                self.logger(),
+                tunnel_generation,
+                client.connection_id,
+            ),
         };
         self.telemetry
             .connect_started
@@ -489,6 +535,17 @@ impl Proxy {
         self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.snapshots.load();
         let request_body_bytes = Arc::new(AtomicU64::new(0));
+        let mut meta = ExchangeMeta {
+            generation: snapshot.generation(),
+            started,
+            connection_id: client.connection_id,
+            request_id: client.request_id,
+            listener_id: client.listener_id.clone(),
+            status: None,
+            request_body_bytes,
+        };
+        let mut terminal =
+            ExchangeTerminal::new(Arc::clone(&self.telemetry), self.logger(), meta.clone());
         let mut response = if self.is_draining() {
             headers::error_response(StatusCode::SERVICE_UNAVAILABLE, true)
         } else {
@@ -497,19 +554,12 @@ impl Proxy {
                 client.clone(),
                 interim,
                 &snapshot,
-                Arc::clone(&request_body_bytes),
+                Arc::clone(&meta.request_body_bytes),
             )
             .await
         };
-        let meta = ExchangeMeta {
-            generation: snapshot.generation(),
-            started,
-            connection_id: client.connection_id,
-            request_id: client.request_id,
-            listener_id: client.listener_id.clone(),
-            status: response.status(),
-            request_body_bytes,
-        };
+        meta.status = Some(response.status());
+        terminal.disarm();
         response.extensions_mut().insert(meta);
         response
     }
@@ -521,52 +571,47 @@ impl Proxy {
         outcome: crate::http::BodyOutcome,
         response_body_bytes: u64,
     ) {
-        let status = meta.status;
-        match outcome {
-            crate::http::BodyOutcome::Cancelled => {
-                self.telemetry
-                    .http_cancelled
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            crate::http::BodyOutcome::Success | crate::http::BodyOutcome::Failed => {
-                self.telemetry
-                    .http_completed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if status.is_success() {
-            self.telemetry.http_2xx.fetch_add(1, Ordering::Relaxed);
-        } else if status.is_redirection() {
-            self.telemetry.http_3xx.fetch_add(1, Ordering::Relaxed);
-        } else if status.is_client_error() {
+        log_terminal(
+            &self.telemetry,
+            &self.logger(),
+            &meta,
+            outcome,
+            response_body_bytes,
+        );
+    }
+
+    /// Logs a CONNECT request rejected before a tunnel existed. This is a
+    /// terminal request outcome, not a tunnel event.
+    pub(crate) fn log_connect_rejected(
+        &self,
+        client: &ClientInfo,
+        started: tokio::time::Instant,
+        status: StatusCode,
+    ) {
+        self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .http_completed
+            .fetch_add(1, Ordering::Relaxed);
+        if status.is_client_error() {
             self.telemetry.http_4xx.fetch_add(1, Ordering::Relaxed);
         } else {
             self.telemetry.http_5xx.fetch_add(1, Ordering::Relaxed);
         }
-        self.telemetry.observe_http(meta.started.elapsed());
-        let outcome = match outcome {
-            crate::http::BodyOutcome::Success if status.is_server_error() => Outcome::Failed,
-            crate::http::BodyOutcome::Success => Outcome::Success,
-            crate::http::BodyOutcome::Failed => Outcome::Failed,
-            crate::http::BodyOutcome::Cancelled => Outcome::Cancelled,
-        };
-        let request_body_bytes = meta.request_body_bytes();
+        self.telemetry.observe_http(started.elapsed());
+        self.telemetry
+            .connect_rejected
+            .fetch_add(1, Ordering::Relaxed);
         let mut record = LogRecord::new(Event::RequestFinished);
-        record.outcome = Some(outcome);
-        record.reason = Some(match outcome {
-            Outcome::Success => Reason::Completed,
-            Outcome::Cancelled => Reason::ClientClosed,
-            _ => Reason::Error,
-        });
-        record.generation = Some(meta.generation);
-        record.connection_id = Some(meta.connection_id);
-        record.request_id = Some(meta.request_id);
-        record.listener_id = Some(meta.listener_id);
+        record.outcome = Some(Outcome::Failed);
+        record.reason = Some(Reason::Rejected);
+        record.generation = Some(self.snapshots.generation());
+        record.connection_id = Some(client.connection_id);
+        record.request_id = Some(client.request_id);
+        record.listener_id = Some(client.listener_id.clone());
         record.status = Some(status.as_u16());
-        record.elapsed_ms =
-            Some(u64::try_from(meta.started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        record.request_body_bytes = Some(request_body_bytes);
-        record.response_body_bytes = Some(response_body_bytes);
+        record.elapsed_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        record.request_body_bytes = Some(0);
+        record.response_body_bytes = Some(0);
         self.logger().log(record);
     }
 
@@ -899,6 +944,62 @@ impl Proxy {
             .pool
             .new_lease(plan, endpoint, PooledSender::new(sender, task)))
     }
+}
+
+fn log_terminal(
+    telemetry: &Telemetry,
+    logger: &Logger,
+    meta: &ExchangeMeta,
+    outcome: crate::http::BodyOutcome,
+    response_body_bytes: u64,
+) {
+    match outcome {
+        crate::http::BodyOutcome::Cancelled => {
+            telemetry.http_cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::http::BodyOutcome::Success | crate::http::BodyOutcome::Failed => {
+            telemetry.http_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(status) = meta.status {
+        if status.is_success() {
+            telemetry.http_2xx.fetch_add(1, Ordering::Relaxed);
+        } else if status.is_redirection() {
+            telemetry.http_3xx.fetch_add(1, Ordering::Relaxed);
+        } else if status.is_client_error() {
+            telemetry.http_4xx.fetch_add(1, Ordering::Relaxed);
+        } else {
+            telemetry.http_5xx.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    telemetry.observe_http(meta.started.elapsed());
+    let outcome = match outcome {
+        crate::http::BodyOutcome::Success
+            if meta.status.is_some_and(|status| status.is_server_error()) =>
+        {
+            Outcome::Failed
+        }
+        crate::http::BodyOutcome::Success => Outcome::Success,
+        crate::http::BodyOutcome::Failed => Outcome::Failed,
+        crate::http::BodyOutcome::Cancelled => Outcome::Cancelled,
+    };
+    let request_body_bytes = meta.request_body_bytes();
+    let mut record = LogRecord::new(Event::RequestFinished);
+    record.outcome = Some(outcome);
+    record.reason = Some(match outcome {
+        Outcome::Success => Reason::Completed,
+        Outcome::Cancelled => Reason::ClientClosed,
+        _ => Reason::Error,
+    });
+    record.generation = Some(meta.generation);
+    record.connection_id = Some(meta.connection_id);
+    record.request_id = Some(meta.request_id);
+    record.listener_id = Some(meta.listener_id.clone());
+    record.status = meta.status.map(|status| status.as_u16());
+    record.elapsed_ms = Some(u64::try_from(meta.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    record.request_body_bytes = Some(request_body_bytes);
+    record.response_body_bytes = Some(response_body_bytes);
+    logger.log(record);
 }
 
 fn options_without_path(target: &str) -> bool {

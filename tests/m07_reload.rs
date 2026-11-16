@@ -3,14 +3,20 @@
 mod common;
 
 use std::fs;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Waker};
+use std::time::{Duration, Instant};
 
 use angara::config::Config;
 use angara::control::{Lifecycle, ReloadOutcome};
 use angara::http::HttpServer;
 use angara::logging::{Event, LogRecord, Logger};
+use angara::resolver::{ResolveError, Resolver, SystemResolver};
+use angara::telemetry::Telemetry;
 use common::TempDir;
 use common::m03::{self, RawClient};
 use common::m04;
@@ -189,6 +195,39 @@ fn authenticated_request(
 
 async fn status(client: &mut RawClient) -> u16 {
     client.read_response().await.expect("response").head.status
+}
+
+async fn wait_lifecycle(control: &angara::control::ControlState, target: Lifecycle) {
+    for _ in 0..200 {
+        if control.status().lifecycle == target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("lifecycle did not reach {target:?}");
+}
+
+async fn wait_true(value: &AtomicBool) {
+    for _ in 0..200 {
+        if value.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition did not become true");
+}
+
+fn receive_event(receiver: &std::sync::mpsc::Receiver<String>, event: &str) -> serde_json::Value {
+    for _ in 0..40 {
+        let text = receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("terminal log");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        if value["event"] == event {
+            return value;
+        }
+    }
+    panic!("event {event} not logged");
 }
 
 #[tokio::test]
@@ -1153,6 +1192,335 @@ async fn m07_shut01_past_absolute_deadline_forces_without_a_new_window() {
         "past deadline was extended: {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn m07_shut02_aborted_caller_does_not_cancel_service_coordinator() {
+    let dir = TempDir::new("m07-shut02");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = config_text(
+        dir.path(),
+        echo.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    let (server, address) = start_text(dir.path(), text).await;
+    let control = server.control();
+    let mut tunnel = open_tunnel(address, echo.address, "alice", "alice-secret").await;
+    let task = tokio::spawn({
+        let control = Arc::clone(&control);
+        async move {
+            control
+                .shutdown(angara::control::ShutdownReason::Control)
+                .await;
+        }
+    });
+    wait_lifecycle(&control, Lifecycle::Draining).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    task.abort();
+    assert!(task.await.is_err(), "shutdown caller was not aborted");
+    wait_lifecycle(&control, Lifecycle::Stopped).await;
+    for _ in 0..100 {
+        if control.status().connect_active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(control.status().connect_active, 0);
+    let closed = tokio::time::timeout(Duration::from_secs(2), tunnel.read_until_eof()).await;
+    assert!(closed.is_ok(), "tunnel stayed alive after aborted caller");
+    let started = Instant::now();
+    control
+        .shutdown(angara::control::ShutdownReason::Control)
+        .await;
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(control.status().lifecycle, Lifecycle::Stopped);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m07_shut03_http_server_shutdown_uses_current_hot_timeout() {
+    let dir = TempDir::new("m07-shut03");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let startup = config_text(
+        dir.path(),
+        echo.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 1000");
+    let (server, address) = start_text(dir.path(), startup).await;
+    let lowered = config_text(
+        dir.path(),
+        echo.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 50");
+    fs::write(dir.path().join("proxy.toml"), lowered).expect("lowered shutdown");
+    assert_eq!(
+        server.control().reload(1).await,
+        ReloadOutcome::Applied { generation: 2 }
+    );
+    let _tunnel = open_tunnel(address, echo.address, "alice", "alice-secret").await;
+    let started = Instant::now();
+    server.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "HttpServer::shutdown used the startup timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn m07_cancel03_ready_candidate_holds_the_single_operation_slot() {
+    let dir = TempDir::new("m07-cancel03");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"ok"))
+        .await
+        .expect("origin");
+    let (server, _) = start(
+        dir.path(),
+        origin.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .await;
+    let control = server.control();
+    let mut candidate = Box::pin(control.reload(1));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(candidate.as_mut().poll(&mut context).is_pending());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(control.status().reload_busy);
+    assert_eq!(control.reload(1).await, ReloadOutcome::Busy);
+    drop(candidate);
+    for _ in 0..200 {
+        if !control.status().reload_busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        control.reload(1).await,
+        ReloadOutcome::Applied { generation: 2 }
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m07_met03_dns_gauge_tracks_the_actual_blocking_job() {
+    let mut text = m03::config("127.0.0.1:3128");
+    text.push_str("\n[dns]\ntimeout_ms = 100\nmax_in_flight = 1\nmax_answers = 8\n");
+    let config = Config::parse(&text).expect("dns config");
+    let dns = *config.dns();
+    let telemetry = Telemetry::new();
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let started_lookup = Arc::clone(&started);
+    let finished_lookup = Arc::clone(&finished);
+    let lookup: angara::resolver::BlockingLookup = Arc::new(move |_| {
+        started_lookup.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(300));
+        finished_lookup.store(true, Ordering::Release);
+        Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    });
+    let resolver =
+        SystemResolver::with_lookup_and_telemetry(dns, lookup, Some(Arc::clone(&telemetry)));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let outer = tokio::time::timeout(
+        Duration::from_millis(50),
+        resolver.resolve("example.test", deadline),
+    )
+    .await;
+    assert!(outer.is_err());
+    wait_true(&started).await;
+    assert_eq!(telemetry.snapshot().dns_active, 1);
+    assert_eq!(
+        resolver.resolve("busy.test", deadline).await,
+        Err(ResolveError::Busy)
+    );
+    wait_true(&finished).await;
+    for _ in 0..100 {
+        if telemetry.snapshot().dns_active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(telemetry.snapshot().dns_active, 0);
+}
+
+#[tokio::test]
+async fn m07_log05_http_force_shutdown_logs_terminal_cancellation() {
+    let dir = TempDir::new("m07-log05");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let origin = m04::spawn_holding_origin().await.expect("holding origin");
+    let text = config_text(
+        dir.path(),
+        origin.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    let (server, address) = start_text(dir.path(), text).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let mut client = RawClient::connect(address).await.expect("client");
+    client
+        .send(&authenticated_request(
+            origin.address,
+            "alice",
+            "alice-secret",
+            false,
+        ))
+        .await
+        .expect("send");
+    for _ in 0..100 {
+        if origin.accepts.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(origin.accepts.load(Ordering::Acquire) > 0);
+    server.shutdown().await;
+    drop(client);
+    let record = receive_event(&receiver, "request_finished");
+    assert_eq!(record["outcome"], "cancelled");
+    assert!(record.get("status").is_none());
+    let metrics = telemetry.snapshot();
+    assert!(metrics.http_started >= 1);
+    assert_eq!(metrics.http_completed, 0);
+    assert_eq!(metrics.http_cancelled, 1);
+}
+
+#[tokio::test]
+async fn m07_log06_rejected_connect_gets_a_request_terminal() {
+    let dir = TempDir::new("m07-log06");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = config_text(
+        dir.path(),
+        echo.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace(
+        &format!("allowed_ports = [{}]", echo.address.port()),
+        "allowed_ports = [1]",
+    );
+    let (server, address) = start_text(dir.path(), text).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let mut client = RawClient::connect(address).await.expect("client");
+    send_connect(&mut client, echo.address, "alice", "alice-secret").await;
+    assert_eq!(client.read_head().await.expect("403").status, 403);
+    let record = receive_event(&receiver, "request_finished");
+    assert_eq!(record["status"], 403);
+    assert_eq!(record["outcome"], "failed");
+    assert_eq!(record["reason"], "rejected");
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.http_started, 1);
+    assert_eq!(metrics.http_completed, 1);
+    assert_eq!(metrics.connect_rejected, 1);
+    assert_eq!(metrics.connect_started, 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m07_log07_force_shutdown_logs_cancelled_connect_tunnel() {
+    let dir = TempDir::new("m07-log07");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = config_text(
+        dir.path(),
+        echo.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace("shutdown_timeout_ms = 1500", "shutdown_timeout_ms = 100");
+    let (server, address) = start_text(dir.path(), text).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let _tunnel = open_tunnel(address, echo.address, "alice", "alice-secret").await;
+    server.shutdown().await;
+    let record = receive_event(&receiver, "tunnel_finished");
+    assert_eq!(record["outcome"], "cancelled");
+    assert_eq!(record["reason"], "shutdown");
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.connect_active, 0);
+    assert_eq!(metrics.connect_finished, 1);
+    assert_eq!(metrics.connect_cancelled, 1);
+    assert_eq!(metrics.connect_complete, 0);
+}
+
+#[tokio::test]
+async fn m07_con02_truncated_tunnel_tail_is_not_success() {
+    let dir = TempDir::new("m07-con02");
+    users_file(dir.path(), &[("alice", &m05::hash("alice-secret"), false)]);
+    let origin = m04::spawn_eof_then_write_origin(8 * 1024 * 1024)
+        .await
+        .expect("eof origin");
+    let text = config_text(
+        dir.path(),
+        origin.address.port(),
+        "\"alice\"",
+        8,
+        2,
+        5000,
+        false,
+    )
+    .replace(
+        "half_close_timeout_ms = 1000",
+        "half_close_timeout_ms = 500",
+    );
+    let (server, address) = start_text(dir.path(), text).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) =
+        Logger::channel(128, angara::config::LogLevel::Info, telemetry.clone());
+    server.set_logger(logger);
+    let mut client = m04::connect_small_buffers(address)
+        .await
+        .expect("small client");
+    send_connect(&mut client, origin.address, "alice", "alice-secret").await;
+    assert_eq!(client.read_head().await.expect("200").status, 200);
+    client.shutdown_write().await.expect("client half-close");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let record = receive_event(&receiver, "tunnel_finished");
+    assert_ne!(record["outcome"], "success");
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.connect_complete, 0);
+    assert!(metrics.connect_timeout + metrics.connect_cancelled + metrics.connect_error >= 1);
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.read_until_eof()).await;
+    server.shutdown().await;
 }
 
 #[tokio::test]

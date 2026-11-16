@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, ConfigError};
 use crate::http::forward::Proxy;
@@ -28,7 +28,7 @@ pub enum Lifecycle {
 }
 
 impl Lifecycle {
-    fn load(value: &AtomicU8) -> Self {
+    pub(crate) fn load(value: &AtomicU8) -> Self {
         match value.load(Ordering::Acquire) {
             0 => Self::Running,
             1 => Self::Draining,
@@ -36,7 +36,7 @@ impl Lifecycle {
         }
     }
 
-    fn store(self, value: &AtomicU8) {
+    pub(crate) fn store(self, value: &AtomicU8) {
         value.store(
             match self {
                 Self::Running => 0,
@@ -178,7 +178,7 @@ pub struct ControlState {
     shutdown: ShutdownHandle,
     config_path: Option<PathBuf>,
     preparation: Arc<Semaphore>,
-    lifecycle: AtomicU8,
+    lifecycle: Arc<AtomicU8>,
     publication: Mutex<()>,
     started: Instant,
     last_reload: Mutex<Option<ReloadOutcome>>,
@@ -193,6 +193,7 @@ impl ControlState {
         proxy: Weak<Proxy>,
         shutdown: ShutdownHandle,
         config_path: Option<PathBuf>,
+        lifecycle: Arc<AtomicU8>,
     ) -> Arc<Self> {
         Arc::new(Self {
             snapshots,
@@ -201,7 +202,7 @@ impl ControlState {
             shutdown,
             config_path,
             preparation: Arc::new(Semaphore::new(1)),
-            lifecycle: AtomicU8::new(0),
+            lifecycle,
             publication: Mutex::new(()),
             started: Instant::now(),
             last_reload: Mutex::new(None),
@@ -324,7 +325,7 @@ impl ControlState {
         let Ok(permit) = self.preparation.clone().try_acquire_owned() else {
             return self.record(ReloadOutcome::Busy);
         };
-        let preparation_gauge = PreparationGauge::new(Arc::clone(&self.telemetry));
+        let slot = OperationSlot::new(permit, Arc::clone(&self.telemetry));
         let previous = self.snapshots.load();
         let previous_caps = Arc::clone(&previous);
         let timeout = previous.config().operations().reload_timeout();
@@ -340,12 +341,16 @@ impl ControlState {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _gauge = preparation_gauge;
+            let guard = SlotGuard {
+                _slot: Arc::clone(&slot),
+            };
             if let Some(delay) = delay {
                 std::thread::sleep(delay);
             }
-            Config::load_for_reload(&path, previous.config())
+            PreparedCandidate {
+                result: Config::load_for_reload(&path, previous.config()),
+                _guard: guard,
+            }
         });
         let prepared = match tokio::time::timeout_at(deadline, task).await {
             Ok(Ok(result)) => result,
@@ -354,6 +359,11 @@ impl ControlState {
                 return self.record(ReloadOutcome::TimedOut);
             }
         };
+        let PreparedCandidate {
+            result: prepared,
+            _guard: operation_guard,
+        } = prepared;
+        let _operation_guard = operation_guard;
         let candidate = match prepared {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -482,19 +492,34 @@ impl ControlState {
         outcome
     }
 
-    /// Marks lifecycle as draining. Idempotent.
+    /// Marks lifecycle as draining. Idempotent and monotonic: a stopped
+    /// service can never return to draining.
     pub fn begin_shutdown(&self, _reason: ShutdownReason) {
         let _publication = self
             .publication
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let previous = Lifecycle::load(&self.lifecycle);
-        if previous == Lifecycle::Running {
-            self.telemetry
-                .shutdown_started
-                .fetch_add(1, Ordering::Relaxed);
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            match current {
+                0 => {
+                    match self
+                        .lifecycle
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    {
+                        Ok(_) => {
+                            self.telemetry
+                                .shutdown_started
+                                .fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(actual) => current = actual,
+                    }
+                }
+                1 => return,
+                _ => return,
+            }
         }
-        Lifecycle::Draining.store(&self.lifecycle);
     }
 
     /// Marks lifecycle as stopped after the shutdown coordinator completed.
@@ -506,14 +531,14 @@ impl ControlState {
         Lifecycle::Stopped.store(&self.lifecycle);
     }
 
-    /// Typed idempotent shutdown using the current absolute deadline.
+    /// Typed idempotent shutdown using the current absolute deadline. The
+    /// service-owned coordinator finishes cleanup even if this caller is
+    /// cancelled.
     pub async fn shutdown(&self, reason: ShutdownReason) {
         self.begin_shutdown(reason);
         let timeout = self.snapshots.load().config().limits().shutdown_timeout();
         let deadline = Instant::now() + timeout;
-        if self.shutdown.begin(deadline).await {
-            self.mark_stopped();
-        }
+        self.shutdown.begin(deadline).await;
     }
 
     /// Configured single absolute shutdown budget.
@@ -525,6 +550,40 @@ impl ControlState {
     pub fn max_live_generations(&self) -> usize {
         MAX_LIVE_GENERATIONS
     }
+}
+
+/// One admitted reload operation. The permit is deliberately owned here, not
+/// by the async caller: it stays held while the native job runs and while a
+/// ready candidate is stored in the JoinHandle result.
+struct OperationSlot {
+    permit: Option<OwnedSemaphorePermit>,
+    telemetry: Arc<Telemetry>,
+}
+
+impl OperationSlot {
+    fn new(permit: OwnedSemaphorePermit, telemetry: Arc<Telemetry>) -> Arc<Self> {
+        telemetry.preparation_busy.store(1, Ordering::Release);
+        Arc::new(Self {
+            permit: Some(permit),
+            telemetry,
+        })
+    }
+}
+
+impl Drop for OperationSlot {
+    fn drop(&mut self) {
+        self.permit.take();
+        self.telemetry.preparation_busy.store(0, Ordering::Release);
+    }
+}
+
+struct SlotGuard {
+    _slot: Arc<OperationSlot>,
+}
+
+struct PreparedCandidate {
+    result: Result<Config, ConfigError>,
+    _guard: SlotGuard,
 }
 
 fn classify(error: ConfigError) -> ReloadOutcome {
@@ -547,23 +606,6 @@ fn classify(error: ConfigError) -> ReloadOutcome {
 
 fn bounded_fields(path: String) -> Vec<String> {
     vec![path.chars().take(160).collect()]
-}
-
-struct PreparationGauge {
-    telemetry: Arc<Telemetry>,
-}
-
-impl PreparationGauge {
-    fn new(telemetry: Arc<Telemetry>) -> Self {
-        telemetry.preparation_busy.store(1, Ordering::Release);
-        Self { telemetry }
-    }
-}
-
-impl Drop for PreparationGauge {
-    fn drop(&mut self) {
-        self.telemetry.preparation_busy.store(0, Ordering::Release);
-    }
 }
 
 impl std::fmt::Debug for ControlState {

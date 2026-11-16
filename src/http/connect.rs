@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::logging::{Event, LogRecord, Logger, Outcome, Reason};
 use crate::outbound::Connected;
 use crate::telemetry::Telemetry;
 
@@ -30,16 +31,33 @@ pub(crate) struct TunnelSetup {
 /// reason; dropping without an explicit finish records a cancellation.
 pub(crate) struct TunnelGauge {
     telemetry: Arc<Telemetry>,
+    logger: Logger,
+    generation: u64,
+    connection_id: u64,
+    progress: Option<Arc<TunnelProgress>>,
     finished: bool,
 }
 
 impl TunnelGauge {
-    pub(crate) fn new(telemetry: Arc<Telemetry>) -> Self {
+    pub(crate) fn new(
+        telemetry: Arc<Telemetry>,
+        logger: Logger,
+        generation: u64,
+        connection_id: u64,
+    ) -> Self {
         telemetry.connect_active.fetch_add(1, Ordering::AcqRel);
         Self {
             telemetry,
+            logger,
+            generation,
+            connection_id,
+            progress: None,
             finished: false,
         }
+    }
+
+    pub(crate) fn attach_progress(&mut self, progress: Arc<TunnelProgress>) {
+        self.progress = Some(progress);
     }
 
     pub(crate) fn finish(&mut self, end: &TunnelEnd) {
@@ -51,40 +69,54 @@ impl TunnelGauge {
         self.telemetry
             .connect_finished
             .fetch_add(1, Ordering::Relaxed);
-        match end {
+        let (outcome, reason) = match end {
             TunnelEnd::Complete { .. } => {
                 self.telemetry
                     .connect_complete
                     .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Success, Reason::Completed)
             }
             TunnelEnd::Idle => {
                 self.telemetry.connect_idle.fetch_add(1, Ordering::Relaxed);
+                (Outcome::Cancelled, Reason::Idle)
             }
             TunnelEnd::HalfCloseTimeout => {
                 self.telemetry
                     .connect_timeout
                     .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Failed, Reason::Timeout)
             }
             TunnelEnd::Io => {
                 self.telemetry.connect_error.fetch_add(1, Ordering::Relaxed);
+                (Outcome::Failed, Reason::Error)
             }
-        }
+            TunnelEnd::Cancelled => {
+                self.telemetry
+                    .connect_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+                (Outcome::Cancelled, Reason::Shutdown)
+            }
+        };
+        let mut record = LogRecord::new(Event::TunnelFinished);
+        record.outcome = Some(outcome);
+        record.reason = Some(reason);
+        record.generation = Some(self.generation);
+        record.connection_id = Some(self.connection_id);
+        record.tunnel_bytes = Some(
+            self.progress
+                .as_ref()
+                .map(|progress| progress.total_bytes())
+                .unwrap_or(0),
+        );
+        self.logger.log(record);
     }
 }
 
 impl Drop for TunnelGauge {
     fn drop(&mut self) {
-        if self.finished {
-            return;
+        if !self.finished {
+            self.finish(&TunnelEnd::Cancelled);
         }
-        self.finished = true;
-        self.telemetry.connect_active.fetch_sub(1, Ordering::AcqRel);
-        self.telemetry
-            .connect_finished
-            .fetch_add(1, Ordering::Relaxed);
-        self.telemetry
-            .connect_cancelled
-            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -100,6 +132,8 @@ pub(crate) enum TunnelEnd {
     HalfCloseTimeout,
     /// A socket read/write failed or was reset.
     Io,
+    /// The service was forced down before the tunnel could reach a normal end.
+    Cancelled,
 }
 
 pub(crate) async fn run(

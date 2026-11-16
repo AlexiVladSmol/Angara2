@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use crate::http::idle::IdleState;
 use crate::http::interim::{InterimHub, SplitIo, TransportProgress, writer_loop};
 use crate::http::{BodyCompletion, BodyOutcome, ConnectionOutput, ExchangeBody, ResponseBody};
 use crate::limits::{CapController, CapPermit};
-use crate::logging::{Event, LogRecord, MetricsSummary, Outcome, Reason};
+use crate::logging::{Event, LogRecord, MetricsSummary};
 use crate::policy;
 use crate::tls::TLS_APP_BUFFER_BYTES;
 use http_body_util::BodyExt;
@@ -68,19 +68,45 @@ pub struct ShutdownHandle {
     force: watch::Sender<bool>,
     tasks: TaskTracker,
     proxy: Arc<Proxy>,
-    shutdown_timeout: Duration,
-    started: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU8>,
+    state: Arc<ShutdownState>,
+}
+
+struct ShutdownState {
+    started: AtomicBool,
+    done_tx: watch::Sender<bool>,
+    done_rx: watch::Receiver<bool>,
 }
 
 impl ShutdownHandle {
-    /// Starts the one absolute drain/force deadline. Repeated calls are
-    /// idempotent and never extend the original deadline. Returns `true` only
-    /// for the caller that actually ran the coordinator.
+    /// Starts the one absolute drain/force deadline. The coordinator is a
+    /// service-owned task, so aborting the caller does not cancel cleanup.
+    /// Repeated calls wait for the same coordinator; the first deadline wins.
     pub async fn begin(&self, deadline: std::time::Instant) -> bool {
-        if self.started.swap(true, Ordering::AcqRel) {
+        if crate::control::Lifecycle::load(&self.lifecycle) == crate::control::Lifecycle::Stopped {
+            let _ = self.state.done_tx.send(true);
             return false;
         }
-        let deadline = tokio::time::Instant::from_std(deadline);
+
+        let leader = !self.state.started.swap(true, Ordering::AcqRel);
+        if leader {
+            let this = self.clone();
+            let deadline = tokio::time::Instant::from_std(deadline);
+            tokio::spawn(async move {
+                this.run(deadline).await;
+            });
+        }
+
+        let mut done = self.state.done_rx.clone();
+        while !*done.borrow() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+        leader
+    }
+
+    async fn run(self, deadline: tokio::time::Instant) {
         self.proxy.begin_shutdown();
         self.proxy.clear_idle_origins();
         let _ = self.drain.send(true);
@@ -94,18 +120,28 @@ impl ShutdownHandle {
             self.tasks.reap_after_abort().await;
         }
         let _ = self.proxy.shutdown_origins().await;
-        true
+        crate::control::Lifecycle::Stopped.store(&self.lifecycle);
+        let _ = self.state.done_tx.send(true);
     }
 
     /// Best-effort immediate cancellation for Drop.
     pub fn force_now(&self) {
         let _ = self.force.send(true);
         self.tasks.abort_all();
+        crate::control::Lifecycle::Stopped.store(&self.lifecycle);
+        let _ = self.state.done_tx.send(true);
     }
 
-    /// Configured shutdown budget.
+    /// Current configured shutdown budget. Reload can change this before the
+    /// first shutdown begins; an already-started coordinator keeps its
+    /// original absolute deadline.
     pub fn timeout(&self) -> Duration {
-        self.shutdown_timeout
+        self.proxy
+            .snapshots()
+            .load()
+            .config()
+            .limits()
+            .shutdown_timeout()
     }
 }
 
@@ -261,13 +297,19 @@ impl HttpServer {
             });
         }
 
+        let lifecycle = Arc::new(AtomicU8::new(0));
+        let (done_tx, done_rx) = watch::channel(false);
         let shutdown = ShutdownHandle {
             drain,
             force,
             tasks,
             proxy: Arc::clone(&proxy),
-            shutdown_timeout: config.limits().shutdown_timeout(),
-            started: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::clone(&lifecycle),
+            state: Arc::new(ShutdownState {
+                started: AtomicBool::new(false),
+                done_tx,
+                done_rx,
+            }),
         };
         let control = crate::control::ControlState::new(
             proxy.snapshots(),
@@ -275,6 +317,7 @@ impl HttpServer {
             Arc::downgrade(&proxy),
             shutdown.clone(),
             config_path,
+            lifecycle,
         );
         Ok(Self {
             addresses,
@@ -330,9 +373,7 @@ impl HttpServer {
     pub async fn shutdown_until(self, deadline: std::time::Instant) {
         self.control
             .begin_shutdown(crate::control::ShutdownReason::Server);
-        if self.shutdown.begin(deadline).await {
-            self.control.mark_stopped();
-        }
+        self.shutdown.begin(deadline).await;
     }
 }
 
@@ -621,7 +662,6 @@ async fn serve_client<S>(
         Arc::clone(&tunnel_mode),
     );
     let (hub, interim_receiver) = InterimHub::new();
-    let tunnel_proxy = Arc::clone(&proxy);
     let connection_id = proxy.next_connection_id();
     let client = ClientInfo {
         peer: peer.ip(),
@@ -650,14 +690,23 @@ async fn serve_client<S>(
             };
             let mut request_client = client.clone();
             request_client.request_id = proxy.next_request_id();
+            let exchange_started = tokio::time::Instant::now();
             let (response, setup) = if request.method() == http::Method::CONNECT {
                 let on_upgrade = hyper::upgrade::on(&mut request);
+                let connect_client = request_client.clone();
                 match proxy
                     .handle_connect(request, request_client, on_upgrade)
                     .await
                 {
                     Ok((response, setup)) => (response, Some(setup)),
-                    Err(response) => (response, None),
+                    Err(response) => {
+                        proxy.log_connect_rejected(
+                            &connect_client,
+                            exchange_started,
+                            response.status(),
+                        );
+                        (response, None)
+                    }
                 }
             } else {
                 (proxy.handle(request, request_client, interim).await, None)
@@ -751,7 +800,7 @@ async fn serve_client<S>(
                         half_close_timeout,
                         mut gauge,
                     } = setup;
-                    let tunnel_generation = origin.endpoint().generation();
+                    gauge.attach_progress(Arc::clone(&tunnel_progress));
                     let upgraded = tokio::select! {
                         biased;
                         _ = force.changed() => None,
@@ -760,13 +809,7 @@ async fn serve_client<S>(
                         }
                     };
                     let Some(upgraded) = upgraded else {
-                        let mut record = LogRecord::new(Event::TunnelFinished);
-                        record.outcome = Some(Outcome::Cancelled);
-                        record.reason = Some(Reason::Shutdown);
-                        record.generation = Some(tunnel_generation);
-                        record.connection_id = Some(connection_id);
-                        record.tunnel_bytes = Some(tunnel_progress.total_bytes());
-                        tunnel_proxy.logger().log(record);
+                        // The gauge's Drop records the cancelled tunnel.
                         drop(gauge);
                         drop(writer);
                         output.close();
@@ -780,13 +823,15 @@ async fn serve_client<S>(
                         Arc::clone(&tunnel_progress),
                     ));
                     let mut writer_done = false;
-                    let outcome = loop {
+                    let mut writer_error = false;
+                    let relay = loop {
                         tokio::select! {
                             biased;
                             _ = force.changed() => break None,
                             result = &mut writer, if !writer_done => {
                                 writer_done = true;
                                 if result.is_err() {
+                                    writer_error = true;
                                     break None;
                                 }
                             }
@@ -794,37 +839,33 @@ async fn serve_client<S>(
                         }
                     };
                     drop(tunnel);
-                    let (tunnel_outcome, tunnel_reason) = match &outcome {
-                        Some(TunnelEnd::Complete { .. }) => {
-                            (Outcome::Success, Reason::Completed)
-                        }
-                        Some(TunnelEnd::Idle) => (Outcome::Cancelled, Reason::Idle),
-                        Some(TunnelEnd::HalfCloseTimeout) => {
-                            (Outcome::Failed, Reason::Timeout)
-                        }
-                        Some(TunnelEnd::Io) => (Outcome::Failed, Reason::Error),
-                        None => (Outcome::Cancelled, Reason::Shutdown),
+                    let mut final_end = match relay {
+                        Some(end) => end,
+                        None if writer_error => TunnelEnd::Io,
+                        None => TunnelEnd::Cancelled,
                     };
-                    if let Some(end) = &outcome {
-                        gauge.finish(end);
-                    }
-                    drop(gauge);
-                    let mut record = LogRecord::new(Event::TunnelFinished);
-                    record.outcome = Some(tunnel_outcome);
-                    record.reason = Some(tunnel_reason);
-                    record.generation = Some(tunnel_generation);
-                    record.connection_id = Some(connection_id);
-                    record.tunnel_bytes = Some(tunnel_progress.total_bytes());
-                    tunnel_proxy.logger().log(record);
-                    match outcome {
-                        Some(TunnelEnd::Complete { drain_deadline }) if !writer_done => {
-                            if let Some(deadline) = drain_deadline {
-                                let _ = tokio::time::timeout_at(deadline, &mut writer).await;
+                    // A relay Complete is not a successful client transfer
+                    // until the bridge/socket writer has also drained. Reuse
+                    // the first-EOF deadline; a timed-out or failed tail makes
+                    // the terminal outcome failed.
+                    if let TunnelEnd::Complete { drain_deadline } = &final_end
+                        && !writer_done
+                    {
+                        let drain = match drain_deadline {
+                            Some(deadline) => {
+                                tokio::time::timeout_at(*deadline, &mut writer).await
                             }
-                            drop(writer);
+                            None => tokio::time::timeout(idle_timeout, &mut writer).await,
+                        };
+                        match drain {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => final_end = TunnelEnd::Io,
+                            Err(_) => final_end = TunnelEnd::HalfCloseTimeout,
                         }
-                        _ => drop(writer),
                     }
+                    gauge.finish(&final_end);
+                    drop(gauge);
+                    drop(writer);
                     output.close();
                     return;
                 }

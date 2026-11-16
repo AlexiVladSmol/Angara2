@@ -785,10 +785,12 @@ roots; при исчерпании возвращается `GenerationBusy`. Re
 `Weak`-ссылки и удаляет освобождённые поколения; сам registry, metrics и
 status не удерживают историю roots.
 
-Подготовка и публикация разделены. Один permit допускает ровно один
-blocking candidate (queue0); файл читается один раз в ограниченный buffer,
-TOML/PHC проверяются вне async workers. Публикация — короткая секция под
-отдельным lifecycle-mutex: expected generation, deadline, `Running` и
+Подготовка и публикация разделены. Один admission guard допускает ровно один
+blocking candidate (queue0) и удерживается до publish/уничтожения готового
+результата, даже если native job уже завершился; caller drop/timeout не
+освобождает слот работающего job. Файл читается один раз в ограниченный
+buffer, TOML/PHC проверяются вне async workers. Публикация — короткая секция
+под отдельным lifecycle-mutex: expected generation, deadline, `Running` и
 generation cap проверяются вместе с CAS-заменой root. Поэтому `Draining`
 не может быть обойдён поздним candidate, а `SIGTERM` отменяет ещё не
 опубликованный reload.
@@ -814,11 +816,16 @@ cert/key: при прежних TLS paths используются prepared Arcs
 - SIGHUP запускает тот же reload. Во время выполнения максимум один
   pending-флаг взводится повторными HUP; после завершения выполняется ровно
   один дополнительный reload, без spawn на каждый signal и без очереди
-  waiter-ов. SIGTERM/SIGINT прерывают незавершённый reload-task до publish и
-  вместе с typed shutdown используют один absolute deadline. Draining
-  запрещает новый accept/exchange/reload publish, закрывает idle origins и
-  даёт активной работе оставшееся время; native DNS/Argon2/file jobs не
-  обещают принудительный abort, но их permits остаются ограниченными.
+  waiter-ов. SIGTERM/SIGINT прерывают незавершённый reload-task до publish.
+  Shutdown выполняет один service-owned coordinator: первый absolute deadline
+  и результат сохраняются, abort/timeout вызывающего future не отменяет
+  force/reap, повторные вызовы ждут тот же результат. `HttpServer::shutdown`,
+  `ControlState::shutdown` и CLI берут текущий hot `shutdown_timeout_ms` при
+  первом запуске; уже начатый deadline не меняется. Lifecycle монотонен:
+  `Stopped` не возвращается в `Draining`. Draining запрещает новый
+  accept/exchange/reload publish, закрывает idle origins и даёт активной
+  работе оставшееся время; native DNS/Argon2/file jobs не обещают
+  принудительный abort, но их permits остаются ограниченными.
 - Shared OutboundService/resolver/pool/auth permits/TaskTracker не
   пересоздаются. Client/outbound caps меняются глобально без убийства старых
   holders. Pool key содержит generation/listener/user/egress/endpoint; после
@@ -829,11 +836,17 @@ cert/key: при прежних TLS paths используются prepared Arcs
   `reload_rejected`, `shutdown_started`/`service_stopped`, `request_finished`,
   `tunnel_finished`, `metrics_summary`. `request_finished` появляется после
   завершения или отмены streaming body, а не сразу после заголовков; HEAD и
-  пустое body дают 0. Поля `request_body_bytes`/`response_body_bytes` считают
-  только DATA-кадры соответствующих body, `tunnel_bytes` — положительные
-  plaintext-чтения обоих направлений CONNECT (ранний payload один раз).
-  Один terminal record на exchange/tunnel, record ≤4096 bytes, bounded queue
-  drop-newest с counters. Username, PHC, credentials, URL/path/query, headers,
+  пустое body дают 0. Exactly-once guard создаётся при admission exchange и
+  покрывает auth/DNS/ожидание headers/streaming/force: abort до тела пишет
+  cancelled, а не оставляет `http_started` без outcome. Отвергнутый CONNECT
+  получает `request_finished` со status/reason rejected и не изображает
+  открытый tunnel. `tunnel_finished` для CONNECT пишется только после
+  фактического writer drain; потеря хвоста даёт failed/timeout, не success.
+  Поля `request_body_bytes`/`response_body_bytes` считают только DATA-кадры
+  соответствующих body, `tunnel_bytes` — положительные plaintext-чтения
+  обоих направлений CONNECT (ранний payload один раз). Один terminal record
+  на exchange/tunnel, record ≤4096 bytes, bounded queue drop-newest с
+  counters. Username, PHC, credentials, URL/path/query, headers,
   source/destination IP, TLS material и payload не журналируются.
 - Logging ownership: один CLI-owned stderr worker на процесс, очередь
   `log_queue_capacity`; producers используют `try_send` и не блокируют
@@ -847,8 +860,10 @@ cert/key: при прежних TLS paths используются prepared Arcs
   `1, 5, 10, 25, 50, 100, 500, 1000` плюс overflow bucket; units — ms.
   Reload не сбрасывает counters. `metrics_enabled=false` отключает
   histograms/summary, но structural counters, бюджеты и control status
-  работают. `status()` дополнительно отдаёт configured listeners/egress,
-  in-use gauges и последний safe reload outcome без Config/Users Arcs.
+  работают. `dns_active` привязан к фактическому blocking lookup: timeout/drop
+  ожидающего future не уменьшает gauge, пока native job не завершится.
+  `status()` дополнительно отдаёт configured listeners/egress, in-use gauges
+  и последний safe reload outcome без Config/Users Arcs.
 
 Полный стенд — [`examples/m07-operations-local.toml`](examples/m07-operations-local.toml)
 (HTTP+HTTPS/Basic). Безопасный локальный сценарий:
