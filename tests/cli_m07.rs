@@ -8,8 +8,14 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+
+// These tests spawn real `serve` processes and reserve ports by binding then
+// dropping a listener. Serialize them so parallel cargo-test threads cannot
+// race for the same ephemeral port.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -102,12 +108,17 @@ fn wait_with_deadline(child: &mut Child, timeout: Duration) -> std::process::Exi
 }
 
 fn request(proxy_port: u16, origin_port: u16) -> u16 {
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("proxy connect");
-    write!(
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", proxy_port)) else {
+        return 0;
+    };
+    if write!(
         stream,
         "GET http://127.0.0.1:{origin_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nConnection: close\r\n\r\n"
     )
-    .expect("request write");
+    .is_err()
+    {
+        return 0;
+    }
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     let text = String::from_utf8_lossy(&response);
@@ -137,6 +148,7 @@ fn kill(child: &Child, signal: &str) {
 
 #[test]
 fn cli_m07_sighup_applies_and_sigterm_stops_within_deadline() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     let dir = common::TempDir::new("m07-signal");
     let proxy_port = free_port();
     let (origin_port, origin_thread) = origin();
@@ -189,6 +201,7 @@ fn cli_m07_sighup_applies_and_sigterm_stops_within_deadline() {
 
 #[test]
 fn cli_m07_stalled_stderr_pipe_does_not_extend_sigterm_deadline() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     let dir = common::TempDir::new("m07-stalled-log");
     let proxy_port = free_port();
     let (origin_port, origin_thread) = origin();
@@ -235,6 +248,7 @@ fn cli_m07_stalled_stderr_pipe_does_not_extend_sigterm_deadline() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_m07_sighup_storm_is_coalesced_and_bounded() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     let dir = common::TempDir::new("m07-hup-storm");
     let proxy_port = free_port();
     let (origin_port, origin_thread) = origin();

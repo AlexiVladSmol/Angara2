@@ -550,7 +550,7 @@ fn m07_cpu01_workers_are_actual_and_reload_does_not_block_independent_http() {
     .expect("runtime");
     let users = dir.path().join("users.toml");
     runtime.block_on(async {
-        let slow = m04::spawn_slow_http_origin(Duration::from_millis(1500))
+        let slow = m04::spawn_slow_http_origin(Duration::from_millis(3000))
             .await
             .expect("slow origin");
         let fast = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"fast"))

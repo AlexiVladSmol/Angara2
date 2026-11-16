@@ -732,6 +732,12 @@ async fn m07_auth02_disabled_unknown_and_users_file_path_reload() {
         .expect("carol send");
     assert_eq!(status(&mut carol).await, 200);
 
+    for _ in 0..50 {
+        if control.metrics().auth_active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let metrics = control.metrics();
     assert!(metrics.auth_ok >= 3);
     assert!(metrics.auth_invalid >= 1);
@@ -810,6 +816,12 @@ async fn m07_met01_counters_follow_real_lifecycle_and_remain_after_reload() {
     assert!(text.len() < 8_192, "metrics snapshot grew: {}", text.len());
     assert!(!text.contains("alice"));
     assert!(!text.contains("127.0.0.1"));
+    for _ in 0..100 {
+        if control.status().client_active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let status = control.status();
     assert!(status.listeners.len() <= 64);
     assert!(status.egress.len() <= 64);
@@ -1271,9 +1283,11 @@ async fn m07_log04_request_response_and_head_byte_counts() {
         }
     }
     let post_record = post_record.expect("post record");
+    assert_eq!(post_record["outcome"], "success");
     assert_eq!(post_record["request_body_bytes"], 5);
     assert_eq!(post_record["response_body_bytes"], 2);
     let head_record = head_record.expect("head record");
+    assert_eq!(head_record["outcome"], "success");
     assert_eq!(head_record["request_body_bytes"], 0);
     assert_eq!(head_record["response_body_bytes"], 0);
     server.shutdown().await;
