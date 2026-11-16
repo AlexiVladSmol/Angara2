@@ -1,6 +1,6 @@
 # Angara — стратегия тестирования
 
-Статус: **план согласован в M00, ревизия 0.2; исполняемые тесты ещё не написаны**. Codex определяет требования и оценивает проверки; DeepSeek реализует тесты и стенды вместе с функциями.
+**Редакция 0.9 от 16 ноября 2026 года.** Приняты M00–M07. Исходный набор M08 включает 412 основных Linux-тестов и три отдельно запускаемые ресурсные проверки.
 
 ## 1. Принципы
 
@@ -59,6 +59,46 @@
 | ADMIN-02 | TUI корректно показывает ограниченные снимки, обрабатывает обрыв API; выход из TUI не останавливает proxy | M11 |
 | ADMIN-03 | Web выключен по умолчанию, слушает loopback; admin auth, Host/Origin/CSRF и конфликт порта проверены | M12, если выбран |
 
+### Контракт приёмки M03
+
+Точные 18 групп M03-SRV/HTTP/POL/POOL/NET/RES/CPU/CFG/REG находятся в [задании M03-r1](tasks/M03_HTTP_PROXY.md). База 45e8815e736d2415b833a33213fca9adeea65b0b — 127 пройденных Linux-тестов M02. Serve впервые открывает HTTP listeners: старые stub/help/netguard ожидания меняются адресно, check и invalid serve остаются без сети. Остальные M02 сценарии сохраняются.
+
+Обязательны фактические raw framing/Expect/103/trailers сценарии, origin accept counters для pool reuse/изоляции, реальный peer и egress, fresh DNS при pool hit, ограниченные body queues/завершение tasks/permits, process shutdown и малый resource report. Проверки проходят на настоящем server path, а не только helper functions. Ограничение server 1xx API hyper фиксируется spike, но не исключает требование. Протокольный corpus включает запрос-ловушку после неоднозначного framing; CL+TE может быть обработан только безопасным исходом RFC 9112 с обязательным close либо отклонён.
+
+### Контракт приёмки M02
+
+Точные M02-TGT/ACL/IP/DNS/NET/CFG/ERR/REG сценарии находятся в [задании M02-r1](tasks/M02_NETWORK_POLICY.md). Обязательно сохранить покрытие исходных 53 тестов M01; ожидания для реализованных в M02 новых ключей меняются по правилам совместимости в задании. Дополнительно обязательны отсутствие DNS/dial при раннем deny, IP-проверка каждого DNS-кандидата, удержание permit до реального завершения blocking lookup, реальный TCP dial и наблюдаемый bind двух исходящих loopback IP. Коды классов ошибок и негативные сценарии проверяются по внешнему поведению.
+
+В историческом контракте M02 check и serve не создают сетевой runtime. M03 намеренно заменяет serve stub настоящим сервером и адаптирует его netguard; запрет сети у check сохраняется. Pool и несколько принимающих listeners проверяются в M03, два NIC — в M08; два исходящих loopback IP M02 не заменяют эти проверки.
+
+Историческая матрица принятого CONNECT — [M04-r1](tasks/M04_CONNECT_TUNNELS.md#7-обязательная-матрица-приёмки-18-m04-id). Она конкретизирует CON-01–04, ACL/CFG/NET/LOAD/OPS: early-byte handoff, single writer и порядок 200, отсутствие ложного успеха, TLS site с проверкой CA/имени клиентом, общий budget, bounded relay/drain/shutdown. Прежние M01–M03 проверки сохраняются; изменение старого 501 для CONNECT не разрешает ослабить TRACE/Upgrade/framing/pool assertions.
+
+M03 R1–R9 закрыты на 96af256, PR #10 слит в 9330cd5. Регрессии особенно защищают output counters только для hyper bytes, shared byte-progress idle, один 100 Continue, trailer nominations, bounded task ownership/shutdown, исходный request-target и explicit sender.ready() перед HTTP pool reuse. Эти требования остаются при рефакторинге CONNECT adapters.
+
+### Контракт приёмки M05
+
+Полная матрица 20 M05-ID и точные resource/CI команды — в [M05-r1](tasks/M05_AUTH_USERS.md#9-обязательная-матрица-приёмки--20-m05-id). Baseline: accepted e7afedf, merge 4903788, 242 основных и три separately run resource checks, успешный CI 42988221130. M04-R1–R5 остаются постоянными regression: reverse drain при origin EOF, progress каждого partial write, единый deadline до финального bridge flush, точная проверка TLS errors и раннего payload.
+
+Auth: real Argon2/PHC и bounded verifier mocks для lifecycle; source-denied/malformed без hash/DNS/dial; unknown/disabled через dummy; одинаковый 407, bounded overload/timeout 503, user ACL 403. Проверять request identity на keep-alive/pipeline и на прямом safe outbound API, pool isolation, user egress, TTY no-echo, users file preparation без сети/runtime, transport opt-in, secret markers. Auth jobs удерживают permits после cancel до actual completion; network shutdown не получает нового grace window. Рост RSS/jobs/FD измеряется отдельно от функциональных assertions.
+
+Локальные auth HTTP+CONNECT TLS fixtures работают без внешних сайтов; 10/20 logical clients не подменяют физические устройства/несколько NIC. В отчёте разделить controlled-rate success и overload с учётом всех 503/retries. Все M01–M04 проверки и три explicit resource checks сохраняются; новое тестирование выполняет DeepSeek вместе с реализацией, docs PR не выдаёт их за уже выполненные.
+
+### Контракт приёмки M06
+
+Точные 22 M06-ID и команды — [M06-r1](tasks/M06_TLS_LISTENERS.md#9-обязательная-матрица-приёмки--22-m06-id). База be548e5, accepted349a4e5,311 основных + 3 explicit resource checks; CI43198437631. M05-R1–R3 остаются regression: один runtime/server deadline, typed safe diagnostics (backtick/fake index), безопасные PHC files и интерактивные пароли со специальными символами.
+
+TLS tests разделяют proxy и site trust: разные CA, SAN/expiry/chain errors проверяет реальный клиент, не любой SSL/OSError. Proxy failure не допускает auth/DNS/dial; site failure приходит после допустимого outer TLS/CONNECT. Layered TLS реализован корректным curl/rustls/MemoryBIO client. Проверяются TLS1.2/1.3/ALPN, zero-queue handshake budget, no plaintext fallback, delayed ClientHello, startup atomicity, generic transport writer/flush, TLS1.3 half-close и TLS1.2 closure semantics, abrupt EOF, first-EOF/global shutdown deadlines.
+
+Ключи генерируются во private tempdir, passwords/private key/PHC не выводятся в artifacts; SSLKEYLOGFILE/keylog/early data/resumption выключены. RSS/FD/tasks и фактическая latency записываются;10/20 logical clients с controlled auth rate не подменяют physical NIC/devices. Полные M01–M05 и3 explicit resource checks обязательны. M06 теперь принят:357 основных тестов+3 resource checks, post-merge CI43403004578 success. Его историческое задание остаётся неизменным; документационная постановка M07 не реализует новые операции.
+
+### Контракт приёмки M07
+
+Полная матрица **25 M07-ID** — [M07-r1](tasks/M07_OPERATIONS.md), Issue #20. Нужны атомарная публикация/CAS/rollback, whole snapshot для old/new exchanges/users, per-request source/auth/policy и pool isolation, глобальные budgets при cap lower/raise и actual native jobs, max16 roots, cancel/late prepare, SIGHUP storm и один shutdown deadline с blocked TLS/log pipe. JSON секреты/кардинальность/record sizes/overflow и metrics actual lifecycle проверяются как самостоятельные свойства, не копией helpers.
+
+Контрольные M06 cases: continuous256B/20ms передаёт16KiB дольше idle1s; early write на21ms + stall завершается примерно через1s от последней записи; zero-progress также bounded. Не возвращать synthetic timer progress. Негативные проверки обязаны отвергать outer timeout и отличать clean TLS close от допустимого force RST.
+
+M04 forced-shutdown test стабилизируется в M07: EOF или конкретный reset допускаются только при действительном force close с actual cleanup; >=20 последовательных Linux повторов, без skip и без ослабления graceful/body/half-close checks. Прежние локальные failures не суммируются в pass. Resource/load reports считают все attempts/errors/retries и проверяют bounded queues/threads/FD/RSS/generations;10/20 clients не означают physical devices/NIC. Systemd/release soak остаются M08.
+
 ## 3. Уровни проверок
 
 **Unit:** канонизация целей, правила ACL, схема config, ошибки credentials, преобразования разрешённых заголовков, состояние limiter. Ожидания выводятся из требований и RFC, а не из тех же helper-функций, которые проверяются.
@@ -95,7 +135,11 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 
 После базового прогона владелец утверждает необходимое число соединений, throughput и допустимые latency/RSS. До этого блокирующие инварианты: нет неконтролируемого роста при фиксированной нагрузке, поток не буферизуется целиком, после завершения возвращаются FD/permits/задачи и перегрузка приводит к ограниченному отказу.
 
-Предложение для M08: 60-минутный soak с включёнными auth и TLS плюс отдельный стресс-профиль; затем для первого пилота — более длинный прогон на целевом сервере. Длительность, concurrency и численные границы фиксируются в Issue до запуска, а не подбираются под результат.
+В [M08-r1](tasks/M08_RELEASE_CANDIDATE.md) закреплены две когорты (10 и 20 клиентов), часовой прогон с TLS и Basic на 20 клиентах и отдельный профиль перегрузки. Документ задаёт длительность, объёмы потоковой передачи, исходные пороги RSS/FD и формат измерений. Рабочую нагрузку клиентов и физические устройства учитывать раздельно. [Issue #23](https://github.com/AlexeiSmol/Angara/issues/23)
+
+### Приёмка M08 на установленном архиве
+
+Полный перечень содержит 18 групп. Проверить происхождение артефакта, безопасную установку, реальный systemd, смену версии A→B→A, две сети и несколько CPU. Для каждого результата фиксировать полный SHA и SHA-256 архива. Часовой сценарий должен запускаться до слияния на ветке реализации или на отдельной VM. Регрессию и отрицательные сценарии M01–M07 сохранить. [M08-r1](tasks/M08_RELEASE_CANDIDATE.md)
 
 ## 6. Как Codex принимает тесты
 
