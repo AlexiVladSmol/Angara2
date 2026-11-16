@@ -14,6 +14,7 @@ BINDIR=/usr/local/bin
 SBINDIR=/usr/local/sbin
 VARLIB=/var/lib/angara
 DESTDIR=
+DESTDIR_INPUT=
 ARCHIVE=
 ARCHIVE_SHA=
 SOURCE_DIR=
@@ -67,7 +68,7 @@ while [ "$#" -gt 0 ]; do
         --archive) [ "$#" -ge 2 ] || die "--archive needs a value"; ARCHIVE=$2; shift 2 ;;
         --sha256) [ "$#" -ge 2 ] || die "--sha256 needs a value"; ARCHIVE_SHA=$2; shift 2 ;;
         --source-dir) [ "$#" -ge 2 ] || die "--source-dir needs a value"; SOURCE_DIR=$2; shift 2 ;;
-        --destdir) [ "$#" -ge 2 ] || die "--destdir needs a value"; DESTDIR=$2; shift 2 ;;
+        --destdir) [ "$#" -ge 2 ] || die "--destdir needs a value"; DESTDIR_INPUT=$2; shift 2 ;;
         --prefix) [ "$#" -ge 2 ] || die "--prefix needs a value"; PREFIX=$2; shift 2 ;;
         --sysconfdir) [ "$#" -ge 2 ] || die "--sysconfdir needs a value"; SYSCONFDIR=$2; shift 2 ;;
         --unit-dir) [ "$#" -ge 2 ] || die "--unit-dir needs a value"; UNIT_DIR=$2; shift 2 ;;
@@ -85,17 +86,12 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ -n "$DESTDIR" ]; then
-    case "$DESTDIR" in
+if [ -n "$DESTDIR_INPUT" ]; then
+    case "$DESTDIR_INPUT" in
         /) die "--destdir / is not a staging directory" ;;
     esac
-    mkdir -p "$DESTDIR"
-    DESTDIR=$(CDPATH= cd -- "$DESTDIR" && pwd)
-    case "$DESTDIR" in
-        /|'') die "--destdir must not resolve to /" ;;
-    esac
-    # A staging tree is deliberately owner-neutral: it may be built by an
-    # unprivileged packager and inspected before a root install.
+    # Resolve and create the staging directory only after the archive hash and
+    # manifest have been verified, so a bad archive cannot create host paths.
     NO_OWNER=1
 else
     [ "$(id -u)" -eq 0 ] || die "real installation requires root; use --destdir for a staging check"
@@ -163,6 +159,14 @@ if [ -n "$EXPECTED_SOURCE_SHA" ] && [ "$SOURCE_SHA" != "$EXPECTED_SOURCE_SHA" ];
 fi
 if [ -n "$EXPECTED_CANDIDATE" ] && [ "$CANDIDATE" != "$EXPECTED_CANDIDATE" ]; then
     die "candidate mismatch: expected $EXPECTED_CANDIDATE, got $CANDIDATE"
+fi
+
+if [ -n "$DESTDIR_INPUT" ]; then
+    mkdir -p "$DESTDIR_INPUT"
+    DESTDIR=$(CDPATH= cd -- "$DESTDIR_INPUT" && pwd)
+    case "$DESTDIR" in
+        /|'') die "--destdir must not resolve to /" ;;
+    esac
 fi
 
 path() {

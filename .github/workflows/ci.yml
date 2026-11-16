@@ -682,6 +682,9 @@ jobs:
         run: sudo --preserve-env=M08_BIN bash tests/m08/functional.sh
       - name: Run streaming checks
         run: sudo --preserve-env=M08_BIN bash tests/m08/streaming.sh
+      - name: Make reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -753,6 +756,9 @@ jobs:
         run: sudo --preserve-env=M08_BIN bash tests/m08/workers.sh
       - name: Run overload checks
         run: sudo --preserve-env=M08_BIN bash tests/m08/overload.sh
+      - name: Make reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -853,6 +859,9 @@ jobs:
         env:
           M08_SOAK_SECONDS: "3600"
         run: sudo --preserve-env=M08_BIN,M08_SOAK_SECONDS bash tests/m08/soak_stand.sh
+      - name: Make soak reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
       - name: Upload soak report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

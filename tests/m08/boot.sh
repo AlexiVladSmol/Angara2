@@ -38,7 +38,7 @@ SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source
 ROOT="$TMP/rootfs"
 log "debootstrap noble rootfs (this takes several minutes)"
 debootstrap --variant=minbase \
-    --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3-minimal \
+    --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
     noble "$ROOT" http://archive.ubuntu.com/ubuntu/ \
     >"$TMP/debootstrap.log" 2>&1 \
     || fail "debootstrap failed; see $TMP/debootstrap.log"

@@ -16,6 +16,7 @@ cleanup() {
     rm -rf "$TMP"
 }
 trap cleanup EXIT HUP INT TERM
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then systemctl status angara.service --no-pager >&2 2>&1 || true; journalctl -u angara.service -n 80 --no-pager >&2 2>&1 || true; fi' ERR
 umask 077
 
 python3 "$M08_DIR/origin.py" --host 127.0.0.1 --port 18080 \
@@ -99,11 +100,11 @@ assert_eq "$(awk '/Max open files/{print $4}' "/proc/$PID/limits")" "16384" "pro
 ss -ltnp | grep -q "127.0.0.1:3128.*pid=$PID"
 runuser -u angara -- "$BIN" check --config /etc/angara/angara.toml >/dev/null
 
-ORIGIN_BEFORE=$(wc -l <"$TMP/origin.log" 2>/dev/null || echo 0)
+ORIGIN_BEFORE=$(line_count "$TMP/origin.log")
 CODE=$(http_code http://127.0.0.1:3128 http://127.0.0.1:18080/)
 assert_eq "$CODE" "403" "initial default deny"
 sleep 0.3
-ORIGIN_AFTER=$(wc -l <"$TMP/origin.log" 2>/dev/null || echo 0)
+ORIGIN_AFTER=$(line_count "$TMP/origin.log")
 assert_eq "$ORIGIN_AFTER" "$ORIGIN_BEFORE" "initial deny origin connections"
 
 # Apply an allowing generation with a 1 s metrics interval.  The interval is
@@ -117,7 +118,13 @@ COMMON=(
 python3 "$M08_DIR/make_config.py" --output "$TMP/allow.toml" --mode functional \
     "${COMMON[@]}"
 write_config "$TMP/allow.toml"
-systemctl restart angara.service
+runuser -u angara -- "$BIN" check --config /etc/angara/angara.toml \
+    || fail "G1 config is not readable/valid for angara"
+if ! systemctl restart angara.service; then
+    systemctl status angara.service --no-pager >&2 || true
+    journalctl -u angara.service -n 80 --no-pager >&2 || true
+    fail "systemctl restart with G1 config failed"
+fi
 wait_service_active
 wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
 PID=$(systemctl show -p MainPID --value angara.service)

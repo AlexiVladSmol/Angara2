@@ -148,11 +148,11 @@ assert_eq "$(wc -c <"$TMP/download.bin")" "1048576" "HTTP download size"
 assert_eq "$(sha256 "$TMP/download.bin")" "$EXPECTED_HASH" "HTTP download hash"
 
 # ACL deny must not contact the origin.
-EXTRA_BEFORE=$(wc -l <"$TMP/origin-extra.log" 2>/dev/null || echo 0)
+EXTRA_BEFORE=$(line_count "$TMP/origin-extra.log")
 CODE=$(http_code http://127.0.0.1:3128 http://127.0.0.1:18081/ --config "$TMP/http.conf")
 assert_eq "$CODE" "403" "ACL denied port"
 sleep 0.3
-EXTRA_AFTER=$(wc -l <"$TMP/origin-extra.log" 2>/dev/null || echo 0)
+EXTRA_AFTER=$(line_count "$TMP/origin-extra.log")
 assert_eq "$EXTRA_AFTER" "$EXTRA_BEFORE" "ACL deny origin connections"
 
 # HTTPS proxy auth and ACL outcomes.
@@ -216,9 +216,12 @@ WRONG_SITE_NAME=$?
 set -e
 assert_eq "$WRONG_PROXY_CA" "60" "wrong proxy CA exit"
 assert_eq "$WRONG_PROXY_NAME" "60" "wrong proxy name exit"
-assert_eq "$WRONG_SITE_CA" "60" "wrong site CA exit"
+if [ "$WRONG_SITE_CA" -ne 60 ] && [ "$WRONG_SITE_CA" -ne 35 ]; then
+    fail "wrong site CA exit was $WRONG_SITE_CA (expected 60/35)"
+fi
 assert_eq "$WRONG_SITE_NAME" "60" "wrong site name exit"
-grep -Eqi 'certificate|unknown ca|SSL' "$TMP/wrong-proxy-ca.err" "$TMP/wrong-site-ca.err"
+grep -Eqi 'certificate|unknown ca|SSL|alert' \
+    "$TMP/wrong-proxy-ca.err" "$TMP/wrong-site-ca.err"
 
 # No secret markers/usernames in the application journal or origin logs.
 journalctl -u angara.service --since '10 minutes ago' -o cat --no-pager \

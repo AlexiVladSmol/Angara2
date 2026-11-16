@@ -68,6 +68,7 @@ def write_curl_config(
     site_ca: str,
     url: str,
     count: int,
+    report: bool = True,
 ) -> None:
     lines = ["silent", "show-error", f'proxy = "{proxy}"']
     if proxy_ca:
@@ -76,13 +77,14 @@ def write_curl_config(
         lines.append(f'proxy-user = "{user}:{password}"')
     if site_ca:
         lines.append(f'cacert = "{site_ca}"')
-    lines.extend(
-        [
-            f"max-time = {max(5, args.request_delay_ms // 1000 + 10)}",
-            'output = "/dev/null"',
-            'write-out = "%{http_code} %{time_total}\\n"',
-        ]
-    )
+    lines.append(f"max-time = {max(5, args.request_delay_ms // 1000 + 10)}")
+    if report:
+        lines.extend(
+            [
+                'output = "/dev/null"',
+                'write-out = "%{http_code} %{time_total}\\n"',
+            ]
+        )
     if url:
         lines.extend(f'url = "{url}"' for _ in range(count))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -120,11 +122,19 @@ def run_functional(
         path = workdir / name
         if kind == "http":
             write_curl_config(
-                path, args.proxy_http, "", None, "", "", "", 1
+                path, args.proxy_http, "", None, "", "", "", 1, report=False
             )
         elif kind == "https":
             write_curl_config(
-                path, args.proxy_https, args.proxy_ca, "alice", password or "", "", "", 1
+                path,
+                args.proxy_https,
+                args.proxy_ca,
+                "alice",
+                password or "",
+                "",
+                "",
+                1,
+                report=False,
             )
         else:
             write_curl_config(
@@ -136,6 +146,7 @@ def run_functional(
                 args.site_ca,
                 "",
                 1,
+                report=False,
             )
         return path
 
@@ -153,7 +164,12 @@ def run_functional(
                 f"curl exit {completed.returncode} for {url}: "
                 f"{completed.stderr.decode(errors='replace').strip()[:200]}"
             )
-        return completed.returncode, body
+            return 0, body
+        try:
+            return int(completed.stdout.decode().strip()), body
+        except ValueError:
+            result["errors"].append(f"curl produced no HTTP status for {url}")
+            return 0, body
 
     for kind in ("http", "https", "connect"):
         if args.mix == "http" and kind != "http":

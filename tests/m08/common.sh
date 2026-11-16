@@ -7,6 +7,11 @@ REPO_DIR=$(CDPATH= cd -- "$M08_DIR/../.." && pwd)
 
 fail() {
     printf 'M08 FAIL: %s\n' "$*" >&2
+    if command -v systemctl >/dev/null 2>&1 \
+        && [ -f /etc/systemd/system/angara.service ]; then
+        systemctl status angara.service --no-pager >&2 2>&1 || true
+        journalctl -u angara.service -n 60 --no-pager >&2 2>&1 || true
+    fi
     exit 1
 }
 
@@ -66,6 +71,14 @@ http_code() {
 
 sha256() {
     sha256sum "$1" | awk '{print $1}'
+}
+
+line_count() {
+    if [ -f "$1" ]; then
+        wc -l <"$1"
+    else
+        echo 0
+    fi
 }
 
 journal_cursor() {

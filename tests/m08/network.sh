@@ -63,7 +63,7 @@ wait_port 10.241.2.2 18081
 python3 "$M08_DIR/make_config.py" --output "$TMP/network.toml" --mode network \
     --http-bind 127.0.0.1 --http-port 3128 \
     --http2-bind 127.0.0.2 --http2-port 3128 \
-    --site-port 18080 --allow-ports 18080 --extra-port 0 \
+    --site-port 18080 --allow-ports 18080,18081 --extra-port 0 \
     --egress-a 10.241.1.1 --egress-b 10.241.2.1 \
     --ip-networks 127.0.0.0/8,10.241.0.0/16 \
     --workers 2
@@ -93,14 +93,14 @@ printf 'M08 NET sources: A=%s B=%s txA=%s->%s txB=%s->%s\n' \
 # Remove the selected egress address and force a new connection.  The request
 # must fail explicitly and must not fall back through the other interface.
 ip addr del 10.241.2.1/24 dev "$LINK_B"
-B2_BEFORE=$(wc -l <"$TMP/origin-b2.log" 2>/dev/null || echo 0)
+B2_BEFORE=$(line_count "$TMP/origin-b2.log")
 CODE_REMOVED=$(http_code http://127.0.0.2:3128 http://10.241.2.2:18081/health)
 case "$CODE_REMOVED" in
     502|503|504) ;;
     *) fail "removed egress address returned unexpected HTTP $CODE_REMOVED" ;;
 esac
 sleep 0.3
-B2_AFTER=$(wc -l <"$TMP/origin-b2.log" 2>/dev/null || echo 0)
+B2_AFTER=$(line_count "$TMP/origin-b2.log")
 assert_eq "$B2_AFTER" "$B2_BEFORE" "removed-egress origin connections"
 TX_A_REMOVED=$(cat "/sys/class/net/$LINK_A/statistics/tx_bytes")
 assert_eq "$TX_A_REMOVED" "$TX_A_AFTER" "removed-egress fallback traffic on A"
