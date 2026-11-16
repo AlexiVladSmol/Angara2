@@ -58,6 +58,15 @@ here.
 | M08-CI-01 | `.github/workflows/ci.yml` release/install/systemd/network/load jobs; artifact-to-stand path |
 | M08-DOC-01 | this map, `docs/ADMIN_GUIDE.md`, `RELEASE_CHECKLIST.md`, executed commands, owner scenario |
 
+## Load-profile password budget
+
+`tests/m08/load_stand.sh` and `tests/m08/soak_stand.sh` use
+`auth.max_verifying = 16` for the synthetic 10/20-client Basic cohorts. The
+production default remains `2`; the M05 admission contract and its tests are
+unchanged. The larger test-only budget avoids turning the controlled request
+rate into artificial 503 responses from the zero-queue Argon2 admission. The
+actual outcome counts are attached to the CI run.
+
 ## Reporting rules
 
 - Every result names the full head SHA and archive SHA-256.
