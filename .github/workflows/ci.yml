@@ -4,12 +4,8 @@ on:
   push:
     branches:
       - main
-      - docs/m00-proposal
-      # Development branches get CI even before the workflow exists on the
-      # base branch, for example when the workflow itself is introduced in a PR.
-      - "feat/**"
-      - "fix/**"
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -875,7 +871,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     needs: release
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[soak]')
+    # The hour-long soak is an explicit final-SHA run, not a per-commit cost.
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

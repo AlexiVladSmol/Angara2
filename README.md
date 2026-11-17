@@ -224,7 +224,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | `upgrade` | A→B→A с различимыми unit/helper/TLS, разрешённый запрос через origin, backup, `/proc/<pid>/exe`, config hashes, pre/post-switch failure, foreign-listener readiness, recover |
 | `boot` | минимальный Ubuntu 24.04 rootfs, `systemctl enable`, systemd-nspawn boot, autostart, readiness 403 |
 | `vm-boot` | одноразовая Ubuntu cloud VM: установка/enable на первом boot, второй boot и readiness после автозапуска |
-| `soak` | 60-минутный 20-клиентный прогон; проверяет фактическую длительность и обязательные reload; запускается push-коммитом с маркером `[soak]` |
+| `soak` | 60-минутный 20-клиентный прогон; проверяет фактическую длительность и обязательные reload; запускается вручную через `workflow_dispatch` на итоговом SHA |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.

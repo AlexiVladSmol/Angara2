@@ -419,6 +419,9 @@ cat >"$FAKE_INSTALL/install" <<EOF
 #!/bin/sh
 target=
 for last in "\$@"; do target=\$last; done
+if [ "\$target" = "\${M08_FAIL_INSTALL_ALWAYS_TARGET:-}" ]; then
+    exit 1
+fi
 if [ "\$target" = "\${M08_FAIL_INSTALL_TARGET:-}" ] \
     && [ ! -e "$TMP/install-failed-once" ]; then
     : >"$TMP/install-failed-once"
@@ -471,6 +474,51 @@ grep -q 'A variant marker' /etc/systemd/system/angara.service \
     || fail "helper rename failure did not restore A unit"
 grep -q 'A variant marker' /usr/local/sbin/angaractl \
     || fail "helper rename failure did not restore A helper"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+
+log "upgrade stage: persistent metadata restore failure"
+set +e
+PATH="$FAKE_INSTALL:$PATH" \
+    M08_FAIL_INSTALL_ALWAYS_TARGET=/etc/systemd/system/angara.service.new \
+    "$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    >"$TMP/persistent-metadata.out" 2>"$TMP/persistent-metadata.err"
+PERSISTENT_METADATA_CODE=$?
+set -e
+[ "$PERSISTENT_METADATA_CODE" -ne 0 ] \
+    || fail "persistent metadata failure was accepted"
+if grep -q 'rollback=restored' "$TMP/persistent-metadata.err"; then
+    fail "persistent metadata failure falsely reported restored A"
+fi
+grep -q 'rollback=FAILED' "$TMP/persistent-metadata.err" \
+    || fail "persistent metadata failure did not report rollback=FAILED"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "persistent-metadata-failure restored current A"
+grep -q 'A variant marker' /etc/systemd/system/angara.service \
+    || fail "persistent metadata failure changed A unit"
+grep -q 'A variant marker' /usr/local/sbin/angaractl \
+    || fail "persistent metadata failure changed A helper"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+
+# Missing curl must be rejected before stopping A.
+log "upgrade stage: missing readiness tool"
+NO_CURL_BIN="$TMP/no-curl"
+mkdir -p "$NO_CURL_BIN"
+ln -s "$(command -v id)" "$NO_CURL_BIN/id"
+set +e
+PATH="$NO_CURL_BIN" /bin/bash "$ANGARACTL" upgrade \
+    --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    >"$TMP/no-curl.out" 2>"$TMP/no-curl.err"
+NO_CURL_CODE=$?
+set -e
+[ "$NO_CURL_CODE" -ne 0 ] || fail "upgrade without curl was accepted"
+grep -q 'curl is required' "$TMP/no-curl.err" \
+    || fail "missing curl did not produce a clear error"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "missing-curl check left A current"
 wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
     --config "$TMP/https.conf"
 
