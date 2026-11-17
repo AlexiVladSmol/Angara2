@@ -293,6 +293,64 @@ kill "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=
 
+# A hostname with both IPv4 and IPv6 addresses must not let a foreign IPv6
+# listener satisfy readiness while curl uses a different address.
+log "upgrade stage: multi-address hostname readiness"
+if ! getent ahosts localhost | awk '{print $1}' | grep -qx '::1'; then
+    fail "localhost does not resolve to ::1 for the multi-address test"
+fi
+if ! getent ahosts localhost | awk '{print $1}' | grep -qx '127.0.0.1'; then
+    fail "localhost does not resolve to 127.0.0.1 for the multi-address test"
+fi
+cat >"$TMP/foreign-v6-3128.py" <<'PY'
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Server6(HTTPServer):
+    address_family = socket.AF_INET6
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(407)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+Server6(("::1", 3128), Handler).serve_forever()
+PY
+python3 "$TMP/foreign-v6-3128.py" >"$TMP/foreign-v6-3128.out" 2>"$TMP/foreign-v6-3128.err" &
+FOREIGN_PID=$!
+for _ in $(seq 1 100); do
+    python3 - <<'PY' >/dev/null 2>&1 && break
+import socket
+sock = socket.create_connection(("::1", 3128), timeout=1)
+sock.close()
+PY
+    sleep 0.1
+done
+python3 - <<'PY' >/dev/null 2>&1 \
+    || fail "IPv6 localhost foreign listener did not start"
+import socket
+sock = socket.create_connection(("::1", 3128), timeout=1)
+sock.close()
+PY
+set +e
+"$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    --probe-proxy http://localhost:3128 \
+    >"$TMP/multi-address.out" 2>"$TMP/multi-address.err"
+MULTI_ADDRESS_CODE=$?
+set -e
+[ "$MULTI_ADDRESS_CODE" -ne 0 ] || fail "multi-address foreign listener passed readiness"
+if grep -Fq "readiness=ok candidate=$B_CANDIDATE" "$TMP/multi-address.out"; then
+    fail "multi-address probe confirmed readiness for B"
+fi
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "multi-address-failure restored A"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=
+
 # An IPv4 wildcard listener does not serve an IPv6-only foreign listener on
 # the same port.  Use a real dual-family endpoint pair and require the probe
 # to match the MainPID of the selected release.
