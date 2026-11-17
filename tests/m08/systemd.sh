@@ -262,15 +262,72 @@ python3 "$M08_DIR/make_config.py" --output "$TMP/force.toml" --mode functional \
 write_config "$TMP/force.toml"
 reload_event reload_applied >/dev/null
 python3 - 127.0.0.1 3128 18080 <<'PY' >"$TMP/stall.out" 2>"$TMP/stall.err" &
-import socket, sys, time
+import re
+import socket
+import sys
+import time
+
 proxy, port, origin = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 sock = socket.create_connection((proxy, port), timeout=5)
-sock.sendall((f"GET http://127.0.0.1:{origin}/download?bytes=268435456&delay_ms=1 HTTP/1.1\r\n"
-              f"Host: 127.0.0.1:{origin}\r\n\r\n").encode())
-time.sleep(20)
+sock.sendall((
+    f"GET http://127.0.0.1:{origin}/download?bytes=268435456&delay_ms=1 HTTP/1.1\r\n"
+    f"Host: 127.0.0.1:{origin}\r\n\r\n"
+).encode())
+# Do not read while the test stops the service.  After the force deadline the
+# client itself must observe reset/EOF and an incomplete body.
+time.sleep(2)
+sock.settimeout(5)
+data = b""
+cap = 32 * 1024 * 1024
+eof = False
+try:
+    while len(data) < cap:
+        chunk = sock.recv(65536)
+        if not chunk:
+            eof = True
+            break
+        data += chunk
+except (ConnectionResetError, BrokenPipeError):
+    print("reset")
+    raise SystemExit(0)
+except socket.timeout:
+    print("timeout")
+    raise SystemExit(3)
+except OSError as error:
+    print(f"error:{error}")
+    raise SystemExit(3)
+if not eof:
+    try:
+        extra = sock.recv(1)
+        if not extra:
+            eof = True
+    except (ConnectionResetError, BrokenPipeError):
+        print("reset")
+        raise SystemExit(0)
+    except socket.timeout:
+        pass
+if b"\r\n\r\n" not in data:
+    print("short")
+    raise SystemExit(0)
+header, body = data.split(b"\r\n\r\n", 1)
+match = re.search(rb"(?i)Content-Length:\s*(\d+)", header)
+if match is None:
+    print("short")
+    raise SystemExit(0)
+expected = int(match.group(1))
+if len(body) < expected:
+    if eof:
+        print("short")
+        raise SystemExit(0)
+    print("open")
+    raise SystemExit(3)
+print("complete")
+raise SystemExit(1)
 PY
 STALL_PID=$!
 sleep 1
+CGROUP_BEFORE=$(systemctl show -p ControlGroup --value angara.service)
+[ -n "$CGROUP_BEFORE" ] || fail "forced stop has no cgroup before stop"
 FORCE_CURSOR=$(journalctl -u angara.service -n 0 --show-cursor --no-pager 2>/dev/null \
     | sed -n 's/^-- cursor: //p')
 START_MS=$(date +%s%3N)
@@ -278,13 +335,29 @@ systemctl stop angara.service
 END_MS=$(date +%s%3N)
 ELAPSED=$((END_MS - START_MS))
 [ "$ELAPSED" -le 3000 ] || fail "forced stop took ${ELAPSED}ms"
+CLIENT_DONE=0
+for _ in $(seq 1 100); do
+    if ! kill -0 "$STALL_PID" 2>/dev/null; then
+        CLIENT_DONE=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$CLIENT_DONE" -ne 1 ]; then
+    kill "$STALL_PID" 2>/dev/null || true
+    wait "$STALL_PID" 2>/dev/null || true
+    STALL_PID=
+    fail "forced client did not observe shutdown within 10s"
+fi
 set +e
-kill "$STALL_PID" 2>/dev/null
-wait "$STALL_PID" 2>/dev/null
+wait "$STALL_PID"
 STALL_CODE=$?
 set -e
 STALL_PID=
-[ "$STALL_CODE" -ne 0 ] || fail "forced client unexpectedly completed successfully"
+[ "$STALL_CODE" -eq 0 ] \
+    || fail "forced client did not observe interruption (exit $STALL_CODE)"
+grep -Eq '^(reset|short)$' "$TMP/stall.out" \
+    || { cat "$TMP/stall.out" >&2; fail "forced client result was not reset/short"; }
 wait_service_inactive 20
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "forced stop result"
 assert_eq "$(systemctl show -p ExecMainStatus --value angara.service)" "0" "forced stop status"
@@ -292,10 +365,11 @@ if ss -ltn | grep -q ':3128'; then fail "forced stop left the listener open"; fi
 if pgrep -f '[/]opt/angara/.*/bin/angara serve' >/dev/null 2>&1; then
     fail "a serve process survived forced shutdown"
 fi
-CGROUP=$(systemctl show -p ControlGroup --value angara.service)
-if [ -n "$CGROUP" ] && [ -e "/sys/fs/cgroup$CGROUP/cgroup.procs" ] \
-    && [ -s "/sys/fs/cgroup$CGROUP/cgroup.procs" ]; then
-    fail "forced stop left processes in $CGROUP"
+CGROUP_AFTER=$(systemctl show -p ControlGroup --value angara.service)
+if [ -n "$CGROUP_AFTER" ] \
+    && [ -e "/sys/fs/cgroup$CGROUP_AFTER/cgroup.procs" ] \
+    && [ -s "/sys/fs/cgroup$CGROUP_AFTER/cgroup.procs" ]; then
+    fail "forced stop left processes in $CGROUP_AFTER (before: $CGROUP_BEFORE)"
 fi
 if journalctl -u angara.service --after-cursor "$FORCE_CURSOR" -o cat --no-pager 2>/dev/null \
     | grep -Eq 'Killing process|status=9/KILL|signal=KILL'; then

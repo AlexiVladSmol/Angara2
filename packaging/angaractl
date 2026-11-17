@@ -24,6 +24,7 @@ PROBE_CODE=403,407,502,503,504
 PROBE_CACERT=
 WORKDIR=
 COMMAND=
+ACTIVATION_RESTORED=0
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -363,8 +364,91 @@ else:
 PY
 }
 
+proxy_host() {
+    python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+parsed = urlsplit(sys.argv[1])
+print(parsed.hostname or "127.0.0.1")
+PY
+}
+
+# Match the actual probe destination address, not merely a port number owned
+# by the MainPID.  A second listener on another loopback address must not
+# satisfy readiness for the requested proxy endpoint.
+listener_owned_by_pid() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ipaddress
+import socket
+import subprocess
+import sys
+
+pid = int(sys.argv[1])
+host = sys.argv[2]
+port = int(sys.argv[3])
+expected = []
+try:
+    infos = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+    )
+    for family, _, _, _, sockaddr in infos:
+        try:
+            expected.append((family, ipaddress.ip_address(sockaddr[0])))
+        except ValueError:
+            pass
+except OSError:
+    pass
+if not expected:
+    try:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        expected.append((family, ipaddress.ip_address(host.strip("[]"))))
+    except ValueError:
+        sys.exit(1)
+
+try:
+    result = subprocess.run(
+        ["ss", "-H", "-ltnp"], capture_output=True, text=True, check=False
+    )
+except OSError:
+    sys.exit(1)
+
+for line in result.stdout.splitlines():
+    fields = line.split()
+    if len(fields) < 4:
+        continue
+    if f"pid={pid}," not in line and f"pid={pid})" not in line:
+        continue
+    local = fields[3]
+    if local.startswith("["):
+        try:
+            address, local_port = local.rsplit("]:", 1)
+        except ValueError:
+            continue
+        address = address[1:]
+    else:
+        if ":" not in local:
+            continue
+        address, local_port = local.rsplit(":", 1)
+    if local_port != str(port):
+        continue
+    if address in ("*", "0.0.0.0", "::", "[::]"):
+        sys.exit(0)
+    address = address.split("%", 1)[0]
+    try:
+        actual = ipaddress.ip_address(address)
+    except ValueError:
+        continue
+    for family, candidate in expected:
+        if actual == candidate:
+            sys.exit(0)
+        if actual.version == 6 and actual.ipv4_mapped == candidate:
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
 verify_service_identity() {
-    local release=$1 pid actual expected proxy port
+    local release=$1 pid actual expected proxy host port
     systemctl is-active --quiet "$SERVICE" || return 1
     pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
     [ -n "$pid" ] && [ "$pid" != "0" ] && [ -d "/proc/$pid" ] || return 1
@@ -373,9 +457,9 @@ verify_service_identity() {
     [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
     command -v ss >/dev/null 2>&1 || return 1
     proxy=$(resolve_probe_proxy) || return 1
+    host=$(proxy_host "$proxy") || return 1
     port=$(proxy_port "$proxy") || return 1
-    ss -ltnp 2>/dev/null | grep -F "pid=$pid," \
-        | grep -Eq "[:.]$port[[:space:]]" || return 1
+    listener_owned_by_pid "$pid" "$host" "$port" || return 1
     return 0
 }
 
@@ -438,23 +522,72 @@ journal_tail() {
     fi
 }
 
-rollback_to() {
-    local target=$1 failed=$2
-    [ -d "$target" ] || return 1
-    check_release_metadata_conflicts
-    if service_active; then
-        systemctl stop "$SERVICE" || true
+restore_after_failure() {
+    local target=$1 previous=$2 saved_probe=$PROBE_PROXY
+    if [ -n "$target" ]; then
+        if service_active; then
+            systemctl stop "$SERVICE" || true
+        fi
+        switch_current "$target" || true
+        if [ -n "$previous" ]; then
+            set_previous "$previous" || true
+        else
+            rm -f "$PREFIX/previous" "$PREFIX/previous.tmp" 2>/dev/null || true
+        fi
+        install_release_metadata "$target" || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # The operator's probe may point at the failed candidate's address;
+        # the restored release must be checked against its own listener.
+        PROBE_PROXY=
+        if start_service "$target"; then
+            PROBE_PROXY=$saved_probe
+            return 0
+        fi
+        PROBE_PROXY=$saved_probe
+        return 1
     fi
-    switch_current "$target"
-    set_previous "$failed"
-    install_release_metadata "$target"
-    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
-        systemctl daemon-reload || true
-    fi
-    if start_service "$target"; then
-        return 0
-    fi
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     return 1
+}
+
+activate_candidate() {
+    local release=$1 old_current=$2 old_previous=$3
+    ACTIVATION_RESTORED=0
+    if ! switch_current "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    if [ -n "$old_current" ] && [ "$old_current" != "$release" ]; then
+        if ! set_previous "$old_current"; then
+            if restore_after_failure "$old_current" "$old_previous"; then
+                ACTIVATION_RESTORED=1
+            fi
+            return 1
+        fi
+    fi
+    if ! install_release_metadata "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        if ! systemctl daemon-reload; then
+            if restore_after_failure "$old_current" "$old_previous"; then
+                ACTIVATION_RESTORED=1
+            fi
+            return 1
+        fi
+    fi
+    if ! start_service "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    return 0
 }
 
 command_install_or_upgrade() {
@@ -464,9 +597,10 @@ command_install_or_upgrade() {
     install_staged_candidate
     preflight_release "$RELEASE_DIR"
     check_release_metadata_conflicts
-    local backup old_current
+    local backup old_current old_previous
     backup=$(backup_config)
     old_current=$(read_current_link || true)
+    old_previous=$(read_previous_link || true)
     printf 'backup=%s\n' "$backup"
     printf 'candidate=%s\n' "$STAGED_CANDIDATE"
     printf 'archive_sha256=%s\n' "$ARCHIVE_SHA"
@@ -477,20 +611,7 @@ command_install_or_upgrade() {
     if service_active; then
         stop_service
     fi
-    if ! switch_current "$RELEASE_DIR"; then
-        if [ -n "$old_current" ]; then
-            switch_current "$old_current" || true
-        fi
-        die "cannot switch /opt/angara/current"
-    fi
-    if [ -n "$old_current" ] && [ "$old_current" != "$RELEASE_DIR" ]; then
-        set_previous "$old_current"
-    fi
-    install_release_metadata "$RELEASE_DIR"
-    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
-        systemctl daemon-reload || die "systemctl daemon-reload failed"
-    fi
-    if start_service "$RELEASE_DIR"; then
+    if activate_candidate "$RELEASE_DIR" "$old_current" "$old_previous"; then
         printf 'active=%s\n' "$STAGED_CANDIDATE"
         printf 'service=%s\n' "$(systemctl show -p ActiveState --value "$SERVICE")"
         return 0
@@ -498,9 +619,9 @@ command_install_or_upgrade() {
 
     printf 'error: candidate %s did not become ready\n' "$STAGED_CANDIDATE" >&2
     if [ -n "$old_current" ] && [ "$old_current" != "$RELEASE_DIR" ]; then
-        if rollback_to "$old_current" "$RELEASE_DIR"; then
+        if [ "$ACTIVATION_RESTORED" -eq 1 ]; then
             printf 'rollback=restored %s\n' "$(basename "$old_current")" >&2
-            printf 'retry_command=angaractl activate %s --confirm\n' \
+            printf 'retry_command=angaractl activate --candidate %s --confirm\n' \
                 "$(basename "$RELEASE_DIR")" >&2
         else
             printf 'rollback=FAILED; inspect journal and run: angaractl recover\n' >&2
@@ -526,15 +647,7 @@ command_rollback() {
     if service_active; then
         stop_service
     fi
-    switch_current "$previous"
-    if [ -n "$current" ] && [ "$current" != "$previous" ]; then
-        set_previous "$current"
-    fi
-    install_release_metadata "$previous"
-    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
-        systemctl daemon-reload || die "systemctl daemon-reload failed"
-    fi
-    if ! start_service "$previous"; then
+    if ! activate_candidate "$previous" "$current" "$previous"; then
         die "rollback target $previous did not become ready"
     fi
     printf 'active=%s\n' "$(basename "$previous")"
@@ -549,22 +662,17 @@ command_activate() {
     [ -d "$release" ] || die "release does not exist: $release"
     preflight_release "$release"
     check_release_metadata_conflicts
-    local current backup
+    local current previous backup
     current=$(read_current_link || true)
+    previous=$(read_previous_link || true)
     backup=$(backup_config)
     printf 'backup=%s\n' "$backup"
     if service_active; then
         stop_service
     fi
-    switch_current "$release"
-    if [ -n "$current" ] && [ "$current" != "$release" ]; then
-        set_previous "$current"
+    if ! activate_candidate "$release" "$current" "$previous"; then
+        die "candidate $CANDIDATE did not become ready"
     fi
-    install_release_metadata "$release"
-    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
-        systemctl daemon-reload || die "systemctl daemon-reload failed"
-    fi
-    start_service "$release" || die "candidate $CANDIDATE did not become ready"
     printf 'active=%s\n' "$CANDIDATE"
 }
 

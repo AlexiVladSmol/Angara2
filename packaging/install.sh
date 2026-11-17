@@ -27,6 +27,7 @@ CHECK_SERVICE_USER=0
 SERVICE=angara.service
 SERVICE_USER=angara
 WORKDIR=
+STAGING_RELEASE=
 STAGED_SOURCE=
 
 die() {
@@ -44,10 +45,52 @@ reject_unsafe_components() {
     done
 }
 
+# Validate the DESTDIR input lexically and, for every existing component,
+# reject symlinks before mkdir can follow them.  Resolving only after mkdir
+# would let a caller redirect writes into a sibling tree.
+assert_destdir_input_safe() {
+    local value=$1 part prefix
+    case "$value" in
+        /*) ;;
+        *) value="$(pwd -P)/$value" ;;
+    esac
+    case "$value" in
+        ''|/) die "--destdir must not be the filesystem root" ;;
+        *\\*|*//*) die "--destdir contains an unsafe separator: $value" ;;
+    esac
+    reject_unsafe_components "$value"
+    local IFS=/
+    prefix=
+    for part in ${value#/}; do
+        [ -n "$part" ] || continue
+        prefix="$prefix/$part"
+        if [ -L "$prefix" ]; then
+            die "--destdir component is a symlink: $prefix"
+        fi
+        if [ -e "$prefix" ] && [ ! -d "$prefix" ]; then
+            die "--destdir component is not a directory: $prefix"
+        fi
+    done
+    printf '%s\n' "$value"
+}
+
+# The primary GID is also an access grant: another passwd entry with the same
+# primary group would read root:angara 0640 users/TLS files even when the
+# group member list is empty.
+gid_has_other_users() {
+    local gid=$1 name passwd uid ugid rest
+    while IFS=: read -r name passwd uid ugid rest; do
+        [ "$name" = "$SERVICE_USER" ] && continue
+        [ "$ugid" = "$gid" ] && return 0
+    done < <(getent passwd 2>/dev/null || true)
+    return 1
+}
+
 # Read-only validation of an existing service account.  The account must be a
 # dedicated, non-interactive system account whose only group is the dedicated
-# `angara` group.  A group member or an extra supplementary group could read
-# root:angara 0640 users/TLS files, so both are rejected.
+# `angara` group.  A group member, a shared primary GID or an extra
+# supplementary group could read root:angara 0640 users/TLS files, so all are
+# rejected.
 validate_service_user() {
     local user_entry group_entry user_uid user_gid group_gid shell home members groups
     if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
@@ -77,6 +120,9 @@ validate_service_user() {
             || die "user $SERVICE_USER primary GID $user_gid does not match group GID $group_gid"
         [ -z "$members" ] \
             || die "group $SERVICE_USER has unexpected members ($members); refusing to adopt it"
+        if gid_has_other_users "$group_gid"; then
+            die "group $SERVICE_USER GID $group_gid is the primary group of another passwd entry; refusing to adopt it"
+        fi
         groups=$(id -nG "$SERVICE_USER" 2>/dev/null || true)
         [ "$groups" = "$SERVICE_USER" ] \
             || die "user $SERVICE_USER has supplementary groups ($groups); refusing to adopt it"
@@ -89,11 +135,17 @@ validate_service_user() {
                 || die "group $SERVICE_USER must not be GID 0"
             [ -z "$members" ] \
                 || die "group $SERVICE_USER exists with members ($members); refusing to adopt it"
+            if gid_has_other_users "$group_gid"; then
+                die "existing group $SERVICE_USER GID $group_gid is the primary group of a passwd entry; refusing to adopt it"
+            fi
         fi
     fi
 }
 
 cleanup() {
+    if [ -n "$STAGING_RELEASE" ] && [ -d "$STAGING_RELEASE" ]; then
+        rm -rf "$STAGING_RELEASE"
+    fi
     if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
         rm -rf "$WORKDIR"
     fi
@@ -157,9 +209,9 @@ if [ -n "$DESTDIR_INPUT" ]; then
     case "$DESTDIR_INPUT" in
         /) die "--destdir / is not a staging directory" ;;
     esac
-    reject_unsafe_components "$DESTDIR_INPUT"
-    # Resolve and create the staging directory only after the archive hash and
-    # manifest have been verified, so a bad archive cannot create host paths.
+    # Check the caller-supplied path before mkdir can follow a symlink.  The
+    # archive hash and manifest are still verified before the directory exists.
+    DESTDIR_INPUT=$(assert_destdir_input_safe "$DESTDIR_INPUT")
     NO_OWNER=1
 else
     [ "$(id -u)" -eq 0 ] || die "real installation requires root; use --destdir for a staging check"
@@ -453,22 +505,23 @@ if [ -e "$RELEASE_DIR" ]; then
     cmp -s "$RELEASE_DIR/manifest.json" "$STAGED_SOURCE/manifest.json" \
         || die "existing release manifest differs from the incoming manifest: $RELEASE_DIR"
 else
-    TMP_RELEASE=$(path "$PREFIX/releases/.tmp-$CANDIDATE")
-    rm -rf "$TMP_RELEASE"
-    mkdir -p "$TMP_RELEASE"
-    cp -R "$STAGED_SOURCE/." "$TMP_RELEASE/"
-    rm -f "$TMP_RELEASE/manifest.json"
-    cp "$STAGED_SOURCE/manifest.json" "$TMP_RELEASE/manifest.json"
+    # A unique, operation-owned directory avoids deleting a pre-existing
+    # candidate temp tree or following a foreign symlink.
+    STAGING_RELEASE=$(mktemp -d "$(path "$PREFIX/releases/.tmp-$CANDIDATE.XXXXXX")")
+    cp -R "$STAGED_SOURCE/." "$STAGING_RELEASE/"
+    rm -f "$STAGING_RELEASE/manifest.json"
+    cp "$STAGED_SOURCE/manifest.json" "$STAGING_RELEASE/manifest.json"
     if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
-        chown -R root:root "$TMP_RELEASE"
+        chown -R root:root "$STAGING_RELEASE"
     fi
-    find "$TMP_RELEASE" -type d -exec chmod 0755 {} +
-    find "$TMP_RELEASE" -type f -exec chmod 0644 {} +
-    chmod 0755 "$TMP_RELEASE/bin/angara" "$TMP_RELEASE/install.sh" \
-        "$TMP_RELEASE/angaractl" "$TMP_RELEASE/verify_manifest.py"
-    python3 "$TMP_RELEASE/verify_manifest.py" --root "$TMP_RELEASE" --quiet \
+    find "$STAGING_RELEASE" -type d -exec chmod 0755 {} +
+    find "$STAGING_RELEASE" -type f -exec chmod 0644 {} +
+    chmod 0755 "$STAGING_RELEASE/bin/angara" "$STAGING_RELEASE/install.sh" \
+        "$STAGING_RELEASE/angaractl" "$STAGING_RELEASE/verify_manifest.py"
+    python3 "$STAGING_RELEASE/verify_manifest.py" --root "$STAGING_RELEASE" --quiet \
         || die "staged release failed manifest verification"
-    mv "$TMP_RELEASE" "$RELEASE_DIR"
+    mv -T "$STAGING_RELEASE" "$RELEASE_DIR"
+    STAGING_RELEASE=
 fi
 
 OLD_CURRENT=

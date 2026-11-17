@@ -106,7 +106,9 @@ chmod 0640 "$TMPCONF"
 mv -f "$TMPCONF" /etc/angara/angara.toml
 systemctl restart angara.service
 wait_service_active
-wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/health 200
+# The 18080 origin lives inside netns A; this readiness request must use the
+# real routed origin rather than a nonexistent host loopback service.
+wait_http_code http://127.0.0.1:3128 http://10.241.1.2:18080/health 200
 wait_port 127.0.0.2 3128
 for _ in $(seq 1 100); do
     if curl --noproxy '' --proxy 'http://[::1]:3130' --connect-timeout 1 \

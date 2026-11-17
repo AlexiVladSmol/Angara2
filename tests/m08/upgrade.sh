@@ -255,6 +255,93 @@ wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
     --config "$TMP/https.conf"
 assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" "recovered current"
 
+# A foreign server on a second address with the same port must not satisfy the
+# readiness check for the probe endpoint.
+log "upgrade stage: foreign address readiness"
+cat >"$TMP/foreign-address.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(407)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+HTTPServer(("127.0.0.2", 3128), Handler).serve_forever()
+PY
+python3 "$TMP/foreign-address.py" >"$TMP/foreign-address.out" 2>"$TMP/foreign-address.err" &
+FOREIGN_PID=$!
+wait_port 127.0.0.2 3128
+set +e
+"$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    --probe-proxy http://127.0.0.2:3128 \
+    >"$TMP/foreign-address-upgrade.out" 2>"$TMP/foreign-address-upgrade.err"
+FOREIGN_ADDRESS_CODE=$?
+set -e
+[ "$FOREIGN_ADDRESS_CODE" -ne 0 ] || fail "foreign address passed readiness"
+if grep -q 'readiness=ok' "$TMP/foreign-address-upgrade.out"; then
+    fail "foreign address confirmed readiness"
+fi
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "foreign-address-restored current"
+wait_service_active
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+grep -q 'A variant marker' /etc/systemd/system/angara.service \
+    || fail "foreign address failure did not restore A unit"
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=
+
+# A forced daemon-reload failure after the switch must restore A and the
+# retry command printed by the failure path must be executable.
+log "upgrade stage: daemon-reload failure"
+REAL_SYSTEMCTL=$(command -v systemctl)
+SYSTEMCTL_FAKE="$TMP/fake-systemctl"
+mkdir -p "$SYSTEMCTL_FAKE"
+cat >"$SYSTEMCTL_FAKE/systemctl" <<EOF
+#!/bin/sh
+if [ "\$1" = "daemon-reload" ] && [ ! -e "$TMP/reload-failed-once" ]; then
+    : >"$TMP/reload-failed-once"
+    exit 1
+fi
+exec "$REAL_SYSTEMCTL" "\$@"
+EOF
+chmod 0755 "$SYSTEMCTL_FAKE/systemctl"
+set +e
+PATH="$SYSTEMCTL_FAKE:$PATH" "$ANGARACTL" upgrade \
+    --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    >"$TMP/reload-failure.out" 2>"$TMP/reload-failure.err"
+RELOAD_FAILURE_CODE=$?
+set -e
+[ "$RELOAD_FAILURE_CODE" -ne 0 ] || fail "reload failure was accepted"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "reload-failure-restored current"
+grep -q 'A variant marker' /etc/systemd/system/angara.service \
+    || fail "reload failure did not restore A unit"
+grep -q 'A variant marker' /usr/local/sbin/angaractl \
+    || fail "reload failure did not restore A helper"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+RETRY_COMMAND=$(sed -n 's/^retry_command=//p' "$TMP/reload-failure.err" | tail -n1)
+[ -n "$RETRY_COMMAND" ] || fail "reload failure did not print a retry command"
+case "$RETRY_COMMAND" in
+    *"activate --candidate "*"--confirm"*) ;;
+    *) fail "retry command has the wrong CLI shape: $RETRY_COMMAND" ;;
+esac
+RETRY_COMMAND=${RETRY_COMMAND/angaractl/$ANGARACTL}
+eval "$RETRY_COMMAND" >"$TMP/retry.out" 2>"$TMP/retry.err"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$B_CANDIDATE" \
+    "retry command activated B"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+"$ANGARACTL" rollback --confirm >"$TMP/retry-rollback.out" 2>"$TMP/retry-rollback.err"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "retry rollback restored A"
+
 # Foreign listener returning an accepted readiness code must not make B ready.
 log "upgrade stage: foreign readiness"
 systemctl stop angara.service

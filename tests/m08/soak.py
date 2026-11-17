@@ -105,6 +105,7 @@ def main() -> int:
     parser.add_argument("--password-file", required=True)
     parser.add_argument("--origin-port", type=int, default=18080)
     parser.add_argument("--site-port", type=int, default=18443)
+    parser.add_argument("--connect-log", default="")
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--workdir", type=Path)
@@ -148,6 +149,8 @@ def main() -> int:
             str(args.origin_port),
             "--site-port",
             str(args.site_port),
+            "--connect-log",
+            args.connect_log,
             "--password-file",
             args.password_file,
             "--pid",

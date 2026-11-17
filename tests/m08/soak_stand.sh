@@ -77,6 +77,7 @@ python3 "$M08_DIR/soak.py" \
     --site-ca "$TMP/pki/site_ca.pem" \
     --password-file "$TMP/password" \
     --origin-port 18080 --site-port 18443 \
+    --connect-log "$TMP/origin-site.log" \
     --pid "$PID" --report "$REPORT_DIR/soak.json" \
     --workdir "$TMP/soak" | tee "$REPORT_DIR/soak.txt"
 

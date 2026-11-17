@@ -75,6 +75,7 @@ for clients in 10 20; do
         --site-ca "$TMP/pki/site_ca.pem" \
         --origin-port 18080 --site-port 18443 \
         --password-file "$TMP/password" \
+        --connect-log "$TMP/origin-site.log" \
         --pid "$PID" --report "$REPORT_DIR/load-$clients.json" \
         --after-wait 20 | tee "$REPORT_DIR/load-$clients.txt"
 done

@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-wait", type=int, default=20)
     parser.add_argument("--proxy-unit", default="angara.service")
     parser.add_argument("--metrics-wait", type=float, default=3.0)
+    parser.add_argument("--connect-log", default="")
     return parser.parse_args()
 
 
@@ -108,6 +109,16 @@ def read_process(pid: int) -> dict[str, int] | None:
     except OSError:
         return None
     return result
+
+
+def count_lines(path: str) -> int | None:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return None
 
 
 def proxy_completed(unit: str) -> int | None:
@@ -358,8 +369,10 @@ def main() -> int:
         time.sleep(args.baseline_wait)
         baseline = read_process(args.pid)
         proxy_before = proxy_completed(args.proxy_unit)
+        connect_before = count_lines(args.connect_log)
         print(
-            f"warm baseline rss={baseline} proxy_http_completed={proxy_before}",
+            f"warm baseline rss={baseline} proxy_http_completed={proxy_before} "
+            f"connect_log={connect_before}",
             flush=True,
         )
 
@@ -409,8 +422,10 @@ def main() -> int:
         codes: dict[str, int] = {}
         latencies: list[float] = []
         observed = 0
+        connect_200 = 0
         for index in range(total):
             output = workdir / f"client-{index}.out"
+            kind = assignments[index]
             for line in output.read_text(encoding="utf-8", errors="replace").splitlines():
                 parts = line.strip().split()
                 if len(parts) != 2:
@@ -418,11 +433,16 @@ def main() -> int:
                 code, seconds = parts
                 observed += 1
                 codes[code] = codes.get(code, 0) + 1
+                if kind == "connect" and code == "200":
+                    connect_200 += 1
                 try:
                     latencies.append(float(seconds) * 1000.0)
                 except ValueError:
                     pass
         expected = total * count
+        expected_connect = assignments.count("connect") * count
+        expected_http = expected - expected_connect
+        connect_client_ok = connect_200 == expected_connect
         unexpected = {code: value for code, value in codes.items() if code != "200"}
         missing = expected - observed
         success = observed - sum(unexpected.values()) - max(missing, 0)
@@ -432,21 +452,44 @@ def main() -> int:
         metrics_deadline = time.monotonic() + args.metrics_wait
         proxy_after = None
         proxy_delta = None
+        connect_after = None
+        connect_delta = None
         while True:
             proxy_after = proxy_completed(args.proxy_unit)
             if proxy_before is not None and proxy_after is not None:
                 proxy_delta = proxy_after - proxy_before
-                if proxy_delta >= observed:
-                    break
+            connect_after = count_lines(args.connect_log)
+            if connect_before is not None and connect_after is not None:
+                connect_delta = connect_after - connect_before
+            http_ready = expected_http == 0 or (
+                proxy_delta is not None and proxy_delta >= expected_http
+            )
+            connect_ready = expected_connect == 0 or (
+                connect_delta is not None and connect_delta >= expected_connect
+            )
+            if http_ready and connect_ready:
+                break
             if time.monotonic() >= metrics_deadline:
                 break
             time.sleep(0.5)
-        proxy_ok = (
+        proxy_ok = expected_http == 0 or (
             proxy_before is not None
             and proxy_after is not None
             and proxy_delta is not None
-            and proxy_delta >= observed
+            and proxy_delta >= expected_http
         )
+        connect_log_checked = bool(args.connect_log) and expected_connect > 0
+        connect_log_ok = (
+            not connect_log_checked
+            or (
+                connect_before is not None
+                and connect_after is not None
+                and connect_delta is not None
+                and connect_delta >= expected_connect
+            )
+        )
+        connect_ok = connect_client_ok and connect_log_ok
+        route_ok = proxy_ok and connect_ok
 
         time.sleep(args.after_wait)
         after = read_process(args.pid)
@@ -471,7 +514,7 @@ def main() -> int:
             and missing == 0
             and not client_exit_errors
             and duration_ok
-            and proxy_ok
+            and route_ok
             and resource_ok
             else "fail",
             "clients": total,
@@ -489,8 +532,20 @@ def main() -> int:
                 "http_completed_before": proxy_before,
                 "http_completed_after": proxy_after,
                 "http_completed_delta": proxy_delta,
+                "expected_http_requests": expected_http,
+                "connect_log": args.connect_log,
+                "connect_log_before": connect_before,
+                "connect_log_after": connect_after,
+                "connect_log_delta": connect_delta,
+                "expected_connect_requests": expected_connect,
+                "connect_200": connect_200,
+                "connect_client_ok": connect_client_ok,
+                "connect_log_checked": connect_log_checked,
+                "connect_log_ok": connect_log_ok,
                 "observed_requests": observed,
-                "ok": proxy_ok,
+                "http_ok": proxy_ok,
+                "connect_ok": connect_ok,
+                "ok": route_ok,
             },
             "latency_ms": {
                 "p50": round(percentile(latencies, 0.50), 3),

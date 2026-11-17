@@ -158,6 +158,27 @@ fi
 [ -z "$(find "$TMP/escape-target" -mindepth 1 -print -quit)" ] \
     || fail "parent symlink wrote outside DESTDIR"
 
+# R2: a symlink in the DESTDIR path itself must be rejected before mkdir.
+mkdir -p "$TMP/symlink-parent-target"
+ln -s "$TMP/symlink-parent-target" "$TMP/symlink-parent"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$TMP/symlink-parent/new" >/dev/null 2>&1; then
+    fail "DESTDIR path through a symlink was accepted"
+fi
+[ ! -e "$TMP/symlink-parent-target/new" ] \
+    || fail "DESTDIR path through a symlink escaped the requested tree"
+
+# R2: a pre-existing candidate temp directory is foreign data, not scratch.
+SENTINEL_STAGE="$TMP/sentinel-stage"
+mkdir -p "$SENTINEL_STAGE/opt/angara/releases/.tmp-$CANDIDATE"
+printf 'sentinel\n' >"$SENTINEL_STAGE/opt/angara/releases/.tmp-$CANDIDATE/sentinel"
+"$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$SENTINEL_STAGE" >/dev/null
+assert_eq "$(cat "$SENTINEL_STAGE/opt/angara/releases/.tmp-$CANDIDATE/sentinel")" \
+    "sentinel" "pre-existing candidate temp data preserved"
+[ -d "$SENTINEL_STAGE/opt/angara/releases/$CANDIDATE" ] \
+    || fail "sentinel install did not create the release directory"
+
 # R2: a foreign unit must not be overwritten.
 FOREIGN="$TMP/foreign-stage"
 mkdir -p "$FOREIGN/etc/systemd/system"
@@ -229,9 +250,24 @@ cat >"$FAKE/getent" <<'EOF'
 case "$1 $2" in
   "passwd angara")
     [ "${FAKE_MODE:-}" = "absent" ] && exit 1
+    [ "${FAKE_MODE:-}" = "group_shared" ] && exit 1
     case "${FAKE_MODE:-}" in
       uid0) printf 'angara:x:0:999::/nonexistent:/usr/sbin/nologin\n' ;;
       *) printf 'angara:x:999:999::/nonexistent:/usr/sbin/nologin\n' ;;
+    esac
+    ;;
+  "passwd ")
+    case "${FAKE_MODE:-}" in
+      shared_gid)
+        printf 'angara:x:999:999::/nonexistent:/usr/sbin/nologin\n'
+        printf 'outsider:x:1001:999::/nonexistent:/usr/sbin/nologin\n'
+        ;;
+      group_shared)
+        printf 'outsider:x:1001:999::/nonexistent:/usr/sbin/nologin\n'
+        ;;
+      *)
+        printf 'angara:x:999:999::/nonexistent:/usr/sbin/nologin\n'
+        ;;
     esac
     ;;
   "group angara")
@@ -273,6 +309,14 @@ if PATH="$FAKE:$PATH" FAKE_MODE=gid0 "$TOP/install.sh" \
     --check-service-user >/dev/null 2>&1; then
     fail "service group with GID 0 was accepted"
 fi
+if PATH="$FAKE:$PATH" FAKE_MODE=shared_gid "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "service group shared as another user's primary GID was accepted"
+fi
+if PATH="$FAKE:$PATH" FAKE_MODE=group_shared "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "existing group shared as another user's primary GID was accepted"
+fi
 PATH="$FAKE:$PATH" FAKE_MODE=valid "$TOP/install.sh" --check-service-user \
     | grep -q 'service_user=valid'
 
@@ -296,7 +340,9 @@ tar -czf "$TMP/replacement.tar.gz" -C "$TMP" \
 cp "$ARCHIVE" "$TMP/race.tar.gz"
 RACE_SHA=$(sha256sum "$TMP/race.tar.gz" | awk '{print $1}')
 REAL_TAR=$(command -v tar)
-cat >"$FAKE/tar" <<EOF
+TAR_FAKE="$TMP/faketar"
+mkdir -p "$TAR_FAKE"
+cat >"$TAR_FAKE/tar" <<EOF
 #!/bin/sh
 if [ ! -e "$TMP/race-swapped" ]; then
   cp "$TMP/replacement.tar.gz" "$TMP/race.tar.gz"
@@ -304,8 +350,8 @@ if [ ! -e "$TMP/race-swapped" ]; then
 fi
 exec "$REAL_TAR" "\$@"
 EOF
-chmod 0755 "$FAKE/tar"
-PATH="$FAKE:$PATH" "$TOP/install.sh" --archive "$TMP/race.tar.gz" \
+chmod 0755 "$TAR_FAKE/tar"
+PATH="$TAR_FAKE:$PATH" "$TOP/install.sh" --archive "$TMP/race.tar.gz" \
     --sha256 "$RACE_SHA" --destdir "$TMP/race-stage" >/dev/null
 assert_eq "$(readlink "$TMP/race-stage/opt/angara/current")" \
     "/opt/angara/releases/$CANDIDATE" "race archive used the verified private copy"
