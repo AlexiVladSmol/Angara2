@@ -256,23 +256,53 @@ check_release_metadata_conflicts() {
 
 install_release_metadata() {
     local release=$1
-    [ -d "$release" ] || die "release directory does not exist: $release"
-    install -d -m 0755 "$UNIT_DIR"
-    rm -f "$UNIT_DIR/$SERVICE.new"
-    install -m 0644 "$release/systemd/angara.service" "$UNIT_DIR/$SERVICE.new"
-    if [ -e "$UNIT_DIR/$SERVICE" ] && cmp -s "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$SERVICE.new"; then
-        rm -f "$UNIT_DIR/$SERVICE.new"
+    [ -d "$release" ] || {
+        printf 'error: release directory does not exist: %s\n' "$release" >&2
+        return 1
+    }
+    install -d -m 0755 "$UNIT_DIR" || {
+        printf 'error: cannot create unit directory: %s\n' "$UNIT_DIR" >&2
+        return 1
+    }
+    rm -f "$UNIT_DIR/$SERVICE.new" || return 1
+    install -m 0644 "$release/systemd/angara.service" \
+        "$UNIT_DIR/$SERVICE.new" || {
+        printf 'error: cannot stage unit from %s\n' "$release" >&2
+        return 1
+    }
+    if [ -e "$UNIT_DIR/$SERVICE" ] \
+        && cmp -s "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$SERVICE.new"; then
+        rm -f "$UNIT_DIR/$SERVICE.new" || return 1
         UNIT_METADATA_CHANGED=0
     else
-        mv -f "$UNIT_DIR/$SERVICE.new" "$UNIT_DIR/$SERVICE"
+        mv -f "$UNIT_DIR/$SERVICE.new" "$UNIT_DIR/$SERVICE" || {
+            printf 'error: cannot install unit %s\n' "$UNIT_DIR/$SERVICE" >&2
+            return 1
+        }
         UNIT_METADATA_CHANGED=1
     fi
-    chown root:root "$UNIT_DIR/$SERVICE"
-    install -d -m 0755 "$SBINDIR"
-    rm -f "$SBINDIR/angaractl.new"
-    install -m 0755 "$release/angaractl" "$SBINDIR/angaractl.new"
-    mv -f "$SBINDIR/angaractl.new" "$SBINDIR/angaractl"
-    chown root:root "$SBINDIR/angaractl"
+    chown root:root "$UNIT_DIR/$SERVICE" || {
+        printf 'error: cannot chown unit %s\n' "$UNIT_DIR/$SERVICE" >&2
+        return 1
+    }
+    install -d -m 0755 "$SBINDIR" || {
+        printf 'error: cannot create helper directory: %s\n' "$SBINDIR" >&2
+        return 1
+    }
+    rm -f "$SBINDIR/angaractl.new" || return 1
+    install -m 0755 "$release/angaractl" "$SBINDIR/angaractl.new" || {
+        printf 'error: cannot stage helper from %s\n' "$release" >&2
+        return 1
+    }
+    mv -f "$SBINDIR/angaractl.new" "$SBINDIR/angaractl" || {
+        printf 'error: cannot install helper %s\n' "$SBINDIR/angaractl" >&2
+        return 1
+    }
+    chown root:root "$SBINDIR/angaractl" || {
+        printf 'error: cannot chown helper %s\n' "$SBINDIR/angaractl" >&2
+        return 1
+    }
+    return 0
 }
 
 switch_current() {
@@ -373,76 +403,103 @@ print(parsed.hostname or "127.0.0.1")
 PY
 }
 
-# Match the actual probe destination address, not merely a port number owned
-# by the MainPID.  A second listener on another loopback address must not
-# satisfy readiness for the requested proxy endpoint.
+# Match the actual probe destination to the MainPID.  A TCP connection is
+# opened to the requested endpoint, then `ss` is used to confirm that this
+# established server socket is owned by the MainPID.  This handles exact,
+# wildcard, IPv4-mapped and dual-stack listeners without assuming that a
+# wildcard IPv4/IPv6 socket serves the other family.
 listener_owned_by_pid() {
     python3 - "$1" "$2" "$3" <<'PY'
 import ipaddress
 import socket
 import subprocess
 import sys
+import time
 
 pid = int(sys.argv[1])
 host = sys.argv[2]
 port = int(sys.argv[3])
-expected = []
+
+
+def parse_endpoint(value):
+    value = value.strip()
+    if value.startswith("["):
+        if "]:" not in value:
+            return None
+        address, text_port = value.rsplit("]:", 1)
+        address = address[1:]
+    else:
+        if ":" not in value:
+            return None
+        address, text_port = value.rsplit(":", 1)
+    address = address.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(address), int(text_port)
+    except ValueError:
+        return None
+
+
+def same_address(left, right):
+    if left == right:
+        return True
+    if left.version == 6 and left.ipv4_mapped == right:
+        return True
+    if right.version == 6 and right.ipv4_mapped == left:
+        return True
+    return False
+
+
 try:
     infos = socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
     )
-    for family, _, _, _, sockaddr in infos:
-        try:
-            expected.append((family, ipaddress.ip_address(sockaddr[0])))
-        except ValueError:
-            pass
-except OSError:
-    pass
-if not expected:
-    try:
-        family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        expected.append((family, ipaddress.ip_address(host.strip("[]"))))
-    except ValueError:
-        sys.exit(1)
-
-try:
-    result = subprocess.run(
-        ["ss", "-H", "-ltnp"], capture_output=True, text=True, check=False
-    )
 except OSError:
     sys.exit(1)
 
-for line in result.stdout.splitlines():
-    fields = line.split()
-    if len(fields) < 4:
-        continue
-    if f"pid={pid}," not in line and f"pid={pid})" not in line:
-        continue
-    local = fields[3]
-    if local.startswith("["):
+connections = []
+try:
+    for family, kind, proto, _, sockaddr in infos:
+        connection = socket.socket(family, kind, proto)
+        connection.settimeout(1)
         try:
-            address, local_port = local.rsplit("]:", 1)
-        except ValueError:
+            connection.connect(sockaddr)
+        except OSError:
+            connection.close()
             continue
-        address = address[1:]
-    else:
-        if ":" not in local:
-            continue
-        address, local_port = local.rsplit(":", 1)
-    if local_port != str(port):
-        continue
-    if address in ("*", "0.0.0.0", "::", "[::]"):
-        sys.exit(0)
-    address = address.split("%", 1)[0]
-    try:
-        actual = ipaddress.ip_address(address)
-    except ValueError:
-        continue
-    for family, candidate in expected:
-        if actual == candidate:
-            sys.exit(0)
-        if actual.version == 6 and actual.ipv4_mapped == candidate:
-            sys.exit(0)
+        connections.append(connection)
+    if not connections:
+        sys.exit(1)
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["ss", "-H", "-tnp"], capture_output=True, text=True, check=False
+            )
+        except OSError:
+            sys.exit(1)
+        for connection in connections:
+            peer_address, peer_port = connection.getpeername()[:2]
+            try:
+                expected = ipaddress.ip_address(peer_address.split("%", 1)[0])
+            except ValueError:
+                continue
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) < 5:
+                    continue
+                if f"pid={pid}," not in line and f"pid={pid})" not in line:
+                    continue
+                parsed = parse_endpoint(fields[3])
+                if parsed is None:
+                    continue
+                actual, local_port = parsed
+                if local_port == peer_port and same_address(actual, expected):
+                    sys.exit(0)
+        time.sleep(0.05)
+finally:
+    for connection in connections:
+        connection.close()
 sys.exit(1)
 PY
 }
@@ -483,7 +540,8 @@ probe_service() {
     for attempt in $(seq 1 60); do
         if verify_service_identity "$expected"; then
             if [ "$NO_PROBE" -eq 1 ]; then
-                printf 'readiness=ok proxy=skipped url=skipped\n'
+                printf 'readiness=ok candidate=%s proxy=skipped url=skipped\n' \
+                    "$(basename "$expected")"
                 return 0
             fi
             command -v curl >/dev/null 2>&1 \
@@ -491,7 +549,8 @@ probe_service() {
             proxy=$(resolve_probe_proxy) \
                 || die "cannot derive a proxy URL from $SYSCONFDIR/angara.toml"
             if probe_once "$proxy"; then
-                printf 'readiness=ok proxy=%s url=%s\n' "$proxy" "$PROBE_URL"
+                printf 'readiness=ok candidate=%s proxy=%s url=%s\n' \
+                    "$(basename "$expected")" "$proxy" "$PROBE_URL"
                 return 0
             fi
         fi

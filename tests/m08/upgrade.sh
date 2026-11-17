@@ -235,8 +235,8 @@ set +e
 POST_SWITCH_CODE=$?
 set -e
 [ "$POST_SWITCH_CODE" -ne 0 ] || fail "unbindable post-switch start was accepted"
-if grep -q 'readiness=ok' "$TMP/post-switch.out"; then
-    fail "post-switch failure reported readiness"
+if grep -Fq "readiness=ok candidate=$B_CANDIDATE" "$TMP/post-switch.out"; then
+    fail "post-switch failure reported readiness for B"
 fi
 if grep -q 'rollback_command=angaractl rollback' "$TMP/post-switch.err"; then
     fail "post-switch failure suggested the wrong rollback direction"
@@ -279,8 +279,8 @@ set +e
 FOREIGN_ADDRESS_CODE=$?
 set -e
 [ "$FOREIGN_ADDRESS_CODE" -ne 0 ] || fail "foreign address passed readiness"
-if grep -q 'readiness=ok' "$TMP/foreign-address-upgrade.out"; then
-    fail "foreign address confirmed readiness"
+if grep -Fq "readiness=ok candidate=$B_CANDIDATE" "$TMP/foreign-address-upgrade.out"; then
+    fail "foreign address confirmed readiness for B"
 fi
 assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
     "foreign-address-restored current"
@@ -292,6 +292,71 @@ grep -q 'A variant marker' /etc/systemd/system/angara.service \
 kill "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
 FOREIGN_PID=
+
+# An IPv4 wildcard listener does not serve an IPv6-only foreign listener on
+# the same port.  Use a real dual-family endpoint pair and require the probe
+# to match the MainPID of the selected release.
+log "upgrade stage: wildcard family readiness"
+cat >"$TMP/foreign-v6.py" <<'PY'
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Server6(HTTPServer):
+    address_family = socket.AF_INET6
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(407)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+Server6(("::1", 31897), Handler).serve_forever()
+PY
+python3 "$TMP/foreign-v6.py" >"$TMP/foreign-v6.out" 2>"$TMP/foreign-v6.err" &
+FOREIGN_PID=$!
+for _ in $(seq 1 100); do
+    python3 - <<'PY' >/dev/null 2>&1 && break
+import socket
+sock = socket.create_connection(("::1", 31897), timeout=1)
+sock.close()
+PY
+    sleep 0.1
+done
+python3 - <<'PY' >/dev/null 2>&1 \
+    || fail "IPv6 foreign listener did not start"
+import socket
+sock = socket.create_connection(("::1", 31897), timeout=1)
+sock.close()
+PY
+python3 "$M08_DIR/make_config.py" --output "$TMP/wildcard.toml" --mode functional \
+    --http-bind 0.0.0.0 --http-port 31897 --https-port 0 --https2-port 0 \
+    --site-port 18443 --extra-port 0 --workers 2 --shutdown-ms 5000 \
+    --reload-ms 5000 --idle-ms 60000 --metrics-interval 1000
+install -m 0640 -o root -g angara "$TMP/wildcard.toml" /etc/angara/angara.toml
+systemctl restart angara.service
+wait_service_active
+set +e
+"$ANGARACTL" activate --candidate "$B_CANDIDATE" --confirm \
+    --probe-proxy 'http://[::1]:31897' \
+    >"$TMP/wildcard.out" 2>"$TMP/wildcard.err"
+WILDCARD_CODE=$?
+set -e
+[ "$WILDCARD_CODE" -ne 0 ] || fail "IPv6 foreign listener passed wildcard readiness"
+if grep -Fq "readiness=ok candidate=$B_CANDIDATE" "$TMP/wildcard.out"; then
+    fail "IPv6 foreign listener confirmed readiness for B"
+fi
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "wildcard-failure restored A"
+# A binds the IPv4 wildcard; the default probe uses 127.0.0.1 and must pass.
+wait_http_code http://127.0.0.1:31897 http://127.0.0.1:18080/ 200
+kill "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=
+install -m 0640 -o root -g angara "$TMP/angara.toml" /etc/angara/angara.toml
+systemctl restart angara.service
+wait_service_active
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
 
 # A forced daemon-reload failure after the switch must restore A and the
 # retry command printed by the failure path must be executable.
@@ -342,6 +407,73 @@ wait_service_active
 assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
     "retry rollback restored A"
 
+# Metadata writes must fail explicitly even though activate_candidate calls
+# install_release_metadata from an `if` condition where set -e is suppressed.
+log "upgrade stage: unit metadata copy failure"
+REAL_INSTALL=$(command -v install)
+REAL_MV=$(command -v mv)
+FAKE_INSTALL="$TMP/fake-install"
+FAKE_MV="$TMP/fake-mv"
+mkdir -p "$FAKE_INSTALL" "$FAKE_MV"
+cat >"$FAKE_INSTALL/install" <<EOF
+#!/bin/sh
+target=
+for last in "\$@"; do target=\$last; done
+if [ "\$target" = "\${M08_FAIL_INSTALL_TARGET:-}" ] \
+    && [ ! -e "$TMP/install-failed-once" ]; then
+    : >"$TMP/install-failed-once"
+    exit 1
+fi
+exec "$REAL_INSTALL" "\$@"
+EOF
+cat >"$FAKE_MV/mv" <<EOF
+#!/bin/sh
+target=
+for last in "\$@"; do target=\$last; done
+if [ "\$target" = "\${M08_FAIL_MV_TARGET:-}" ] \
+    && [ ! -e "$TMP/mv-failed-once" ]; then
+    : >"$TMP/mv-failed-once"
+    exit 1
+fi
+exec "$REAL_MV" "\$@"
+EOF
+chmod 0755 "$FAKE_INSTALL/install" "$FAKE_MV/mv"
+set +e
+PATH="$FAKE_INSTALL:$PATH" \
+    M08_FAIL_INSTALL_TARGET=/etc/systemd/system/angara.service.new \
+    "$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    >"$TMP/unit-copy.out" 2>"$TMP/unit-copy.err"
+UNIT_COPY_CODE=$?
+set -e
+[ "$UNIT_COPY_CODE" -ne 0 ] || fail "unit metadata copy failure was accepted"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "unit-copy-failure restored A"
+grep -q 'A variant marker' /etc/systemd/system/angara.service \
+    || fail "unit copy failure did not restore A unit"
+grep -q 'A variant marker' /usr/local/sbin/angaractl \
+    || fail "unit copy failure did not restore A helper"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+
+log "upgrade stage: helper metadata rename failure"
+set +e
+PATH="$FAKE_MV:$PATH" M08_FAIL_MV_TARGET=/usr/local/sbin/angaractl \
+    "$ANGARACTL" upgrade --archive "$ARCHIVE_B" --sha256 "$SHA_B" --confirm \
+    >"$TMP/helper-mv.out" 2>"$TMP/helper-mv.err"
+HELPER_MV_CODE=$?
+set -e
+[ "$HELPER_MV_CODE" -ne 0 ] || fail "helper metadata rename failure was accepted"
+wait_service_active
+assert_eq "$(readlink /opt/angara/current)" "/opt/angara/releases/$A_CANDIDATE" \
+    "helper-mv-failure restored A"
+grep -q 'A variant marker' /etc/systemd/system/angara.service \
+    || fail "helper rename failure did not restore A unit"
+grep -q 'A variant marker' /usr/local/sbin/angaractl \
+    || fail "helper rename failure did not restore A helper"
+wait_http_code https://127.0.0.1:3129 http://127.0.0.1:18080/ 200 \
+    --config "$TMP/https.conf"
+
 # Foreign listener returning an accepted readiness code must not make B ready.
 log "upgrade stage: foreign readiness"
 systemctl stop angara.service
@@ -366,8 +498,8 @@ set +e
 FOREIGN_CODE=$?
 set -e
 [ "$FOREIGN_CODE" -ne 0 ] || fail "upgrade accepted a foreign readiness server"
-if grep -q 'readiness=ok' "$TMP/foreign-upgrade.out"; then
-    fail "foreign server confirmed readiness"
+if grep -Fq "readiness=ok candidate=$B_CANDIDATE" "$TMP/foreign-upgrade.out"; then
+    fail "foreign server confirmed readiness for B"
 fi
 kill "$FOREIGN_PID" 2>/dev/null || true
 wait "$FOREIGN_PID" 2>/dev/null || true
