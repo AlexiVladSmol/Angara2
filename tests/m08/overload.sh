@@ -58,6 +58,7 @@ wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
 cat >"$TMP/https.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$PASSWORD"
@@ -66,6 +67,7 @@ EOF
 cat >"$TMP/bad.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$WRONG"
@@ -174,7 +176,9 @@ kill "$CONNECT_PID" 2>/dev/null || true
 wait "$CONNECT_PID" 2>/dev/null || true
 wait_service_inactive 20
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "overload stop result"
-! ss -ltn | grep -q ':3128'
+if ss -ltn | grep -q ':3128'; then
+    fail "stop under CONNECT left the listener open"
+fi
 printf 'stop_under_connect elapsed_ms=%s bytes=%s\n' "$ELAPSED" \
     "$(wc -c <"$TMP/slow-connect.bin")" | tee -a "$REPORT_DIR/overload.txt"
 

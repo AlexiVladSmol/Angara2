@@ -156,6 +156,12 @@ def main() -> int:
             str(report),
             "--after-wait",
             "0",
+            "--baseline-wait",
+            "0",
+            "--proxy-unit",
+            "angara.service",
+            "--metrics-wait",
+            "3",
             "--min-success",
             "1.0",
         ]
@@ -178,6 +184,7 @@ def main() -> int:
         )
         time.sleep(args.warmup_idle)
         baseline = read_process(args.pid)
+        measure_started = time.monotonic()
         for batch in range(batches):
             batch_report = batch_dir / f"batch-{batch:02d}.json"
             command = load_command(batch_seconds, batch_report)
@@ -232,6 +239,13 @@ def main() -> int:
                 }
             )
             print(f"soak batch={batch} ok={batch_ok}", flush=True)
+        measure_elapsed = time.monotonic() - measure_started
+        duration_ok = measure_elapsed >= args.duration
+        reloads_ok = (
+            reloads["applied"] >= batches * 2
+            and reloads["rejected"] >= batches
+            and not reloads["errors"]
+        )
         # Restore the valid file even if a batch failed mid-way.
         atomic_write_config(config_path, valid_config)
         time.sleep(30)
@@ -242,9 +256,11 @@ def main() -> int:
             "threads": max((item["threads"] for item in samples), default=0),
         }
         threshold_ok = (
-            peak["rss_kib"] <= 524288
+            bool(samples)
+            and peak["rss_kib"] <= 524288
             and after is not None
             and baseline is not None
+            and peak["fds"] <= baseline["fds"] + 512
             and after["fds"] <= baseline["fds"] + 8
             and after["rss_kib"] <= baseline["rss_kib"] + 65536
         )
@@ -253,10 +269,14 @@ def main() -> int:
             "result": "pass"
             if warmup_ok
             and threshold_ok
+            and duration_ok
+            and reloads_ok
             and all(item["ok"] for item in batch_results)
-            and not reloads["errors"]
             else "fail",
             "duration_s": args.duration,
+            "measured_elapsed_s": round(measure_elapsed, 3),
+            "duration_ok": duration_ok,
+            "reloads_ok": reloads_ok,
             "clients": args.clients,
             "batch_seconds": batch_seconds,
             "warmup_seconds": args.warmup_seconds,
@@ -279,6 +299,9 @@ def main() -> int:
                 {
                     "result": report["result"],
                     "warmup": report["warmup"],
+                    "duration_ok": duration_ok,
+                    "reloads_ok": reloads_ok,
+                    "measured_elapsed_s": round(measure_elapsed, 3),
                     "baseline": baseline,
                     "peak": peak,
                     "after": after,

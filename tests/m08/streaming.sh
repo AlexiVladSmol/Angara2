@@ -58,11 +58,13 @@ PID=$(systemctl show -p MainPID --value angara.service)
 cat >"$TMP/http.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "http://127.0.0.1:3128"
 EOF
 cat >"$TMP/https.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$PASSWORD"
@@ -95,6 +97,7 @@ sample_process() {
 
 BASELINE_RSS=$(awk '/^VmRSS:/{print $2}' "/proc/$PID/status")
 BASELINE_FD=$(find "/proc/$PID/fd" -mindepth 1 -maxdepth 1 | wc -l)
+MAX_PEAK_RSS=0
 printf 'stream baseline rss_kib=%s fds=%s\n' "$BASELINE_RSS" "$BASELINE_FD" \
     | tee "$REPORT_DIR/streaming.txt"
 
@@ -116,6 +119,7 @@ run_transfer() {
     assert_eq "$(wc -c <"$output")" "$bytes" "$label size"
     assert_eq "$(sha256 "$output")" "$expected" "$label hash"
     read -r peak_rss peak_fd <"$TMP/peak-$label.txt"
+    [ "$peak_rss" -gt "$MAX_PEAK_RSS" ] && MAX_PEAK_RSS=$peak_rss
     printf '%s bytes=%s elapsed_ms=%s peak_rss_kib=%s peak_fd=%s\n' \
         "$label" "$bytes" "$elapsed" "$peak_rss" "$peak_fd" \
         | tee -a "$REPORT_DIR/streaming.txt"
@@ -157,5 +161,8 @@ printf 'stream after rss_kib=%s fds=%s\n' "$AFTER_RSS" "$AFTER_FD" \
     || fail "FD did not return: baseline $BASELINE_FD, after $AFTER_FD"
 [ "$AFTER_RSS" -le $((BASELINE_RSS + 65536)) ] \
     || fail "RSS did not return: baseline $BASELINE_RSS, after $AFTER_RSS"
-[ "$AFTER_RSS" -le 524288 ] || fail "RSS exceeded 512 MiB: $AFTER_RSS KiB"
+[ "$MAX_PEAK_RSS" -le 524288 ] \
+    || fail "peak RSS exceeded 512 MiB: $MAX_PEAK_RSS KiB"
+printf 'stream peak_rss_kib=%s\n' "$MAX_PEAK_RSS" \
+    | tee -a "$REPORT_DIR/streaming.txt"
 log "streaming checks passed baseline_rss=$BASELINE_RSS after_rss=$AFTER_RSS"

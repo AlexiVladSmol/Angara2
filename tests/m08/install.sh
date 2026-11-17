@@ -34,6 +34,8 @@ python3 "$TOP/verify_manifest.py" --root "$TOP"
 grep -q '^candidate_id=' <(python3 "$TOP/verify_manifest.py" --root "$TOP")
 grep -q '^source_sha=' <(python3 "$TOP/verify_manifest.py" --root "$TOP")
 file "$TOP/bin/angara" | grep -q 'ELF 64-bit.*x86-64'
+grep -q '^# Managed by Angara package' "$TOP/systemd/angara.service"
+grep -q '^# Managed by Angara package' "$TOP/angaractl"
 grep -q 'Type=exec' "$TOP/systemd/angara.service"
 grep -q '^User=angara$' "$TOP/systemd/angara.service"
 grep -q '^Group=angara$' "$TOP/systemd/angara.service"
@@ -121,6 +123,192 @@ printf '\n# local marker\n' >>"$DEST/etc/angara/angara.toml"
     --destdir "$DEST" | tee "$TMP/install-2.txt"
 grep -q 'config_preserved=1' "$TMP/install-2.txt"
 grep -q '# local marker' "$DEST/etc/angara/angara.toml"
+
+# Existing release/reuse must match the incoming manifest identity and content.
+R1_DEST="$TMP/r1-stage"
+"$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$R1_DEST" >/dev/null
+R1_CANDIDATE=$CANDIDATE
+R1_MANIFEST="$R1_DEST/opt/angara/releases/$R1_CANDIDATE/manifest.json"
+cp "$R1_MANIFEST" "$TMP/r1-manifest.saved"
+python3 - "$R1_MANIFEST" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+data["source_sha"] = "1" * 40
+data["candidate_id"] = "0.1.0-111111111111"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$R1_DEST" >/dev/null 2>&1; then
+    fail "existing release with a different manifest was reused"
+fi
+cp "$TMP/r1-manifest.saved" "$R1_MANIFEST"
+
+# R2: a symlink in a parent component must not redirect writes outside DESTDIR.
+mkdir -p "$TMP/escape-target" "$TMP/escape-stage"
+ln -s "$TMP/escape-target" "$TMP/escape-stage/opt"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$TMP/escape-stage" >/dev/null 2>&1; then
+    fail "parent symlink escaped DESTDIR"
+fi
+[ -z "$(find "$TMP/escape-target" -mindepth 1 -print -quit)" ] \
+    || fail "parent symlink wrote outside DESTDIR"
+
+# R2: a foreign unit must not be overwritten.
+FOREIGN="$TMP/foreign-stage"
+mkdir -p "$FOREIGN/etc/systemd/system"
+printf 'foreign unit\n' >"$FOREIGN/etc/systemd/system/angara.service"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$FOREIGN" >/dev/null 2>&1; then
+    fail "foreign unit was accepted"
+fi
+assert_eq "$(cat "$FOREIGN/etc/systemd/system/angara.service")" "foreign unit" \
+    "foreign unit content preserved"
+
+FOREIGN_HELPER="$TMP/foreign-helper-stage"
+mkdir -p "$FOREIGN_HELPER/usr/local/sbin"
+printf 'foreign helper\n' >"$FOREIGN_HELPER/usr/local/sbin/angaractl"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$FOREIGN_HELPER" >/dev/null 2>&1; then
+    fail "foreign helper was accepted"
+fi
+assert_eq "$(cat "$FOREIGN_HELPER/usr/local/sbin/angaractl")" "foreign helper" \
+    "foreign helper content preserved"
+
+FOREIGN_CURRENT="$TMP/foreign-current-stage"
+mkdir -p "$FOREIGN_CURRENT/opt/angara"
+printf 'foreign current\n' >"$FOREIGN_CURRENT/opt/angara/current"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$FOREIGN_CURRENT" >/dev/null 2>&1; then
+    fail "foreign current path was accepted"
+fi
+assert_eq "$(cat "$FOREIGN_CURRENT/opt/angara/current")" "foreign current" \
+    "foreign current preserved"
+
+FOREIGN_BIN="$TMP/foreign-bin-stage"
+mkdir -p "$FOREIGN_BIN/usr/local/bin"
+printf 'foreign bin\n' >"$FOREIGN_BIN/usr/local/bin/angara"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$FOREIGN_BIN" >/dev/null 2>&1; then
+    fail "foreign CLI path was accepted"
+fi
+assert_eq "$(cat "$FOREIGN_BIN/usr/local/bin/angara")" "foreign bin" \
+    "foreign CLI preserved"
+
+# R4: --candidate-only must not write active metadata or symlinks.
+CANDIDATE_STAGE="$TMP/candidate-stage"
+"$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$CANDIDATE_STAGE" --candidate-only >/dev/null
+[ -d "$CANDIDATE_STAGE/opt/angara/releases/$CANDIDATE" ] \
+    || fail "candidate-only did not install the release directory"
+for absent in \
+    "$CANDIDATE_STAGE/opt/angara/current" \
+    "$CANDIDATE_STAGE/etc/angara/angara.toml" \
+    "$CANDIDATE_STAGE/etc/systemd/system/angara.service" \
+    "$CANDIDATE_STAGE/usr/local/bin/angara" \
+    "$CANDIDATE_STAGE/usr/local/sbin/angaractl"
+do
+    [ ! -e "$absent" ] || fail "candidate-only wrote active metadata: $absent"
+done
+
+# R2: configured paths with .. are rejected before writes.
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$TMP/dotdot-stage" --prefix "/opt/../evil" >/dev/null 2>&1; then
+    fail "path containing .. was accepted"
+fi
+
+# R3: service-account validation with fake NSS records.
+FAKE="$TMP/fakebin"
+mkdir -p "$FAKE"
+cat >"$FAKE/getent" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "passwd angara")
+    [ "${FAKE_MODE:-}" = "absent" ] && exit 1
+    case "${FAKE_MODE:-}" in
+      uid0) printf 'angara:x:0:999::/nonexistent:/usr/sbin/nologin\n' ;;
+      *) printf 'angara:x:999:999::/nonexistent:/usr/sbin/nologin\n' ;;
+    esac
+    ;;
+  "group angara")
+    [ "${FAKE_MODE:-}" = "absent" ] && exit 1
+    case "${FAKE_MODE:-}" in
+      member) printf 'angara:x:999:unrelated\n' ;;
+      gid0) printf 'angara:x:0:\n' ;;
+      *) printf 'angara:x:999:\n' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+cat >"$FAKE/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-nG" ]; then
+  case "${FAKE_MODE:-}" in
+    supplementary) printf 'angara sudo\n' ;;
+    *) printf 'angara\n' ;;
+  esac
+  exit 0
+fi
+exit 1
+EOF
+chmod 0755 "$FAKE/getent" "$FAKE/id"
+if PATH="$FAKE:$PATH" FAKE_MODE=member "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "group with a foreign member was accepted"
+fi
+if PATH="$FAKE:$PATH" FAKE_MODE=supplementary "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "supplementary service-user group was accepted"
+fi
+if PATH="$FAKE:$PATH" FAKE_MODE=uid0 "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "service user with UID 0 was accepted"
+fi
+if PATH="$FAKE:$PATH" FAKE_MODE=gid0 "$TOP/install.sh" \
+    --check-service-user >/dev/null 2>&1; then
+    fail "service group with GID 0 was accepted"
+fi
+PATH="$FAKE:$PATH" FAKE_MODE=valid "$TOP/install.sh" --check-service-user \
+    | grep -q 'service_user=valid'
+
+# R1: replace the source archive after its hash check.  The installer must
+# still use the verified private copy, not the swapped path.
+cp -R "$TOP" "$TMP/replacement"
+mv "$TMP/replacement" "$TMP/angara-0.1.0-linux-x86_64-111111111111"
+python3 - "$TMP/angara-0.1.0-linux-x86_64-111111111111/manifest.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+data["source_sha"] = "1" * 40
+data["candidate_id"] = "0.1.0-111111111111"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+tar -czf "$TMP/replacement.tar.gz" -C "$TMP" \
+    angara-0.1.0-linux-x86_64-111111111111
+cp "$ARCHIVE" "$TMP/race.tar.gz"
+RACE_SHA=$(sha256sum "$TMP/race.tar.gz" | awk '{print $1}')
+REAL_TAR=$(command -v tar)
+cat >"$FAKE/tar" <<EOF
+#!/bin/sh
+if [ ! -e "$TMP/race-swapped" ]; then
+  cp "$TMP/replacement.tar.gz" "$TMP/race.tar.gz"
+  touch "$TMP/race-swapped"
+fi
+exec "$REAL_TAR" "\$@"
+EOF
+chmod 0755 "$FAKE/tar"
+PATH="$FAKE:$PATH" "$TOP/install.sh" --archive "$TMP/race.tar.gz" \
+    --sha256 "$RACE_SHA" --destdir "$TMP/race-stage" >/dev/null
+assert_eq "$(readlink "$TMP/race-stage/opt/angara/current")" \
+    "/opt/angara/releases/$CANDIDATE" "race archive used the verified private copy"
 
 # DESTDIR must not touch host paths.
 [ ! -e /etc/angara/angara.toml ] || fail "DESTDIR test unexpectedly touched /etc/angara"

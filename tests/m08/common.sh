@@ -51,11 +51,17 @@ wait_port() {
 }
 
 wait_http_code() {
-    local proxy=$1 url=$2 expected=$3 attempts=${4:-100}
+    local proxy=$1 url=$2 expected=$3
+    shift 3
+    local attempts=100
+    if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        attempts=$1
+        shift
+    fi
     local i code
     for i in $(seq 1 "$attempts"); do
         code=$(curl --noproxy '' --proxy "$proxy" --connect-timeout 1 \
-            --max-time 3 -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+            --max-time 3 -sS -o /dev/null -w '%{http_code}' "$@" "$url" 2>/dev/null || true)
         [ "$code" = "$expected" ] && return 0
         sleep 0.1
     done

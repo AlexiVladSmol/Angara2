@@ -130,6 +130,8 @@ Unit задаёт `User=angara`, `Group=angara`, `NoNewPrivileges=true`, пус�
 `ProtectControlGroups=true`, `RestrictSUIDSGID=true`, `UMask=0077`,
 `LimitNOFILE=16384` и `TasksMax=512`. `KillMode=control-group` и
 `TimeoutStopSec=315s` покрывают максимальные 300 000 мс приложения.
+Начальный профиль использует `limits.shutdown_timeout_ms = 5000`; значение
+можно изменить допустимым hot-reload до следующего shutdown.
 
 ## 5. TLS, Basic и ACL
 
@@ -167,7 +169,7 @@ phc=$(angara users hash)   # интерактивно: Password/Confirm
 } >"$tmp"
 chown root:angara "$tmp"
 chmod 0640 "$tmp"
-mv -f "$tmp" /etc/angara/users.toml
+mv -f "$tmp" /etc/angara/users.local.toml
 ```
 
 Для автоматической проверки используйте только синтетический секрет и
@@ -183,68 +185,30 @@ PHC считается чувствительным: не выводите ег�
 Добавление/удаление пользователя и смена пароля применяются после restart
 или допустимого reload users-файла.
 
-### 5.3. Пример конфигурации HTTP+HTTPS
+### 5.3. Полный пример HTTP+HTTPS/Basic/ACL
 
-```toml
-[auth]
-users_file = "users.toml"
-max_verifying = 2
-verify_timeout_ms = 2000
+В архиве есть готовый самостоятельный файл
+`examples/m08-operations-https-basic.toml`. Это **полный** конфиг, а не
+фрагмент: не добавляйте его к начальному `angara.toml` и не вставляйте
+отдельные таблицы — замените основной файл целиком. Он уже содержит
+`schema_version`, runtime/limits, auth, TLS, оба listener, ACL, IP-политику,
+connect, egress и routing.
 
-[tls]
-max_handshaking = 32
-handshake_timeout_ms = 5000
+```sh
+# каталоги и конфигурация
+sudo install -d -m 0750 -o root -g angara /etc/angara/tls
+sudo install -m 0640 -o root -g angara \
+  /path/to/angara-0.1.0-linux-x86_64-<sha>/examples/m08-operations-https-basic.toml \
+  /etc/angara/angara.toml
+sudo install -m 0640 -o root -g angara /path/to/users.local.toml /etc/angara/users.local.toml
+sudo install -m 0640 -o root -g angara /path/to/proxy-chain.pem \
+  /etc/angara/tls/proxy-chain.pem
+sudo install -m 0640 -o root -g angara /path/to/proxy-key.pem \
+  /etc/angara/tls/proxy-key.pem
 
-[[listeners]]
-id = "proxy-http"
-bind = "127.0.0.1:3128"
-transport = "http"
-auth = "none"
-
-[[listeners]]
-id = "proxy-https"
-bind = "127.0.0.1:3129"
-transport = "https"
-auth = "basic"
-
-[listeners.tls]
-cert_chain_file = "tls/proxy-chain.pem"
-private_key_file = "tls/proxy-key.pem"
-
-[access]
-source_allow = ["127.0.0.0/8", "::1/128"]
-ip_default = "deny"
-
-[[access.rules]]
-id = "http-local"
-action = "allow"
-listeners = ["proxy-http"]
-methods = ["GET", "HEAD", "POST"]
-ports = [18080]
-
-[[access.rules]]
-id = "https-alice"
-action = "allow"
-listeners = ["proxy-https"]
-users = ["alice"]
-methods = ["GET", "HEAD", "POST", "CONNECT"]
-ports = [18080, 18443]
-
-[[access.ip_rules]]
-id = "allow-loopback-target"
-action = "allow"
-networks = ["127.0.0.0/8", "::1/128"]
-allow_special = true
-
-[connect]
-allowed_ports = [18443]
-
-[[egress]]
-id = "system"
-mode = "system"
-
-[routing]
-default_egress = "system"
+sudo runuser -u angara -- /usr/local/bin/angara check \
+  --config /etc/angara/angara.toml
+sudo systemctl restart angara.service
 ```
 
 После изменения listener/TLS/auth-наличия требуется restart. Изменения ACL,
@@ -258,6 +222,47 @@ sudo runuser -u angara -- /usr/local/bin/angara check \
 
 `check` не открывает listener, не выполняет DNS и не подключается к origin.
 Ошибка check означает, что рабочий процесс не нужно перезапускать.
+
+Проверка после restart (замените пути на свою CA и локальный TLS-site):
+
+```sh
+# HTTP listener: разрешённый запрос
+curl --noproxy '' --proxy http://127.0.0.1:3128 \
+  http://127.0.0.1:18080/ -o /dev/null -w '%{http_code}\n'
+
+# HTTPS listener без credentials: 407
+curl --noproxy '' --proxy https://127.0.0.1:3129 \
+  --proxy-cacert /path/to/proxy-ca.pem --proxy-user alice \
+  http://127.0.0.1:18080/ -o /dev/null -w '%{http_code}\n'
+
+# HTTPS listener с alice: разрешённый запрос (пароль вводится интерактивно)
+curl --noproxy '' --proxy https://127.0.0.1:3129 \
+  --proxy-cacert /path/to/proxy-ca.pem --proxy-user alice \
+  --cacert /path/to/site-ca.pem https://127.0.0.1:18443/ \
+  -o /dev/null -w '%{http_code}\n'
+```
+
+Не используйте `--proxy-insecure`, `-k` или отключение проверки имени. Если
+CA/имя не совпадают, curl должен завершиться ошибкой сертификата, а не
+получить 200. Для проверки без интерактивного ввода используйте curl-config
+файл с `proxy-user` в режиме `0600`, не argv.
+
+Перед изменением сохраните согласованный набор файлов и проверьте восстановление:
+
+```sh
+sudo install -d -m 0700 /var/lib/angara/backups
+sudo tar -C /etc -czf /var/lib/angara/backups/angara-manual.tgz angara
+sudo chmod 0600 /var/lib/angara/backups/angara-manual.tgz
+sudo systemctl stop angara.service
+sudo tar -C /etc -xzf /var/lib/angara/backups/angara-manual.tgz
+sudo systemctl start angara.service
+sudo runuser -u angara -- /usr/local/bin/angara check \
+  --config /etc/angara/angara.toml
+```
+
+Резервная копия содержит приватные ключи и users-файл; каталог `0700` и
+архив `0600` обязательны. Откат только бинарника не восстанавливает пароль
+или ACL — восстанавливайте весь согласованный набор.
 
 ## 6. Reload, журнал и остановка
 
@@ -368,7 +373,7 @@ sudo /usr/local/sbin/angaractl uninstall --confirm --purge
 | `status=226/NAMESPACE` | sandbox unit несовместим с окружением; проверьте `systemd-analyze verify` и `/etc/systemd/system/angara.service.d/` |
 | `check` не читает users/TLS | владелец/режим `root:angara 0640`, каталог `/etc/angara` не world-writable |
 | reload отклонён | `reload_rejected`, `outcome`; исправьте файл и повторите SIGHUP; PID/ACL должны сохраниться |
-| клиент получает 407 | нет/неверные credentials; проверьте `users.toml` и `auth` listener |
+| клиент получает 407 | нет/неверные credentials; проверьте `users.local.toml` и `auth` listener |
 | клиент получает 403 | нет allow-правила ACL, запрещён source/domain/IP/port или сработал default deny |
 | TLS-клиент получает ошибку сертификата | проверьте CA/имя/срок; не отключайте проверку на клиенте |
 | сервис ушёл в start-limit | `systemctl reset-failed angara`; устраните конфигурацию/порт, затем `systemctl start` |

@@ -76,11 +76,13 @@ wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
 cat >"$TMP/http.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "http://127.0.0.1:3128"
 EOF
 cat >"$TMP/https.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$PASSWORD"
@@ -89,6 +91,7 @@ EOF
 cat >"$TMP/https-bob.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "bob:$PASSWORD"
@@ -97,6 +100,7 @@ EOF
 cat >"$TMP/https-bad.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$WRONG"
@@ -105,6 +109,7 @@ EOF
 cat >"$TMP/https-noauth.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.1:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 cacert = "$TMP/pki/site_ca.pem"
@@ -112,6 +117,7 @@ EOF
 cat >"$TMP/https-alt.conf" <<EOF
 silent
 show-error
+noproxy = ""
 proxy = "https://127.0.0.2:3129"
 proxy-cacert = "$TMP/pki/proxy_ca.pem"
 proxy-user = "alice:$PASSWORD"

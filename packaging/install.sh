@@ -22,8 +22,8 @@ EXPECTED_SOURCE_SHA=
 EXPECTED_CANDIDATE=
 CANDIDATE_ONLY=0
 NO_SYSTEMD=0
-FORCE=0
 NO_OWNER=0
+CHECK_SERVICE_USER=0
 SERVICE=angara.service
 SERVICE_USER=angara
 WORKDIR=
@@ -32,6 +32,65 @@ STAGED_SOURCE=
 die() {
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+reject_unsafe_components() {
+    local value=$1 part
+    local IFS=/
+    for part in $value; do
+        case "$part" in
+            '..'|.) die "path contains an unsafe component: $value" ;;
+        esac
+    done
+}
+
+# Read-only validation of an existing service account.  The account must be a
+# dedicated, non-interactive system account whose only group is the dedicated
+# `angara` group.  A group member or an extra supplementary group could read
+# root:angara 0640 users/TLS files, so both are rejected.
+validate_service_user() {
+    local user_entry group_entry user_uid user_gid group_gid shell home members groups
+    if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+        user_entry=$(getent passwd "$SERVICE_USER")
+        user_uid=$(printf '%s\n' "$user_entry" | cut -d: -f3)
+        user_gid=$(printf '%s\n' "$user_entry" | cut -d: -f4)
+        home=$(printf '%s\n' "$user_entry" | cut -d: -f6)
+        shell=$(printf '%s\n' "$user_entry" | cut -d: -f7)
+        [ "$user_uid" -ne 0 ] \
+            || die "user $SERVICE_USER must not be UID 0"
+        case "$shell" in
+            */nologin|*/false) ;;
+            *) die "user $SERVICE_USER exists with an interactive shell ($shell); refusing to adopt it" ;;
+        esac
+        case "$home" in
+            /nonexistent|/var/lib/angara|/var/lib/angara/*) ;;
+            *) die "user $SERVICE_USER exists with unexpected home ($home); refusing to adopt it" ;;
+        esac
+        getent group "$SERVICE_USER" >/dev/null 2>&1 \
+            || die "user $SERVICE_USER has no matching $SERVICE_USER group; refusing to adopt it"
+        group_entry=$(getent group "$SERVICE_USER")
+        group_gid=$(printf '%s\n' "$group_entry" | cut -d: -f3)
+        members=$(printf '%s\n' "$group_entry" | cut -d: -f4)
+        [ "$group_gid" -ne 0 ] \
+            || die "group $SERVICE_USER must not be GID 0"
+        [ "$user_gid" = "$group_gid" ] \
+            || die "user $SERVICE_USER primary GID $user_gid does not match group GID $group_gid"
+        [ -z "$members" ] \
+            || die "group $SERVICE_USER has unexpected members ($members); refusing to adopt it"
+        groups=$(id -nG "$SERVICE_USER" 2>/dev/null || true)
+        [ "$groups" = "$SERVICE_USER" ] \
+            || die "user $SERVICE_USER has supplementary groups ($groups); refusing to adopt it"
+    else
+        if getent group "$SERVICE_USER" >/dev/null 2>&1; then
+            group_entry=$(getent group "$SERVICE_USER")
+            group_gid=$(printf '%s\n' "$group_entry" | cut -d: -f3)
+            members=$(printf '%s\n' "$group_entry" | cut -d: -f4)
+            [ "$group_gid" -ne 0 ] \
+                || die "group $SERVICE_USER must not be GID 0"
+            [ -z "$members" ] \
+                || die "group $SERVICE_USER exists with members ($members); refusing to adopt it"
+        fi
+    fi
 }
 
 cleanup() {
@@ -53,12 +112,14 @@ Options:
   --bindir <dir>           CLI symlink directory (default: /usr/local/bin).
   --sbindir <dir>          Maintenance command directory (default: /usr/local/sbin).
   --varlib <dir>           Private state/backup root (default: /var/lib/angara).
-  --source-dir <dir>       Use an already extracted tree (no archive hash check).
+  --source-dir <dir>       Internal verified angaractl staging only; requires
+                           ANGARA_INTERNAL_STAGED_TREE=1.
   --expected-source-sha <sha>  Refuse a different source commit.
   --expected-candidate <id>    Refuse a different candidate id.
-  --candidate-only         Install the release but do not activate it.
+  --candidate-only         Install only the release directory; do not touch
+                           the active unit, helper, config or symlinks.
   --no-systemd             Do not call systemctl daemon-reload.
-  --force                  Allow a managed path/symlink replacement.
+  --check-service-user     Validate an existing angara user/group and exit.
   -h, --help               Show this help.
 EOF
 }
@@ -79,17 +140,24 @@ while [ "$#" -gt 0 ]; do
         --expected-candidate) [ "$#" -ge 2 ] || die "--expected-candidate needs a value"; EXPECTED_CANDIDATE=$2; shift 2 ;;
         --candidate-only) CANDIDATE_ONLY=1; shift ;;
         --no-systemd) NO_SYSTEMD=1; shift ;;
-        --force) FORCE=1; shift ;;
         --no-owner) NO_OWNER=1; shift ;;
+        --check-service-user) CHECK_SERVICE_USER=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
+if [ "$CHECK_SERVICE_USER" -eq 1 ]; then
+    validate_service_user
+    printf 'service_user=valid\n'
+    exit 0
+fi
+
 if [ -n "$DESTDIR_INPUT" ]; then
     case "$DESTDIR_INPUT" in
         /) die "--destdir / is not a staging directory" ;;
     esac
+    reject_unsafe_components "$DESTDIR_INPUT"
     # Resolve and create the staging directory only after the archive hash and
     # manifest have been verified, so a bad archive cannot create host paths.
     NO_OWNER=1
@@ -98,6 +166,8 @@ else
 fi
 
 if [ -n "$SOURCE_DIR" ]; then
+    [ "${ANGARA_INTERNAL_STAGED_TREE:-0}" = "1" ] \
+        || die "--source-dir is reserved for the verified angaractl staging path; use --archive"
     [ -z "$ARCHIVE" ] || die "choose either --archive or --source-dir"
     STAGED_SOURCE=$(CDPATH= cd -- "$SOURCE_DIR" && pwd)
     [ -f "$STAGED_SOURCE/manifest.json" ] || die "source tree has no manifest.json"
@@ -110,14 +180,20 @@ else
         *[!0-9a-f]*|'') die "SHA-256 must be 64 lowercase hex characters" ;;
     esac
     [ "${#ARCHIVE_SHA}" -eq 64 ] || die "SHA-256 must be 64 characters"
-    printf '%s  %s\n' "$ARCHIVE_SHA" "$ARCHIVE" | sha256sum -c - >/dev/null \
-        || die "archive SHA-256 mismatch"
     WORKDIR=$(mktemp -d)
     chmod 0700 "$WORKDIR"
+    # Read the archive exactly once into a private copy, then verify and use
+    # that copy for every subsequent operation.  Reopening the operator-supplied
+    # path after the hash check would allow a swap between check and tar.
+    ARCHIVE_COPY="$WORKDIR/archive.tar.gz"
+    cat -- "$ARCHIVE" >"$ARCHIVE_COPY"
+    chmod 0600 "$ARCHIVE_COPY"
+    printf '%s  %s\n' "$ARCHIVE_SHA" "$ARCHIVE_COPY" | sha256sum -c - >/dev/null \
+        || die "archive SHA-256 mismatch"
     # Reject absolute paths, parent traversal, backslashes and links before
     # extracting anything. The release tree only contains regular files and
     # directories.
-    tar -tzf "$ARCHIVE" >"$WORKDIR/list.txt"
+    tar -tzf "$ARCHIVE_COPY" >"$WORKDIR/list.txt"
     while IFS= read -r entry; do
         case "$entry" in
             ''|/*|*\\*|..|../*|*/..|*/../*|*//*)
@@ -128,7 +204,7 @@ else
             */../*) die "unsafe archive path: $entry" ;;
         esac
     done <"$WORKDIR/list.txt"
-    tar -tvzf "$ARCHIVE" >"$WORKDIR/types.txt"
+    tar -tvzf "$ARCHIVE_COPY" >"$WORKDIR/types.txt"
     while IFS= read -r line; do
         mode=${line%% *}
         case "$mode" in
@@ -138,7 +214,7 @@ else
         esac
     done <"$WORKDIR/types.txt"
     mkdir -p "$WORKDIR/root"
-    tar -xzf "$ARCHIVE" -C "$WORKDIR/root" \
+    tar -xzf "$ARCHIVE_COPY" -C "$WORKDIR/root" \
         --no-same-owner --same-permissions --delay-directory-restore
     mapfile -t top < <(find "$WORKDIR/root" -mindepth 1 -maxdepth 1 -printf '%f\n')
     [ "${#top[@]}" -eq 1 ] || die "archive must contain exactly one top-level directory"
@@ -163,10 +239,17 @@ fi
 
 if [ -n "$DESTDIR_INPUT" ]; then
     mkdir -p "$DESTDIR_INPUT"
-    DESTDIR=$(CDPATH= cd -- "$DESTDIR_INPUT" && pwd)
+    DESTDIR=$(CDPATH= cd -- "$DESTDIR_INPUT" && pwd -P)
     case "$DESTDIR" in
         /|'') die "--destdir must not resolve to /" ;;
     esac
+    DEST_MODE=$(stat -c '%a' "$DESTDIR")
+    DEST_UID=$(stat -c '%u' "$DESTDIR")
+    [ "$DEST_UID" = "$(id -u)" ] \
+        || die "--destdir is not owned by the invoking user: $DESTDIR"
+    if (( (8#$DEST_MODE & 0022) != 0 )); then
+        die "--destdir is group/world writable: $DESTDIR ($DEST_MODE)"
+    fi
 fi
 
 path() {
@@ -186,23 +269,11 @@ ensure_dir() {
 }
 
 ensure_service_user() {
+    [ "$CANDIDATE_ONLY" -eq 0 ] || return 0
     [ -z "$DESTDIR" ] || return 0
     [ "$NO_OWNER" -eq 0 ] || return 0
-    if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
-        local shell home
-        shell=$(getent passwd "$SERVICE_USER" | cut -d: -f7)
-        home=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
-        case "$shell" in
-            */nologin|*/false) ;;
-            *) die "user $SERVICE_USER already exists with an interactive shell ($shell); refusing to adopt it" ;;
-        esac
-        case "$home" in
-            /nonexistent|/var/lib/angara|/var/lib/angara/*) ;;
-            *) die "user $SERVICE_USER already exists with unexpected home ($home); refusing to adopt it" ;;
-        esac
-        getent group "$SERVICE_USER" >/dev/null 2>&1 \
-            || die "user $SERVICE_USER has no matching group; refusing to adopt it"
-    else
+    validate_service_user
+    if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
         if getent group "$SERVICE_USER" >/dev/null 2>&1; then
             useradd --system --gid "$SERVICE_USER" --home-dir /nonexistent \
                 --shell /usr/sbin/nologin --no-create-home --comment "Angara proxy" \
@@ -215,35 +286,172 @@ ensure_service_user() {
     fi
 }
 
-check_managed_path() {
-    local target=$1
-    if [ -L "$target" ]; then
-        die "managed path is a symlink: $target"
-    fi
+validate_managed_template() {
+    local value=$1 part
+    case "$value" in
+        /*) ;;
+        *) die "managed path must be absolute: $value" ;;
+    esac
+    case "$value" in
+        *\\*|*//*) die "managed path contains an unsafe separator: $value" ;;
+    esac
+    value=${value#/}
+    value=${value%/}
+    [ -n "$value" ] || die "managed path must not be the filesystem root"
+    local IFS=/
+    for part in $value; do
+        case "$part" in
+            ''|.|..) die "managed path contains an unsafe component: $value" ;;
+        esac
+    done
+}
+
+assert_safe_managed_path() {
+    local target=$1 current
+    validate_managed_template "$target"
+    current=$target
+    while [ "$current" != "/" ]; do
+        if [ -L "$current" ]; then
+            die "managed path component is a symlink: $current"
+        fi
+        current=$(dirname -- "$current")
+    done
+}
+
+check_managed_dir() {
+    local target=$1 mode
     if [ -e "$target" ] && [ ! -d "$target" ]; then
         die "managed path is not a directory: $target"
     fi
+    if [ -d "$target" ]; then
+        mode=$(stat -c '%a' "$target")
+        if (( (8#$mode & 0022) != 0 )); then
+            die "managed directory is group/world writable: $target ($mode)"
+        fi
+    fi
 }
 
-for managed in "$(path "$PREFIX")" "$(path "$SYSCONFDIR")" "$(path "$UNIT_DIR")" "$(path "$VARLIB"/backups)"; do
-    check_managed_path "$managed"
+for managed_root in "$PREFIX" "$SYSCONFDIR" "$UNIT_DIR" "$BINDIR" "$SBINDIR" "$VARLIB"; do
+    validate_managed_template "$managed_root"
 done
+
+for managed in \
+    "$(path "$PREFIX")" \
+    "$(path "$PREFIX/releases")" \
+    "$(path "$PREFIX/state")" \
+    "$(path "$SYSCONFDIR")" \
+    "$(path "$SYSCONFDIR/tls")" \
+    "$(path "$SYSCONFDIR/angara.toml")" \
+    "$(path "$UNIT_DIR")" \
+    "$(path "$UNIT_DIR/$SERVICE")" \
+    "$(path "$BINDIR")" \
+    "$(path "$SBINDIR")" \
+    "$(path "$SBINDIR/angaractl")" \
+    "$(path "$VARLIB")" \
+    "$(path "$VARLIB/backups")"
+do
+    assert_safe_managed_path "$managed"
+done
+
+for managed_dir in \
+    "$(path "$PREFIX")" \
+    "$(path "$PREFIX/releases")" \
+    "$(path "$PREFIX/state")" \
+    "$(path "$SYSCONFDIR")" \
+    "$(path "$SYSCONFDIR/tls")" \
+    "$(path "$UNIT_DIR")" \
+    "$(path "$BINDIR")" \
+    "$(path "$SBINDIR")" \
+    "$(path "$VARLIB")" \
+    "$(path "$VARLIB/backups")"
+do
+    check_managed_dir "$managed_dir"
+done
+
+preflight_managed_conflicts() {
+    [ "$CANDIDATE_ONLY" -eq 0 ] || return 0
+    local unit_target helper_target config_target current bin_link previous
+    unit_target=$(path "$UNIT_DIR/$SERVICE")
+    if [ -e "$unit_target" ]; then
+        [ -f "$unit_target" ] && [ ! -L "$unit_target" ] \
+            || die "existing unit is not a regular managed file: $unit_target"
+        grep -q '^# Managed by Angara package' "$unit_target" \
+            || die "existing unit is foreign and will not be overwritten: $unit_target"
+    fi
+    helper_target=$(path "$SBINDIR/angaractl")
+    if [ -e "$helper_target" ]; then
+        [ -f "$helper_target" ] && [ ! -L "$helper_target" ] \
+            || die "existing helper is not a regular managed file: $helper_target"
+        grep -q '^# Managed by Angara package' "$helper_target" \
+            || die "existing helper is foreign and will not be overwritten: $helper_target"
+    fi
+    config_target=$(path "$SYSCONFDIR/angara.toml")
+    if [ -L "$config_target" ]; then
+        die "existing config is a symlink: $config_target"
+    fi
+    if [ -e "$config_target" ]; then
+        [ -f "$config_target" ] || die "existing config is not a regular file: $config_target"
+        local config_mode
+        config_mode=$(stat -c '%a' "$config_target")
+        case "$config_mode" in
+            400|440|600|640) ;;
+            *) die "existing $config_target has unsafe mode $config_mode" ;;
+        esac
+    fi
+    current=$(path "$PREFIX/current")
+    if [ -L "$current" ]; then
+        case "$(readlink "$current")" in
+            "$PREFIX"/releases/*) ;;
+            *) die "current symlink points outside $PREFIX/releases" ;;
+        esac
+    elif [ -e "$current" ]; then
+        die "$current exists and is not a managed symlink"
+    fi
+    previous=$(path "$PREFIX/previous")
+    if [ -L "$previous" ]; then
+        case "$(readlink "$previous")" in
+            "$PREFIX"/releases/*) ;;
+            *) die "previous symlink points outside $PREFIX/releases" ;;
+        esac
+    elif [ -e "$previous" ]; then
+        die "$previous exists and is not a managed symlink"
+    fi
+    bin_link=$(path "$BINDIR/angara")
+    if [ -L "$bin_link" ]; then
+        [ "$(readlink "$bin_link")" = "$PREFIX/current/bin/angara" ] \
+            || die "$bin_link points to a foreign target"
+    elif [ -e "$bin_link" ]; then
+        die "$bin_link exists and is not a managed symlink"
+    fi
+}
+
+preflight_managed_conflicts
 
 ensure_service_user
 ensure_dir "$(path "$PREFIX")" 0755 root root
 ensure_dir "$(path "$PREFIX/releases")" 0755 root root
-ensure_dir "$(path "$PREFIX/state")" 0755 root root
-ensure_dir "$(path "$SYSCONFDIR")" 0750 root "$SERVICE_USER"
-ensure_dir "$(path "$SYSCONFDIR/tls")" 0750 root "$SERVICE_USER"
-ensure_dir "$(path "$VARLIB")" 0700 root root
-ensure_dir "$(path "$VARLIB/backups")" 0700 root root
+if [ "$CANDIDATE_ONLY" -eq 0 ]; then
+    ensure_dir "$(path "$PREFIX/state")" 0755 root root
+    ensure_dir "$(path "$SYSCONFDIR")" 0750 root "$SERVICE_USER"
+    ensure_dir "$(path "$SYSCONFDIR/tls")" 0750 root "$SERVICE_USER"
+    ensure_dir "$(path "$VARLIB")" 0700 root root
+    ensure_dir "$(path "$VARLIB/backups")" 0700 root root
+fi
 
 RELEASE_LINK="$PREFIX/releases/$CANDIDATE"
 RELEASE_DIR=$(path "$RELEASE_LINK")
 if [ -e "$RELEASE_DIR" ]; then
-    [ -d "$RELEASE_DIR" ] || die "release path is not a directory: $RELEASE_DIR"
-    python3 "$STAGED_SOURCE/verify_manifest.py" --root "$RELEASE_DIR" --quiet \
-        || die "existing release directory is not a valid $CANDIDATE tree"
+    [ -d "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ] \
+        || die "release path is not a real directory: $RELEASE_DIR"
+    # Verify the existing tree against the trusted manifest of the incoming
+    # archive, not against a manifest that may have been left by another
+    # version under the same candidate directory name.
+    python3 "$STAGED_SOURCE/verify_manifest.py" \
+        --root "$RELEASE_DIR" \
+        --manifest "$STAGED_SOURCE/manifest.json" --quiet \
+        || die "existing release directory does not match the incoming $CANDIDATE manifest"
+    cmp -s "$RELEASE_DIR/manifest.json" "$STAGED_SOURCE/manifest.json" \
+        || die "existing release manifest differs from the incoming manifest: $RELEASE_DIR"
 else
     TMP_RELEASE=$(path "$PREFIX/releases/.tmp-$CANDIDATE")
     rm -rf "$TMP_RELEASE"
@@ -268,69 +476,113 @@ if [ -L "$(path "$PREFIX/current")" ]; then
     OLD_CURRENT=$(readlink -f "$(path "$PREFIX/current")" || true)
 fi
 
-UNIT_TARGET=$(path "$UNIT_DIR/$SERVICE")
-mkdir -p "$(dirname "$UNIT_TARGET")"
-install -m 0644 "$RELEASE_DIR/systemd/angara.service" "$UNIT_TARGET.new"
 UNIT_CHANGED=0
-if [ -e "$UNIT_TARGET" ] && cmp -s "$UNIT_TARGET" "$UNIT_TARGET.new"; then
-    rm -f "$UNIT_TARGET.new"
-else
-    if [ -e "$UNIT_TARGET" ]; then
-        install -m 0644 "$UNIT_TARGET" "$(path "$PREFIX/state/angara.service.previous")"
-    fi
-    mv -f "$UNIT_TARGET.new" "$UNIT_TARGET"
-    UNIT_CHANGED=1
-fi
-if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
-    chown root:root "$UNIT_TARGET"
-fi
-
-CONFIG_TARGET=$(path "$SYSCONFDIR/angara.toml")
 CONFIG_PRESERVED=0
-if [ -e "$CONFIG_TARGET" ]; then
-    CONFIG_PRESERVED=1
-    MODE=$(stat -c '%a' "$CONFIG_TARGET")
-    case "$MODE" in
-        400|440|600|640) ;;
-        *) die "existing $CONFIG_TARGET has unsafe mode $MODE (expected 0400, 0440, 0600 or 0640)" ;;
-    esac
-    "$RELEASE_DIR/bin/angara" check --config "$CONFIG_TARGET" >/dev/null \
-        || die "existing $CONFIG_TARGET does not validate; it was not overwritten"
-    if [ -z "$DESTDIR" ] && [ "$(id -u)" -eq 0 ]; then
-        runuser -u "$SERVICE_USER" -- test -r "$CONFIG_TARGET" \
-            || die "the service user cannot read $CONFIG_TARGET"
+if [ "$CANDIDATE_ONLY" -eq 0 ]; then
+    UNIT_TARGET=$(path "$UNIT_DIR/$SERVICE")
+    if [ -e "$UNIT_TARGET" ]; then
+        [ -f "$UNIT_TARGET" ] && [ ! -L "$UNIT_TARGET" ] \
+            || die "existing unit is not a regular managed file: $UNIT_TARGET"
+        grep -q '^# Managed by Angara package' "$UNIT_TARGET" \
+            || die "existing unit is foreign and will not be overwritten: $UNIT_TARGET"
     fi
-else
-    install -m 0640 "$RELEASE_DIR/config/angara.toml.default" "$CONFIG_TARGET"
+    mkdir -p "$(dirname "$UNIT_TARGET")"
+    rm -f "$UNIT_TARGET.new"
+    install -m 0644 "$RELEASE_DIR/systemd/angara.service" "$UNIT_TARGET.new"
+    if [ -e "$UNIT_TARGET" ] && cmp -s "$UNIT_TARGET" "$UNIT_TARGET.new"; then
+        rm -f "$UNIT_TARGET.new"
+    else
+        if [ -e "$UNIT_TARGET" ]; then
+            install -m 0644 "$UNIT_TARGET" "$(path "$PREFIX/state/angara.service.previous")"
+        fi
+        mv -f "$UNIT_TARGET.new" "$UNIT_TARGET"
+        UNIT_CHANGED=1
+    fi
     if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
-        chown root:"$SERVICE_USER" "$CONFIG_TARGET"
+        chown root:root "$UNIT_TARGET"
+    fi
+
+    CONFIG_TARGET=$(path "$SYSCONFDIR/angara.toml")
+    if [ -e "$CONFIG_TARGET" ]; then
+        CONFIG_PRESERVED=1
+        [ -f "$CONFIG_TARGET" ] && [ ! -L "$CONFIG_TARGET" ] \
+            || die "existing config is not a regular file: $CONFIG_TARGET"
+        MODE=$(stat -c '%a' "$CONFIG_TARGET")
+        case "$MODE" in
+            400|440|600|640) ;;
+            *) die "existing $CONFIG_TARGET has unsafe mode $MODE (expected 0400, 0440, 0600 or 0640)" ;;
+        esac
+        "$RELEASE_DIR/bin/angara" check --config "$CONFIG_TARGET" >/dev/null \
+            || die "existing $CONFIG_TARGET does not validate; it was not overwritten"
+        if [ -z "$DESTDIR" ] && [ "$(id -u)" -eq 0 ]; then
+            runuser -u "$SERVICE_USER" -- test -r "$CONFIG_TARGET" \
+                || die "the service user cannot read $CONFIG_TARGET"
+        fi
+    else
+        install -m 0640 "$RELEASE_DIR/config/angara.toml.default" "$CONFIG_TARGET"
+        if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+            chown root:"$SERVICE_USER" "$CONFIG_TARGET"
+        fi
     fi
 fi
 
 if [ "$CANDIDATE_ONLY" -eq 0 ]; then
     CURRENT=$(path "$PREFIX/current")
+    if [ -L "$CURRENT" ]; then
+        CURRENT_TARGET=$(readlink "$CURRENT")
+        case "$CURRENT_TARGET" in
+            "$PREFIX"/releases/*) ;;
+            *) die "current symlink points outside $PREFIX/releases: $CURRENT_TARGET" ;;
+        esac
+    elif [ -e "$CURRENT" ]; then
+        die "$CURRENT exists and is not a managed symlink"
+    fi
     ln -sfn "$RELEASE_LINK" "$CURRENT.tmp"
     mv -Tf "$CURRENT.tmp" "$CURRENT"
     if [ -n "$OLD_CURRENT" ] && [ "$OLD_CURRENT" != "$RELEASE_DIR" ] && [ -d "$OLD_CURRENT" ]; then
         OLD_CURRENT_LINK=${OLD_CURRENT#"$DESTDIR"}
-        ln -sfn "$OLD_CURRENT_LINK" "$(path "$PREFIX/previous").tmp"
-        mv -Tf "$(path "$PREFIX/previous").tmp" "$(path "$PREFIX/previous")"
+        PREVIOUS=$(path "$PREFIX/previous")
+        if [ -L "$PREVIOUS" ]; then
+            PREVIOUS_TARGET=$(readlink "$PREVIOUS")
+            case "$PREVIOUS_TARGET" in
+                "$PREFIX"/releases/*) ;;
+                *) die "previous symlink points outside $PREFIX/releases: $PREVIOUS_TARGET" ;;
+            esac
+        elif [ -e "$PREVIOUS" ]; then
+            die "$PREVIOUS exists and is not a managed symlink"
+        fi
+        ln -sfn "$OLD_CURRENT_LINK" "$PREVIOUS.tmp"
+        mv -Tf "$PREVIOUS.tmp" "$PREVIOUS"
     fi
 
     BIN_LINK=$(path "$BINDIR/angara")
     mkdir -p "$(dirname "$BIN_LINK")"
-    if [ -e "$BIN_LINK" ] && [ ! -L "$BIN_LINK" ]; then
-        [ "$FORCE" -eq 1 ] || die "$BIN_LINK already exists and is not a managed symlink"
+    if [ -L "$BIN_LINK" ]; then
+        BIN_TARGET=$(readlink "$BIN_LINK")
+        case "$BIN_TARGET" in
+            "$PREFIX/current/bin/angara") ;;
+            *) die "$BIN_LINK points to a foreign target: $BIN_TARGET" ;;
+        esac
+    elif [ -e "$BIN_LINK" ]; then
+        die "$BIN_LINK already exists and is not a managed symlink"
     fi
     ln -sfn "$PREFIX/current/bin/angara" "$BIN_LINK.tmp"
     mv -Tf "$BIN_LINK.tmp" "$BIN_LINK"
-fi
 
-SBIN_TARGET=$(path "$SBINDIR/angaractl")
-mkdir -p "$(dirname "$SBIN_TARGET")"
-install -m 0755 "$RELEASE_DIR/angaractl" "$SBIN_TARGET"
-if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
-    chown root:root "$SBIN_TARGET"
+    SBIN_TARGET=$(path "$SBINDIR/angaractl")
+    if [ -e "$SBIN_TARGET" ]; then
+        [ -f "$SBIN_TARGET" ] && [ ! -L "$SBIN_TARGET" ] \
+            || die "existing helper is not a regular managed file: $SBIN_TARGET"
+        grep -q '^# Managed by Angara package' "$SBIN_TARGET" \
+            || die "existing helper is foreign and will not be overwritten: $SBIN_TARGET"
+    fi
+    mkdir -p "$(dirname "$SBIN_TARGET")"
+    rm -f "$SBIN_TARGET.new"
+    install -m 0755 "$RELEASE_DIR/angaractl" "$SBIN_TARGET.new"
+    mv -f "$SBIN_TARGET.new" "$SBIN_TARGET"
+    if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+        chown root:root "$SBIN_TARGET"
+    fi
 fi
 
 if [ "$NO_SYSTEMD" -eq 0 ] && [ -z "$DESTDIR" ] && [ "$UNIT_CHANGED" -eq 1 ]; then
@@ -341,6 +593,7 @@ printf 'candidate_id=%s\n' "$CANDIDATE"
 printf 'release_dir=%s\n' "$RELEASE_DIR"
 printf 'config_preserved=%s\n' "$CONFIG_PRESERVED"
 printf 'unit_changed=%s\n' "$UNIT_CHANGED"
+printf 'candidate_only=%s\n' "$CANDIDATE_ONLY"
 if [ -n "$DESTDIR" ]; then
     printf 'staged_under=%s\n' "$DESTDIR"
 else

@@ -45,7 +45,7 @@ debootstrap --variant=minbase \
 
 install -d -m 0755 "$ROOT/tmp/release"
 cp -a "$TOP/." "$ROOT/tmp/release/"
-chroot "$ROOT" /tmp/release/install.sh \
+chroot "$ROOT" env ANGARA_INTERNAL_STAGED_TREE=1 /tmp/release/install.sh \
     --source-dir /tmp/release \
     --expected-source-sha "$SOURCE_SHA" \
     --no-systemd >"$TMP/install.txt"

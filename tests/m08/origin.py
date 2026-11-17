@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import ssl
 import sys
 import threading
@@ -179,6 +180,19 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    accept_log = None
+
+    def get_request(self):
+        connection, address = super().get_request()
+        if self.accept_log:
+            with LOCK:
+                with open(self.accept_log, "a", encoding="utf-8") as handle:
+                    handle.write(f"{address[0]}\n")
+        return connection, address
+
+
+class Server6(Server):
+    address_family = socket.AF_INET6
 
 
 def main() -> int:
@@ -188,14 +202,17 @@ def main() -> int:
     parser.add_argument("--cert")
     parser.add_argument("--key")
     parser.add_argument("--log", default="")
+    parser.add_argument("--accept-log", default="")
     parser.add_argument("--print-hash", type=int, default=0)
     args = parser.parse_args()
     if args.print_hash:
         print(pattern_hash(args.print_hash))
         return 0
 
-    server = Server((args.host, args.port), Handler)
+    server_type = Server6 if ":" in args.host else Server
+    server = server_type((args.host, args.port), Handler)
     server.request_log = args.log or None
+    server.accept_log = args.accept_log or None
     if args.cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(args.cert, args.key)

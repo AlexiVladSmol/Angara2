@@ -36,6 +36,8 @@ def main() -> int:
     parser.add_argument("--http-port", type=int, default=3128)
     parser.add_argument("--http2-bind", default="127.0.0.2")
     parser.add_argument("--http2-port", type=int, default=3128)
+    parser.add_argument("--v6-bind", default="::1")
+    parser.add_argument("--v6-port", type=int, default=0)
     parser.add_argument("--https-bind", default="127.0.0.1")
     parser.add_argument("--https-port", type=int, default=0)
     parser.add_argument("--https2-bind", default="127.0.0.2")
@@ -177,6 +179,8 @@ default_egress = "system"
             ("proxy-a", args.http_bind, args.http_port),
             ("proxy-b", args.http2_bind, args.http2_port),
         ]
+        if args.v6_port > 0:
+            listeners.append(("proxy-v6", args.v6_bind, args.v6_port))
     else:
         listeners = [("proxy-http", args.http_bind, args.http_port)]
         if https_enabled:
@@ -186,11 +190,16 @@ default_egress = "system"
 
     for listener_id, bind_host, port in listeners:
         is_https = listener_id.startswith("proxy-https")
+        bind_value = (
+            f"[{bind_host}]:{port}"
+            if ":" in bind_host and not bind_host.startswith("[")
+            else f"{bind_host}:{port}"
+        )
         lines.extend(
             [
                 "[[listeners]]",
                 f"id = {q(listener_id)}",
-                f"bind = {q(f'{bind_host}:{port}')}",
+                f"bind = {q(bind_value)}",
                 f"transport = {q('https' if is_https else 'http')}",
                 f"auth = {q(args.auth_https if is_https else args.auth_http)}",
                 "",
@@ -222,7 +231,12 @@ default_egress = "system"
                     "[[access.rules]]",
                     'id = "network-allow"',
                     'action = "allow"',
-                    'listeners = ["proxy-a", "proxy-b"]',
+                    "listeners = "
+                + (
+                    '["proxy-a", "proxy-b", "proxy-v6"]'
+                    if args.v6_port > 0
+                    else '["proxy-a", "proxy-b"]'
+                ),
                     'methods = ["GET", "HEAD", "POST", "CONNECT"]',
                     f"ports = {list_int(sorted(allow_ports))}",
                     "",
@@ -303,6 +317,11 @@ default_egress = "system"
                 'mode = "bind_ip"',
                 f"bind_ip = {q(args.egress_b)}",
                 "",
+                *(
+                    ["[[egress]]", 'id = "system-v6"', 'mode = "system"', ""]
+                    if args.v6_port > 0
+                    else []
+                ),
                 "[routing]",
                 'default_egress = "egress-a"',
                 "",
@@ -316,6 +335,17 @@ default_egress = "system"
                 'egress_id = "egress-b"',
                 'listeners = ["proxy-b"]',
                 "",
+                *(
+                    [
+                        "[[routing.rules]]",
+                        'id = "listener-v6"',
+                        'egress_id = "system-v6"',
+                        'listeners = ["proxy-v6"]',
+                        "",
+                    ]
+                    if args.v6_port > 0
+                    else []
+                ),
             ]
         )
     else:

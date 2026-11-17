@@ -20,6 +20,7 @@ REQUIRED = {
     "install.sh",
     "angaractl",
     "config/angara.toml.default",
+    "examples/m08-operations-https-basic.toml",
     "docs/ADMIN_GUIDE.md",
     "docs/RELEASE.md",
     "licenses/THIRD_PARTY_NOTICES.md",

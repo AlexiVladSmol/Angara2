@@ -615,6 +615,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" bash tests/m08/install.sh
 
   systemd:
@@ -638,6 +639,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           mkdir -p extracted
           tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
@@ -668,6 +670,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           mkdir -p extracted
           tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
@@ -678,6 +681,15 @@ jobs:
         run: sudo --preserve-env=M08_BIN bash tests/m08/functional.sh
       - name: Run streaming checks
         run: sudo --preserve-env=M08_BIN bash tests/m08/streaming.sh
+      - name: Run shipped admin-guide example
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
+            sudo --preserve-env=M08_BIN,M08_ARCHIVE,M08_SHA256 \
+            bash tests/m08/admin_guide.sh
       - name: Make reports readable
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
@@ -710,6 +722,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           mkdir -p extracted
           tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
@@ -740,6 +753,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           mkdir -p extracted
           tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
@@ -820,8 +834,41 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
             sudo --preserve-env=M08_ARCHIVE,M08_SHA256 bash tests/m08/boot.sh
+
+  vm-boot:
+    name: Disposable Ubuntu cloud VM install and boot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Install QEMU and cloud-init tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Boot disposable VM twice
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
+          M08_SOURCE_SHA="$(git rev-parse HEAD)" \
+            sudo --preserve-env=M08_ARCHIVE,M08_SHA256,M08_SOURCE_SHA \
+            bash tests/m08/vm_boot.sh
 
   soak:
     name: 60-minute 20-client soak
@@ -845,6 +892,7 @@ jobs:
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           mkdir -p extracted
           tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
           TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)

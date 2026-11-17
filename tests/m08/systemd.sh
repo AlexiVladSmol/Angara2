@@ -218,31 +218,39 @@ if grep -Eq 'alice|bob|Proxy-Authorization|Authorization|synthetic' "$TMP/journa
     fail "journal contains a username, credential or synthetic marker"
 fi
 
-# Graceful stop under an active slow HTTP response.
+# Graceful stop: a real, completable 16 MiB exchange must finish within the
+# application deadline with the client receiving every byte.
 python3 "$M08_DIR/make_config.py" --output "$TMP/stop.toml" --mode functional \
-    "${COMMON[@]}" --shutdown-ms 2000
+    "${COMMON[@]}" --shutdown-ms 15000
 write_config "$TMP/stop.toml"
 reload_event reload_applied >/dev/null
-curl --noproxy '' --proxy http://127.0.0.1:3128 --limit-rate 100k \
-    "http://127.0.0.1:18080/download?bytes=67108864&delay_ms=1" \
+GRACEFUL_HASH=$(python3 "$M08_DIR/origin.py" --print-hash 16777216)
+curl --noproxy '' --proxy http://127.0.0.1:3128 --limit-rate 4m \
+    "http://127.0.0.1:18080/download?bytes=16777216" \
     -o "$TMP/slow.bin" >"$TMP/slow.out" 2>"$TMP/slow.err" &
 SLOW_PID=$!
 for _ in $(seq 1 100); do
     [ -s "$TMP/slow.bin" ] && break
     sleep 0.1
 done
-[ -s "$TMP/slow.bin" ] || fail "slow download did not start"
+[ -s "$TMP/slow.bin" ] || fail "graceful download did not start"
 START_MS=$(date +%s%3N)
 systemctl stop angara.service
 END_MS=$(date +%s%3N)
 ELAPSED=$((END_MS - START_MS))
-[ "$ELAPSED" -le 4000 ] || fail "graceful stop took ${ELAPSED}ms"
-wait "$SLOW_PID" 2>/dev/null || true
+[ "$ELAPSED" -le 16000 ] || fail "graceful stop took ${ELAPSED}ms"
+set +e
+wait "$SLOW_PID"
+SLOW_CODE=$?
+set -e
 SLOW_PID=
 wait_service_inactive 20
+assert_eq "$SLOW_CODE" "0" "graceful client exit"
+assert_eq "$(wc -c <"$TMP/slow.bin")" "16777216" "graceful client bytes"
+assert_eq "$(sha256 "$TMP/slow.bin")" "$GRACEFUL_HASH" "graceful client hash"
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "graceful stop result"
 assert_eq "$(systemctl show -p ExecMainStatus --value angara.service)" "0" "graceful stop status"
-! ss -ltn | grep -q ':3128'
+if ss -ltn | grep -q ':3128'; then fail "graceful stop left the listener open"; fi
 reset_failed
 systemctl start angara.service
 wait_service_active
@@ -263,18 +271,36 @@ time.sleep(20)
 PY
 STALL_PID=$!
 sleep 1
+FORCE_CURSOR=$(journalctl -u angara.service -n 0 --show-cursor --no-pager 2>/dev/null \
+    | sed -n 's/^-- cursor: //p')
 START_MS=$(date +%s%3N)
 systemctl stop angara.service
 END_MS=$(date +%s%3N)
 ELAPSED=$((END_MS - START_MS))
 [ "$ELAPSED" -le 3000 ] || fail "forced stop took ${ELAPSED}ms"
-kill "$STALL_PID" 2>/dev/null || true
-wait "$STALL_PID" 2>/dev/null || true
+set +e
+kill "$STALL_PID" 2>/dev/null
+wait "$STALL_PID" 2>/dev/null
+STALL_CODE=$?
+set -e
 STALL_PID=
+[ "$STALL_CODE" -ne 0 ] || fail "forced client unexpectedly completed successfully"
 wait_service_inactive 20
 assert_eq "$(systemctl show -p Result --value angara.service)" "success" "forced stop result"
 assert_eq "$(systemctl show -p ExecMainStatus --value angara.service)" "0" "forced stop status"
-! ss -ltn | grep -q ':3128'
+if ss -ltn | grep -q ':3128'; then fail "forced stop left the listener open"; fi
+if pgrep -f '[/]opt/angara/.*/bin/angara serve' >/dev/null 2>&1; then
+    fail "a serve process survived forced shutdown"
+fi
+CGROUP=$(systemctl show -p ControlGroup --value angara.service)
+if [ -n "$CGROUP" ] && [ -e "/sys/fs/cgroup$CGROUP/cgroup.procs" ] \
+    && [ -s "/sys/fs/cgroup$CGROUP/cgroup.procs" ]; then
+    fail "forced stop left processes in $CGROUP"
+fi
+if journalctl -u angara.service --after-cursor "$FORCE_CURSOR" -o cat --no-pager 2>/dev/null \
+    | grep -Eq 'Killing process|status=9/KILL|signal=KILL'; then
+    fail "systemd had to SIGKILL the forced shutdown"
+fi
 reset_failed
 systemctl start angara.service
 wait_service_active

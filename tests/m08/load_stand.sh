@@ -45,7 +45,7 @@ python3 "$M08_DIR/make_config.py" --output "$TMP/angara.toml" --mode functional 
     --tls-key /etc/angara/tls/proxy-key.pem \
     --workers 2 --https-users alice,bob --max-verifying 16 \
     --shutdown-ms 10000 --reload-ms 5000 \
-    --idle-ms 60000 --metrics-interval 60000 \
+    --idle-ms 60000 --metrics-interval 1000 \
     --max-connections 512 --max-client-connections 256
 TMPCONF=$(mktemp /etc/angara/.load.XXXXXX)
 cp "$TMP/angara.toml" "$TMPCONF"
@@ -56,7 +56,10 @@ systemctl restart angara.service
 wait_service_active
 wait_http_code http://127.0.0.1:3128 http://127.0.0.1:18080/ 200
 PID=$(systemctl show -p MainPID --value angara.service)
-printf 'load stand pid=%s nproc=%s\n' "$PID" "$(nproc)" | tee "$REPORT_DIR/load-stand.txt"
+unset NO_PROXY no_proxy
+printf 'load stand pid=%s nproc=%s NO_PROXY=%s\n' \
+    "$PID" "$(nproc)" "${NO_PROXY:-unset}" \
+    | tee "$REPORT_DIR/load-stand.txt"
 systemctl show -p CPUAffinity -p AllowedCPUs -p CPUQuotaPerSecUSec angara.service \
     >>"$REPORT_DIR/load-stand.txt" 2>&1 || true
 journalctl -u angara.service -n 0 --show-cursor --no-pager 2>/dev/null \

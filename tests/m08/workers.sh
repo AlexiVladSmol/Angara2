@@ -23,6 +23,7 @@ python3 "$M08_DIR/origin.py" --host 127.0.0.1 --port 18080 \
 ORIGIN_PID=$!
 wait_port 127.0.0.1 18080
 
+unset NO_PROXY no_proxy
 CPUS=$(nproc)
 CPU_LIST=$(python3 - <<'PY'
 import os

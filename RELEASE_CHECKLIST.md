@@ -23,6 +23,10 @@ Do not pre-fill results.
 - [ ] Repeated install preserves config/users/TLS/drop-ins.
 - [ ] `--destdir` install changes only the staging tree.
 - [ ] Unsafe path/symlink/corrupt archive/wrong SHA fails before activation.
+- [ ] Archive is copied privately and all tar/manifest operations use the verified bytes.
+- [ ] Existing release tree is verified against the incoming manifest, not its own stale manifest.
+- [ ] Parent symlinks cannot redirect DESTDIR writes; foreign unit/helper/current files are preserved and rejected.
+- [ ] Existing `angara` group has no foreign members; service user has no supplementary privileged groups.
 - [ ] `systemd-analyze verify` passes.
 - [ ] `Type=exec`, `User/Group=angara`, PID/UID/groups/capabilities verified.
 - [ ] Sandbox and `LimitNOFILE=16384`/`TasksMax=512` verified from the process.
@@ -35,6 +39,7 @@ Do not pre-fill results.
 - [ ] Forced application close does not require SIGKILL.
 - [ ] Restart-on-failure, start limit, config error and occupied port verified.
 - [ ] `enable` and boot with systemd PID 1 verified on disposable stand.
+- [ ] Disposable Ubuntu cloud VM installs/enables, reboots, and serves 403 before any operator configuration.
 
 ## Security and functionality
 
@@ -54,7 +59,9 @@ Do not pre-fill results.
 - [ ] Corrupt/wrong-hash/unreadable material fails while A keeps serving.
 - [ ] A→B changes `/proc/<pid>/exe`, current release and proxy response.
 - [ ] Config, users and TLS hashes survive A→B→A.
+- [ ] Distinguishable A/B unit/helper/TLS metadata and an allowed origin request are checked across each transition.
 - [ ] B failure after switch produces diagnostics and restores A.
+- [ ] Foreign process returning an accepted HTTP code cannot confirm B readiness; readiness is tied to MainPID/exe/listener.
 - [ ] Interrupted stop/start is recovered by repeat or explicit rollback.
 - [ ] Port-conflict recovery works after the conflicting listener is removed.
 - [ ] Previous release remains available until operator cleanup.
@@ -83,7 +90,9 @@ Do not pre-fill results.
 
 - [ ] F01–F11 / N01–N09 matrix has test/command/evidence/limitation.
 - [ ] All 18 M08-ID have evidence and limitations.
-- [ ] Admin guide commands were executed on the stand.
+- [ ] Complete `examples/m08-operations-https-basic.toml` passes check/serve/TLS/Basic/ACL from the archive.
+- [ ] Admin guide backup/restore and CA/407/allowed-request commands were executed on the stand.
+- [ ] ROB corpus/command and limits are listed.
 - [ ] Failed attempts and rerun reasons are recorded.
 - [ ] PR has `Closes #23`, head SHA, archive SHA-256, CI links and owner check.
 - [ ] Merge, license choice, first deployment and public v0.1 release remain

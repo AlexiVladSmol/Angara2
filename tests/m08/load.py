@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-delay-ms", type=int, default=50)
     parser.add_argument("--min-success", type=float, default=1.0)
     parser.add_argument("--after-wait", type=int, default=20)
+    parser.add_argument("--baseline-wait", type=int, default=20)
+    parser.add_argument("--proxy-unit", default="angara.service")
+    parser.add_argument("--metrics-wait", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -70,7 +73,7 @@ def write_curl_config(
     count: int,
     report: bool = True,
 ) -> None:
-    lines = ["silent", "show-error", f'proxy = "{proxy}"']
+    lines = ["silent", "show-error", 'noproxy = ""', f'proxy = "{proxy}"']
     if proxy_ca:
         lines.append(f'proxy-cacert = "{proxy_ca}"')
     if user:
@@ -105,6 +108,33 @@ def read_process(pid: int) -> dict[str, int] | None:
     except OSError:
         return None
     return result
+
+
+def proxy_completed(unit: str) -> int | None:
+    completed = subprocess.run(
+        [
+            "journalctl",
+            "-u",
+            unit,
+            "--since",
+            "10 minutes ago",
+            "-o",
+            "cat",
+            "--no-pager",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    for line in reversed(completed.stdout.splitlines()):
+        if '"event":"metrics_summary"' not in line:
+            continue
+        try:
+            value = json.loads(line)
+            metrics = value.get("metrics") or {}
+            return int(metrics["http_completed"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+    return None
 
 
 def run_functional(
@@ -237,7 +267,7 @@ def main() -> int:
     password = read_password(args.password_file) if args.mix == "mixed" else None
     workdir = Path(tempfile.mkdtemp(prefix="angara-m08-load-", dir=args.workdir))
     try:
-        before = read_process(args.pid)
+        cold_before = read_process(args.pid)
         functional = run_functional(workdir, args, password)
         if not functional["ok"]:
             report = {
@@ -325,6 +355,13 @@ def main() -> int:
                 future.result()
         warm_elapsed = time.monotonic() - warm_start
         print(f"warmup clients={total} elapsed={warm_elapsed:.2f}s")
+        time.sleep(args.baseline_wait)
+        baseline = read_process(args.pid)
+        proxy_before = proxy_completed(args.proxy_unit)
+        print(
+            f"warm baseline rss={baseline} proxy_http_completed={proxy_before}",
+            flush=True,
+        )
 
         processes: list[subprocess.Popen] = []
         started = time.monotonic()
@@ -342,7 +379,7 @@ def main() -> int:
             )
             out_handle.close()
             err_handle.close()
-        peak = before
+        peak = baseline
         deadline = started + max(args.duration * 3, 180) + 60
         while any(process.poll() is None for process in processes):
             sample = read_process(args.pid)
@@ -363,6 +400,11 @@ def main() -> int:
         elapsed = time.monotonic() - started
         for process in processes:
             process.wait(timeout=5)
+        client_exit_errors = [
+            f"client {index}: curl exit {process.returncode}"
+            for index, process in enumerate(processes)
+            if process.returncode != 0
+        ]
 
         codes: dict[str, int] = {}
         latencies: list[float] = []
@@ -385,18 +427,71 @@ def main() -> int:
         missing = expected - observed
         success = observed - sum(unexpected.values()) - max(missing, 0)
         success_ratio = success / expected if expected else 0.0
+        duration_ok = elapsed >= args.duration * 0.85
+
+        metrics_deadline = time.monotonic() + args.metrics_wait
+        proxy_after = None
+        proxy_delta = None
+        while True:
+            proxy_after = proxy_completed(args.proxy_unit)
+            if proxy_before is not None and proxy_after is not None:
+                proxy_delta = proxy_after - proxy_before
+                if proxy_delta >= observed:
+                    break
+            if time.monotonic() >= metrics_deadline:
+                break
+            time.sleep(0.5)
+        proxy_ok = (
+            proxy_before is not None
+            and proxy_after is not None
+            and proxy_delta is not None
+            and proxy_delta >= observed
+        )
+
+        time.sleep(args.after_wait)
+        after = read_process(args.pid)
+        peak_rss = (peak or {}).get("rss_kib", 0)
+        peak_fds = (peak or {}).get("fds", 0)
+        peak_fd_ok = (
+            baseline is not None and peak_fds <= baseline["fds"] + 512
+        )
+        resource_ok = (
+            peak is not None
+            and peak_rss > 0
+            and peak_rss <= 524288
+            and peak_fd_ok
+            and baseline is not None
+            and after is not None
+            and after["fds"] <= baseline["fds"] + 8
+            and after["rss_kib"] <= baseline["rss_kib"] + 65536
+        )
         report = {
             "result": "pass"
-            if success_ratio >= args.min_success and missing == 0
+            if success_ratio >= args.min_success
+            and missing == 0
+            and not client_exit_errors
+            and duration_ok
+            and proxy_ok
+            and resource_ok
             else "fail",
             "clients": total,
             "mix": args.mix,
             "duration_s": args.duration,
+            "duration_ok": duration_ok,
             "expected_requests": expected,
             "observed_requests": observed,
             "missing_requests": missing,
             "unexpected_codes": unexpected,
             "codes": codes,
+            "client_exit_errors": client_exit_errors,
+            "proxy_path": {
+                "unit": args.proxy_unit,
+                "http_completed_before": proxy_before,
+                "http_completed_after": proxy_after,
+                "http_completed_delta": proxy_delta,
+                "observed_requests": observed,
+                "ok": proxy_ok,
+            },
             "latency_ms": {
                 "p50": round(percentile(latencies, 0.50), 3),
                 "p95": round(percentile(latencies, 0.95), 3),
@@ -405,10 +500,16 @@ def main() -> int:
             "throughput_rps": round(observed / elapsed, 3) if elapsed else 0.0,
             "elapsed_s": round(elapsed, 3),
             "functional": functional,
-            "resources": {"before": before, "peak": peak, "after": None},
+            "resources": {
+                "cold": cold_before,
+                "baseline": baseline,
+                "peak": peak,
+                "after": after,
+                "peak_fds": peak_fds,
+                "peak_fd_ok": peak_fd_ok,
+                "ok": resource_ok,
+            },
         }
-        time.sleep(args.after_wait)
-        report["resources"]["after"] = read_process(args.pid)
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))

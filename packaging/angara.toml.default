@@ -18,7 +18,7 @@ max_client_connections = 128
 max_header_bytes = 32768
 header_read_timeout_ms = 10000
 idle_timeout_ms = 60000
-shutdown_timeout_ms = 10000
+shutdown_timeout_ms = 5000
 
 [operations]
 reload_timeout_ms = 5000

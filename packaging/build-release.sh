@@ -176,7 +176,8 @@ for example in \
     m02-policy.toml \
     m02-egress-local.toml \
     m03-http-local.toml \
-    m04-connect-local.toml
+    m04-connect-local.toml \
+    m08-operations-https-basic.toml
 do
     install -m 0644 "$REPO_DIR/examples/$example" "$DIST/examples/$example"
 done

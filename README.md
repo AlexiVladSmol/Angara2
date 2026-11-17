@@ -102,7 +102,7 @@ max_client_connections = 128
 max_header_bytes = 32768
 header_read_timeout_ms = 10000
 idle_timeout_ms = 60000
-shutdown_timeout_ms = 10000
+shutdown_timeout_ms = 5000
 
 [http]
 max_headers = 100
@@ -216,14 +216,15 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | --- | --- |
 | `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, M07 reload/control/logging/metrics + resource/load/CPU evidence, `config_m07`/`cli_m07`/`m07_reload`/`m07_limits`, 20 повторов M04 forced-shutdown, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
 | `release` | release-сборка B из head и A из `911266e...`, `manifest.json`, внешний `SHA256SUMS`, notices, artifact upload |
-| `installer` | `tests/m08/install.sh`: манифест, SHA-256, path traversal/symlink rejection, DESTDIR, повторная установка, `systemd-analyze verify` |
-| `systemd` | реальный systemd: identity/capabilities/sandbox/limits, initial 403, reload accepted/rejected, restart-required, SIGHUP storm, stop/force, crash restart, start limit, occupied port |
-| `functional` | HTTP/HTTPS/Basic/ACL, 407/403, обе TLS-цепочки, TLS-in-TLS CONNECT, secret markers, stop under load; streaming 64 MiB/1 GiB |
-| `network` | два veth + netns, source IP у origin, счётчики, удаление egress-адреса без fallback |
-| `load` | 10/20 клиентов по 60 s, TLS+Basic, HTTP/HTTPS/CONNECT, upload/download/HEAD/Range, 1/2/4 workers, overload |
-| `upgrade` | A→B→A, проверка B до остановки A, backup, `/proc/<pid>/exe`, config hashes, pre/post-switch failure, recover |
+| `installer` | `tests/m08/install.sh`: манифест, SHA-256, private copy против TOCTOU, path traversal/symlink rejection, foreign unit/user/group conflicts, DESTDIR, повторная установка |
+| `systemd` | реальный systemd: identity/capabilities/sandbox/limits, initial 403, reload accepted/rejected, restart-required, SIGHUP storm, завершаемый graceful-обмен, force stop без SIGKILL, crash restart, start limit, occupied port |
+| `functional` | HTTP/HTTPS/Basic/ACL, 407/403, обе TLS-цепочки, TLS-in-TLS CONNECT, secret markers, stop under load; streaming 64 MiB/1 GiB; shipped `m08-operations-https-basic.toml` и backup/restore из ADMIN_GUIDE |
+| `network` | установленный unit (не root foreground), два veth + netns, source IP у origin, реальный TCP accept counter, DNS/NSS и IPv6, удаление egress-адреса без fallback |
+| `load` | 10/20 клиентов по 60 s, TLS+Basic, HTTP/HTTPS/CONNECT, upload/download/HEAD/Range, 1/2 workers (4 при наличии CPU), proxy-counter, warmed baseline, overload |
+| `upgrade` | A→B→A с различимыми unit/helper/TLS, разрешённый запрос через origin, backup, `/proc/<pid>/exe`, config hashes, pre/post-switch failure, foreign-listener readiness, recover |
 | `boot` | минимальный Ubuntu 24.04 rootfs, `systemctl enable`, systemd-nspawn boot, autostart, readiness 403 |
-| `soak` | 60-минутный 20-клиентный прогон; запускается push-коммитом с маркером `[soak]` |
+| `vm-boot` | одноразовая Ubuntu cloud VM: установка/enable на первом boot, второй boot и readiness после автозапуска |
+| `soak` | 60-минутный 20-клиентный прогон; проверяет фактическую длительность и обязательные reload; запускается push-коммитом с маркером `[soak]` |
 | `deny` | `cargo-deny check` (advisories, licenses, bans, sources) |
 
 Права workflow — только `contents: read`; production secrets не используются.
@@ -946,23 +947,29 @@ sudo systemctl enable --now angara.service
 запрос получает 403, origin не открывается. TLS, Basic, пользователи и ACL
 включаются по [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md).
 
-`install.sh` проверяет внешний SHA-256, отклоняет path traversal/ссылки,
-сверяет манифест, идемпотентно сохраняет настройки/users/TLS/drop-in и умеет
+`install.sh` читает архив один раз в приватную копию, проверяет SHA-256 этой
+копии и использует её для tar/манифеста; повторная установка сверяется с
+манифестом входящего архива, а не с оставшимся деревом. Он отклоняет path
+traversal/ссылки, конфликты с чужими unit/helper/current/bin, проверяет, что
+группа `angara` закрыта и у сервисного пользователя нет лишних групп, и умеет
 непривилегированный `--destdir`. `angaractl upgrade --archive B --sha256 B
 --confirm` проверяет B бинарником B от пользователя `angara`, делает
 root-only резервную копию `/etc/angara`, останавливает A, атомарно
-переключает `current`, запускает B и проверяет запрос; `angaractl rollback
---confirm` возвращает A. Настройки, users и TLS при этом не перезаписываются.
+переключает `current`, устанавливает unit/helper B, запускает B и проверяет
+запрос, привязанный к MainPID/listener выбранного release; `angaractl
+rollback --confirm` возвращает A. Настройки, users и TLS не перезаписываются.
+Полный пример TLS/Basic/ACL — `examples/m08-operations-https-basic.toml`.
 
 Сборка и происхождение описаны в [`docs/RELEASE.md`](docs/RELEASE.md),
 checklist — в [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md), карта
 F01–F11/N01–N09 и 18 M08-ID — в
 [`docs/M08_EVIDENCE.md`](docs/M08_EVIDENCE.md). CI собирает A и B, проверяет
 архив без Rust на отдельном Ubuntu 24.04 runner, реальный systemd,
-boot/enable, A→B→A, два veth/netns, 1/2/4 workers, 10/20 клиентов, 64 MiB и
-1 GiB streaming, перегрузку и 60-минутный soak. Фактические результаты и
-SHA-256 испытанного архива прикладываются к PR/CI run; они не заполняются
-заранее.
+boot/enable в systemd-nspawn, одноразовую cloud VM, A→B→A с различимыми
+метаданными, два veth/netns с DNS/IPv6, 1/2 workers (4 при наличии CPU),
+10/20 клиентов с proxy-counter, 64 MiB и 1 GiB streaming, перегрузку и
+60-минутный soak. Фактические результаты и SHA-256 испытанного архива
+прикладываются к PR/CI run; они не заполняются заранее.
 
 Нагрузочный профиль стенда использует `auth.max_verifying = 16` вместо
 production default `2`, чтобы контролируемый поток 10/20 клиентов с Basic не

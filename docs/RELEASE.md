@@ -45,6 +45,7 @@ angara-0.1.0-linux-x86_64-<source-short-sha>/
   examples/m02-egress-local.toml
   examples/m03-http-local.toml
   examples/m04-connect-local.toml
+  examples/m08-operations-https-basic.toml
   licenses/THIRD_PARTY_NOTICES.md
   licenses/<package>-<version>/...
   provenance/Cargo.lock
