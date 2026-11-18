@@ -53,7 +53,9 @@ B_CANDIDATE=$(sed -n 's/^candidate_id=//p' "$TMP/b-manifest.txt")
 # binary stay the accepted M07 release.
 mkdir -p "$TMP/a-variant"
 A_VARIANT_TOP="$TMP/a-variant/$(basename "$A_ORIGINAL_TOP")"
-cp -R "$A_ORIGINAL_TOP" "$A_VARIANT_TOP"
+# Preserve modes: this test must differ from the accepted A only in the two
+# deliberately modified metadata files, not because umask rewrote the tree.
+cp -a "$A_ORIGINAL_TOP" "$A_VARIANT_TOP"
 printf '\n# A variant marker\n' >>"$A_VARIANT_TOP/systemd/angara.service"
 printf '# A variant marker\n' >>"$A_VARIANT_TOP/angaractl"
 python3 - "$A_VARIANT_TOP/manifest.json" "$A_VARIANT_TOP" <<'PY'
@@ -72,6 +74,28 @@ for entry in data["files"]:
 with open(manifest_path, "w", encoding="utf-8") as handle:
     json.dump(data, handle, indent=2, sort_keys=True)
     handle.write("\n")
+PY
+python3 - "$A_ORIGINAL_TOP/manifest.json" "$A_VARIANT_TOP/manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    original = json.load(handle)
+with open(sys.argv[2], "r", encoding="utf-8") as handle:
+    variant = json.load(handle)
+
+changed = {"systemd/angara.service", "angaractl"}
+left = {entry["path"]: entry for entry in original["files"]}
+right = {entry["path"]: entry for entry in variant["files"]}
+if set(left) != set(right):
+    raise SystemExit("A variant file set differs from original A")
+for path in sorted(left):
+    if path in changed:
+        if left[path]["mode"] != right[path]["mode"]:
+            raise SystemExit(f"A variant mode changed for {path}")
+        continue
+    if left[path] != right[path]:
+        raise SystemExit(f"A variant changed an unintended file: {path}")
 PY
 A_VARIANT="$TMP/angara-a-variant.tar.gz"
 tar -czf "$A_VARIANT" -C "$TMP/a-variant" "$(basename "$A_VARIANT_TOP")"

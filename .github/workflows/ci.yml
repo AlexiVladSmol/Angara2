@@ -630,6 +630,16 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          # Some hosted runner images ship /usr/local/bin as 0777.  The
+          # installer correctly refuses that layout; normalize the disposable
+          # runner instead of weakening the managed-directory check.
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Install B archive
         run: |
           set -euo pipefail
@@ -661,6 +671,13 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Install B archive
         run: |
           set -euo pipefail
@@ -713,6 +730,13 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Install B archive
         run: |
           set -euo pipefail
@@ -744,6 +768,13 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Install B archive
         run: |
           set -euo pipefail
@@ -794,6 +825,13 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Run upgrade checks
         run: |
           set -euo pipefail
@@ -884,6 +922,13 @@ jobs:
         with:
           name: angara-release-b
           path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
       - name: Install B archive
         run: |
           set -euo pipefail

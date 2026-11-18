@@ -220,6 +220,20 @@ fi
 assert_eq "$(cat "$FOREIGN_BIN/usr/local/bin/angara")" "foreign bin" \
     "foreign CLI preserved"
 
+# R2: a managed directory writable by group/world must be rejected before
+# any release or metadata is written.
+BAD_MANAGED="$TMP/bad-managed-stage"
+mkdir -p "$BAD_MANAGED/usr/local/bin"
+chmod 0777 "$BAD_MANAGED/usr/local/bin"
+if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
+    --destdir "$BAD_MANAGED" >/dev/null 2>&1; then
+    fail "group/world-writable managed directory was accepted"
+fi
+[ ! -e "$BAD_MANAGED/opt/angara" ] \
+    || fail "managed-directory rejection wrote a release tree"
+[ ! -e "$BAD_MANAGED/etc/angara/angara.toml" ] \
+    || fail "managed-directory rejection wrote a config"
+
 # R4: --candidate-only must not write active metadata or symlinks.
 CANDIDATE_STAGE="$TMP/candidate-stage"
 "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
