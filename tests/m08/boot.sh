@@ -14,15 +14,34 @@ command -v debootstrap >/dev/null 2>&1 || fail "debootstrap is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
 command -v timeout >/dev/null 2>&1 || fail "timeout is required"
 
+resolve_mirror_uri() {
+    local uri=$1 target
+    case "$uri" in
+        http://*|https://*)
+            printf '%s\n' "$uri"
+            ;;
+        mirror+file:*)
+            target=${uri#mirror+file:}
+            if [ -f "$target" ]; then
+                awk '!/^[[:space:]]*#/ && NF { print $1; exit }' "$target"
+            fi
+            ;;
+    esac
+}
+
 detect_ubuntu_mirror() {
-    local mirror=
+    local mirror= candidate=
     if [ -n "${M08_UBUNTU_MIRROR:-}" ]; then
         printf '%s\n' "$M08_UBUNTU_MIRROR"
         return 0
     fi
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-        mirror=$(awk '$1 == "URIs:" { print $2; exit }' \
-            /etc/apt/sources.list.d/ubuntu.sources)
+        while IFS= read -r candidate; do
+            mirror=$(resolve_mirror_uri "$candidate")
+            [ -n "$mirror" ] && break
+        done < <(awk '$1 == "URIs:" {
+            for (i = 2; i <= NF; i++) print $i
+        }' /etc/apt/sources.list.d/ubuntu.sources)
     fi
     if [ -z "$mirror" ] && [ -f /etc/apt/sources.list ]; then
         mirror=$(awk '$1 == "deb" {
