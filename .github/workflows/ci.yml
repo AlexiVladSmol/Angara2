@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - main
-      - docs/m00-proposal
-      # Development branches get CI even before the workflow exists on the
-      # base branch, for example when the workflow itself is introduced in a PR.
-      - "feat/**"
-      - "fix/**"
   pull_request:
   workflow_dispatch:
 
@@ -32,6 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install pinned toolchain
@@ -537,6 +533,429 @@ jobs:
           trap - EXIT
           rm -rf "$TMP"
 
+  release:
+    name: Release artifacts A and B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build B archive
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          packaging/build-release.sh \
+            --source-sha "$HEAD_SHA" \
+            --packager-sha "$HEAD_SHA" \
+            --output-dir target/release-artifacts/b
+
+      - name: Build A archive from accepted M07
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE=911266e20f07494226f6d67a7c93f00e22a0958d
+          git worktree add --detach ../angara-a-base "$BASE"
+          packaging/build-release.sh \
+            --source-dir ../angara-a-base \
+            --source-sha "$BASE" \
+            --packager-sha "$HEAD_SHA" \
+            --output-dir target/release-artifacts/a
+
+      - name: Show archive hashes
+        run: |
+          cat target/release-artifacts/a/SHA256SUMS
+          cat target/release-artifacts/b/SHA256SUMS
+          file target/release-artifacts/b/*.tar.gz
+
+      - name: Upload A archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: angara-release-a
+          path: |
+            target/release-artifacts/a/*.tar.gz
+            target/release-artifacts/a/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Upload B archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: angara-release-b
+          path: |
+            target/release-artifacts/b/*.tar.gz
+            target/release-artifacts/b/SHA256SUMS
+          if-no-files-found: error
+
+  installer:
+    name: Archive, manifest and DESTDIR installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Run installer checks
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" bash tests/m08/install.sh
+
+  systemd:
+    name: Live systemd start/reload/stop/restart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          # Some hosted runner images ship /usr/local/bin as 0777.  The
+          # installer correctly refuses that layout; normalize the disposable
+          # runner instead of weakening the managed-directory check.
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Install B archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          mkdir -p extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
+          TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
+          sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
+            --expected-source-sha "$(git rev-parse HEAD)"
+          echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
+      - name: Run systemd checks
+        run: sudo --preserve-env=M08_BIN bash tests/m08/systemd.sh
+
+  functional:
+    name: HTTP/HTTPS/Basic/ACL and layered TLS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Install B archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          mkdir -p extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
+          TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
+          sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
+            --expected-source-sha "$(git rev-parse HEAD)"
+          echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
+      - name: Run functional checks
+        run: sudo --preserve-env=M08_BIN bash tests/m08/functional.sh
+      - name: Run streaming checks
+        run: sudo --preserve-env=M08_BIN bash tests/m08/streaming.sh
+      - name: Run shipped admin-guide example
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
+            sudo --preserve-env=M08_BIN,M08_ARCHIVE,M08_SHA256 \
+            bash tests/m08/admin_guide.sh
+      - name: Make reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m08-functional-reports
+          path: m08-reports/
+          if-no-files-found: ignore
+
+  network:
+    name: Two veth interfaces and source-address failure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Install B archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          mkdir -p extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
+          TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
+          sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
+            --expected-source-sha "$(git rev-parse HEAD)"
+          echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
+      - name: Run network checks
+        run: sudo --preserve-env=M08_BIN bash tests/m08/network.sh
+
+  load:
+    name: 10/20 clients, workers and streaming
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Install B archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          mkdir -p extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
+          TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
+          sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
+            --expected-source-sha "$(git rev-parse HEAD)"
+          echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
+      - name: Run 10/20 client cohorts
+        run: sudo --preserve-env=M08_BIN bash tests/m08/load_stand.sh
+      - name: Run worker comparison
+        run: sudo --preserve-env=M08_BIN bash tests/m08/workers.sh
+      - name: Run overload checks
+        run: sudo --preserve-env=M08_BIN bash tests/m08/overload.sh
+      - name: Make reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m08-load-reports
+          path: m08-reports/
+          if-no-files-found: ignore
+
+  upgrade:
+    name: A to B to A upgrade and rollback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download A archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-a
+          path: artifacts/a
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Run upgrade checks
+        run: |
+          set -euo pipefail
+          A=$(ls artifacts/a/*.tar.gz)
+          B=$(ls artifacts/b/*.tar.gz)
+          M08_ARCHIVE_A="$A" M08_SHA256_A="$(awk '{print $1}' artifacts/a/SHA256SUMS)" \
+          M08_ARCHIVE_B="$B" M08_SHA256_B="$(awk '{print $1}' artifacts/b/SHA256SUMS)" \
+            sudo --preserve-env=M08_ARCHIVE_A,M08_SHA256_A,M08_ARCHIVE_B,M08_SHA256_B \
+            bash tests/m08/upgrade.sh
+
+  boot:
+    name: Real systemd boot and enable
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Install systemd container tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debootstrap systemd-container
+      - name: Boot pristine rootfs
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
+            sudo --preserve-env=M08_ARCHIVE,M08_SHA256 bash tests/m08/boot.sh
+
+  vm-boot:
+    name: Disposable Ubuntu cloud VM install and boot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Install QEMU and cloud-init tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Boot disposable VM twice
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
+          M08_SOURCE_SHA="$(git rev-parse HEAD)" \
+            sudo --preserve-env=M08_ARCHIVE,M08_SHA256,M08_SOURCE_SHA \
+            bash tests/m08/vm_boot.sh
+
+  soak:
+    name: 60-minute 20-client soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    needs: release
+    # The hour-long soak is an explicit final-SHA run, not a per-commit cost.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Download B archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: angara-release-b
+          path: artifacts/b
+      - name: Normalize runner install directories
+        run: |
+          echo "before:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+          sudo chmod 0755 /usr/local/bin /usr/local/sbin
+          echo "after:"
+          stat -c '%a %U:%G %n' /usr/local/bin /usr/local/sbin
+      - name: Install B archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          mkdir -p extracted
+          tar -xzf "$ARCHIVE" -C extracted --no-same-owner --same-permissions
+          TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d -name 'angara-*' -print -quit)
+          sudo "$TOP/install.sh" --archive "$PWD/$ARCHIVE" --sha256 "$SHA" \
+            --expected-source-sha "$(git rev-parse HEAD)"
+          echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
+      - name: Run 60-minute soak
+        env:
+          M08_SOAK_SECONDS: "3600"
+        run: sudo --preserve-env=M08_BIN,M08_SOAK_SECONDS bash tests/m08/soak_stand.sh
+      - name: Make soak reports readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" m08-reports 2>/dev/null || true
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m08-soak-reports
+          path: m08-reports/
+          if-no-files-found: ignore
+
   deny:
     name: Dependency policy (advisories, licenses, sources)
     runs-on: ubuntu-24.04
@@ -545,6 +964,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: cargo-deny check

@@ -1,0 +1,855 @@
+#!/usr/bin/env bash
+# Managed by Angara package.
+# Angara release maintenance: install, activate, upgrade, rollback, status.
+set -euo pipefail
+
+PREFIX=/opt/angara
+SYSCONFDIR=/etc/angara
+UNIT_DIR=/etc/systemd/system
+BINDIR=/usr/local/bin
+SBINDIR=/usr/local/sbin
+VARLIB=/var/lib/angara
+SERVICE=angara.service
+SERVICE_USER=angara
+
+ARCHIVE=
+ARCHIVE_SHA=
+CANDIDATE=
+CONFIRM=0
+NO_PROBE=0
+PURGE=0
+PROBE_PROXY=
+PROBE_URL=http://127.0.0.1:9/
+PROBE_CODE=403,407,502,503,504
+PROBE_CACERT=
+WORKDIR=
+COMMAND=
+ACTIVATION_RESTORED=0
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        rm -rf "$WORKDIR"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+usage() {
+    cat <<'EOF'
+Usage:
+  angaractl install  --archive <tar.gz> --sha256 <sha> --confirm [options]
+  angaractl upgrade  --archive <tar.gz> --sha256 <sha> --confirm [options]
+  angaractl rollback --confirm [options]
+  angaractl recover [options]
+  angaractl activate --candidate <id> --confirm [options]
+  angaractl status [options]
+  angaractl uninstall --confirm [--purge]
+
+Options:
+  --probe-proxy <url>    Proxy URL for the readiness request.
+  --probe-url <url>      Request URL (default: http://127.0.0.1:9/).
+  --probe-code <codes>   Accepted comma-separated HTTP codes
+                         (default: 403,407,502,503,504).
+  --probe-cacert <file>  CA used to verify an HTTPS proxy listener.
+  --no-probe             Do not perform the HTTP readiness request.
+  --candidate <id>       Release candidate id for activate.
+  --purge                Uninstall also removes /opt/angara, /etc/angara and
+                         /var/lib/angara. The default preserves operator data.
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+    usage
+    exit 2
+fi
+case "$1" in
+    install|upgrade|rollback|recover|activate|status|uninstall) COMMAND=$1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown command: $1" ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --archive) [ "$#" -ge 2 ] || die "--archive needs a value"; ARCHIVE=$2; shift 2 ;;
+        --sha256) [ "$#" -ge 2 ] || die "--sha256 needs a value"; ARCHIVE_SHA=$2; shift 2 ;;
+        --candidate) [ "$#" -ge 2 ] || die "--candidate needs a value"; CANDIDATE=$2; shift 2 ;;
+        --probe-proxy) [ "$#" -ge 2 ] || die "--probe-proxy needs a value"; PROBE_PROXY=$2; shift 2 ;;
+        --probe-url) [ "$#" -ge 2 ] || die "--probe-url needs a value"; PROBE_URL=$2; shift 2 ;;
+        --probe-code) [ "$#" -ge 2 ] || die "--probe-code needs a value"; PROBE_CODE=$2; shift 2 ;;
+        --probe-cacert) [ "$#" -ge 2 ] || die "--probe-cacert needs a value"; PROBE_CACERT=$2; shift 2 ;;
+        --confirm) CONFIRM=1; shift ;;
+        --no-probe) NO_PROBE=1; shift ;;
+        --purge) PURGE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "this command requires root"
+}
+
+require_confirm() {
+    [ "$CONFIRM" -eq 1 ] || die "re-run with --confirm to change the running service"
+}
+
+require_probe_curl() {
+    [ "$NO_PROBE" -eq 1 ] && return 0
+    command -v curl >/dev/null 2>&1 \
+        || die "curl is required for the readiness probe; pass --no-probe to skip it"
+}
+
+manifest_field() {
+    python3 - "$1/manifest.json" "$2" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+value = data
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(value)
+PY
+}
+
+stage_archive() {
+    [ -n "$ARCHIVE" ] || die "--archive is required"
+    [ -n "$ARCHIVE_SHA" ] || die "--sha256 is required"
+    [ -f "$ARCHIVE" ] || die "archive does not exist: $ARCHIVE"
+    case "$ARCHIVE_SHA" in
+        *[!0-9a-f]*|'') die "SHA-256 must be 64 lowercase hex characters" ;;
+    esac
+    [ "${#ARCHIVE_SHA}" -eq 64 ] || die "SHA-256 must be 64 characters"
+    WORKDIR=$(mktemp -d)
+    chmod 0700 "$WORKDIR"
+    ARCHIVE_COPY="$WORKDIR/archive.tar.gz"
+    cat -- "$ARCHIVE" >"$ARCHIVE_COPY"
+    chmod 0600 "$ARCHIVE_COPY"
+    printf '%s  %s\n' "$ARCHIVE_SHA" "$ARCHIVE_COPY" | sha256sum -c - >/dev/null \
+        || die "archive SHA-256 mismatch"
+    tar -tzf "$ARCHIVE_COPY" >"$WORKDIR/list.txt"
+    while IFS= read -r entry; do
+        case "$entry" in
+            ''|/*|*\\*|..|../*|*/..|*/../*|*//*)
+                die "unsafe archive path: $entry"
+                ;;
+        esac
+    done <"$WORKDIR/list.txt"
+    tar -tvzf "$ARCHIVE_COPY" >"$WORKDIR/types.txt"
+    while IFS= read -r line; do
+        mode=${line%% *}
+        case "$mode" in
+            -*) ;;
+            d*) ;;
+            *) die "archive contains a link or special file: $line" ;;
+        esac
+    done <"$WORKDIR/types.txt"
+    mkdir -p "$WORKDIR/root"
+    tar -xzf "$ARCHIVE_COPY" -C "$WORKDIR/root" \
+        --no-same-owner --same-permissions --delay-directory-restore
+    mapfile -t top < <(find "$WORKDIR/root" -mindepth 1 -maxdepth 1 -printf '%f\n')
+    [ "${#top[@]}" -eq 1 ] || die "archive must contain exactly one top-level directory"
+    STAGED_SOURCE="$WORKDIR/root/${top[0]}"
+    [ -f "$STAGED_SOURCE/manifest.json" ] || die "release archive has no manifest.json"
+    python3 "$STAGED_SOURCE/verify_manifest.py" --root "$STAGED_SOURCE" --quiet \
+        || die "release archive failed manifest verification"
+    STAGED_CANDIDATE=$(manifest_field "$STAGED_SOURCE" candidate_id)
+    STAGED_SOURCE_SHA=$(manifest_field "$STAGED_SOURCE" source_sha)
+    STAGED_BINARY_SHA=$(manifest_field "$STAGED_SOURCE" binary_sha256)
+}
+
+install_staged_candidate() {
+    local output
+    output=$(ANGARA_INTERNAL_STAGED_TREE=1 "$STAGED_SOURCE/install.sh" \
+        --source-dir "$STAGED_SOURCE" \
+        --candidate-only \
+        --no-systemd \
+        --expected-candidate "$STAGED_CANDIDATE")
+    printf '%s\n' "$output"
+    UNIT_CHANGED=0
+    RELEASE_DIR="$PREFIX/releases/$STAGED_CANDIDATE"
+    [ -d "$RELEASE_DIR" ] || die "staged release was not installed: $RELEASE_DIR"
+    python3 "$STAGED_SOURCE/verify_manifest.py" --root "$RELEASE_DIR" \
+        --manifest "$STAGED_SOURCE/manifest.json" --quiet \
+        || die "installed release does not match the incoming manifest"
+    cmp -s "$RELEASE_DIR/manifest.json" "$STAGED_SOURCE/manifest.json" \
+        || die "installed release manifest differs from the incoming manifest"
+}
+
+runuser_check() {
+    local release=$1
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$SERVICE_USER" -- "$release/bin/angara" check \
+            --config "$SYSCONFDIR/angara.toml"
+    else
+        su -s /bin/sh "$SERVICE_USER" -c \
+            "'$release/bin/angara' check --config '$SYSCONFDIR/angara.toml'"
+    fi
+}
+
+preflight_release() {
+    local release=$1
+    [ -f "$SYSCONFDIR/angara.toml" ] || die "missing $SYSCONFDIR/angara.toml"
+    runuser -u "$SERVICE_USER" -- test -r "$SYSCONFDIR/angara.toml" \
+        || die "the service user cannot read $SYSCONFDIR/angara.toml"
+    if ! runuser_check "$release"; then
+        die "candidate $release cannot validate the active configuration"
+    fi
+}
+
+backup_config() {
+    [ -d "$SYSCONFDIR" ] || die "no configuration directory to back up"
+    install -d -m 0700 "$VARLIB/backups"
+    local stamp target
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    target="$VARLIB/backups/angara-etc-$stamp.tar.gz"
+    tar -C "$(dirname "$SYSCONFDIR")" -czf "$target" "$(basename "$SYSCONFDIR")"
+    chmod 0600 "$target"
+    printf '%s\n' "$target"
+}
+
+check_release_metadata_conflicts() {
+    local unit_target="$UNIT_DIR/$SERVICE"
+    local helper_target="$SBINDIR/angaractl"
+    local current="$PREFIX/current"
+    local previous="$PREFIX/previous"
+    local bin_link="$BINDIR/angara"
+    [ -d "$UNIT_DIR" ] && [ ! -L "$UNIT_DIR" ] \
+        || die "unit directory is missing or is a symlink: $UNIT_DIR"
+    [ -d "$SBINDIR" ] && [ ! -L "$SBINDIR" ] \
+        || die "helper directory is missing or is a symlink: $SBINDIR"
+    [ -d "$BINDIR" ] && [ ! -L "$BINDIR" ] \
+        || die "CLI directory is missing or is a symlink: $BINDIR"
+    if [ -e "$unit_target" ]; then
+        [ -f "$unit_target" ] && [ ! -L "$unit_target" ] \
+            || die "existing unit is not a regular file: $unit_target"
+        grep -q '^# Managed by Angara package' "$unit_target" \
+            || die "existing unit is foreign and will not be overwritten: $unit_target"
+    fi
+    if [ -e "$helper_target" ]; then
+        [ -f "$helper_target" ] && [ ! -L "$helper_target" ] \
+            || die "existing helper is not a regular file: $helper_target"
+        grep -q '^# Managed by Angara package' "$helper_target" \
+            || die "existing helper is foreign and will not be overwritten: $helper_target"
+    fi
+    if [ -L "$current" ]; then
+        case "$(readlink "$current")" in
+            "$PREFIX"/releases/*) ;;
+            *) die "current symlink points outside $PREFIX/releases" ;;
+        esac
+    elif [ -e "$current" ]; then
+        die "$current exists and is not a managed symlink"
+    fi
+    if [ -L "$previous" ]; then
+        case "$(readlink "$previous")" in
+            "$PREFIX"/releases/*) ;;
+            *) die "previous symlink points outside $PREFIX/releases" ;;
+        esac
+    elif [ -e "$previous" ]; then
+        die "$previous exists and is not a managed symlink"
+    fi
+    if [ -L "$bin_link" ]; then
+        [ "$(readlink "$bin_link")" = "$PREFIX/current/bin/angara" ] \
+            || die "$bin_link points to a foreign target"
+    elif [ -e "$bin_link" ]; then
+        die "$bin_link exists and is not a managed symlink"
+    fi
+}
+
+install_release_metadata() {
+    local release=$1
+    [ -d "$release" ] || {
+        printf 'error: release directory does not exist: %s\n' "$release" >&2
+        return 1
+    }
+    install -d -m 0755 "$UNIT_DIR" || {
+        printf 'error: cannot create unit directory: %s\n' "$UNIT_DIR" >&2
+        return 1
+    }
+    rm -f "$UNIT_DIR/$SERVICE.new" || return 1
+    install -m 0644 "$release/systemd/angara.service" \
+        "$UNIT_DIR/$SERVICE.new" || {
+        printf 'error: cannot stage unit from %s\n' "$release" >&2
+        return 1
+    }
+    if [ -e "$UNIT_DIR/$SERVICE" ] \
+        && cmp -s "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$SERVICE.new"; then
+        rm -f "$UNIT_DIR/$SERVICE.new" || return 1
+        UNIT_METADATA_CHANGED=0
+    else
+        mv -f "$UNIT_DIR/$SERVICE.new" "$UNIT_DIR/$SERVICE" || {
+            printf 'error: cannot install unit %s\n' "$UNIT_DIR/$SERVICE" >&2
+            return 1
+        }
+        UNIT_METADATA_CHANGED=1
+    fi
+    chown root:root "$UNIT_DIR/$SERVICE" || {
+        printf 'error: cannot chown unit %s\n' "$UNIT_DIR/$SERVICE" >&2
+        return 1
+    }
+    install -d -m 0755 "$SBINDIR" || {
+        printf 'error: cannot create helper directory: %s\n' "$SBINDIR" >&2
+        return 1
+    }
+    rm -f "$SBINDIR/angaractl.new" || return 1
+    install -m 0755 "$release/angaractl" "$SBINDIR/angaractl.new" || {
+        printf 'error: cannot stage helper from %s\n' "$release" >&2
+        return 1
+    }
+    mv -f "$SBINDIR/angaractl.new" "$SBINDIR/angaractl" || {
+        printf 'error: cannot install helper %s\n' "$SBINDIR/angaractl" >&2
+        return 1
+    }
+    chown root:root "$SBINDIR/angaractl" || {
+        printf 'error: cannot chown helper %s\n' "$SBINDIR/angaractl" >&2
+        return 1
+    }
+    return 0
+}
+
+switch_current() {
+    local release=$1
+    ln -sfn "$release" "$PREFIX/current.tmp"
+    mv -Tf "$PREFIX/current.tmp" "$PREFIX/current"
+}
+
+read_current_link() {
+    if [ -L "$PREFIX/current" ]; then
+        readlink "$PREFIX/current"
+    fi
+}
+
+read_previous_link() {
+    if [ -L "$PREFIX/previous" ]; then
+        readlink "$PREFIX/previous"
+    fi
+}
+
+set_previous() {
+    local release=$1
+    ln -sfn "$release" "$PREFIX/previous.tmp"
+    mv -Tf "$PREFIX/previous.tmp" "$PREFIX/previous"
+}
+
+service_active() {
+    systemctl is-active --quiet "$SERVICE"
+}
+
+stop_service() {
+    if service_active; then
+        systemctl stop "$SERVICE" || die "systemctl stop $SERVICE failed"
+    fi
+    if service_active; then
+        die "$SERVICE is still active after stop"
+    fi
+}
+
+default_probe_proxy() {
+    python3 - "$SYSCONFDIR/angara.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+listeners = data.get("listeners") or []
+if not listeners:
+    raise SystemExit("no listener")
+listener = listeners[0]
+bind = listener["bind"]
+transport = listener.get("transport", "http")
+if bind.startswith("["):
+    host, port = bind.rsplit("]:", 1)
+    host = host[1:]
+elif ":" in bind:
+    host, port = bind.rsplit(":", 1)
+else:
+    raise SystemExit("invalid bind")
+if host in ("0.0.0.0", ""):
+    host = "127.0.0.1"
+elif host in ("::", "[::]"):
+    host = "[::1]"
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+scheme = "https" if transport == "https" else "http"
+print(f"{scheme}://{host}:{port}")
+PY
+}
+
+resolve_probe_proxy() {
+    if [ -n "$PROBE_PROXY" ]; then
+        printf '%s\n' "$PROBE_PROXY"
+    else
+        default_probe_proxy
+    fi
+}
+
+proxy_port() {
+    python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+parsed = urlsplit(sys.argv[1])
+if parsed.port is not None:
+    print(parsed.port)
+elif parsed.scheme == "https":
+    print(443)
+else:
+    print(80)
+PY
+}
+
+proxy_host() {
+    python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+parsed = urlsplit(sys.argv[1])
+print(parsed.hostname or "127.0.0.1")
+PY
+}
+
+# Match the actual probe destination to the MainPID.  A TCP connection is
+# opened to the requested endpoint, then `ss` is used to confirm that this
+# established server socket is owned by the MainPID.  This handles exact,
+# wildcard, IPv4-mapped and dual-stack listeners without assuming that a
+# wildcard IPv4/IPv6 socket serves the other family.
+listener_owned_by_pid() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ipaddress
+import socket
+import subprocess
+import sys
+import time
+
+pid = int(sys.argv[1])
+host = sys.argv[2]
+port = int(sys.argv[3])
+
+
+def parse_endpoint(value):
+    value = value.strip()
+    if value.startswith("["):
+        if "]:" not in value:
+            return None
+        address, text_port = value.rsplit("]:", 1)
+        address = address[1:]
+    else:
+        if ":" not in value:
+            return None
+        address, text_port = value.rsplit(":", 1)
+    address = address.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(address), int(text_port)
+    except ValueError:
+        return None
+
+
+def same_address(left, right):
+    if left == right:
+        return True
+    if left.version == 6 and left.ipv4_mapped == right:
+        return True
+    if right.version == 6 and right.ipv4_mapped == left:
+        return True
+    return False
+
+
+try:
+    infos = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+    )
+except OSError:
+    sys.exit(1)
+
+connections = []
+try:
+    for family, kind, proto, _, sockaddr in infos:
+        connection = socket.socket(family, kind, proto)
+        connection.settimeout(1)
+        try:
+            connection.connect(sockaddr)
+        except OSError:
+            connection.close()
+            continue
+        connections.append(connection)
+    if not connections:
+        sys.exit(1)
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["ss", "-H", "-tnp"], capture_output=True, text=True, check=False
+            )
+        except OSError:
+            sys.exit(1)
+        all_matched = True
+        for connection in connections:
+            client_address, client_port = connection.getsockname()[:2]
+            server_address, server_port = connection.getpeername()[:2]
+            client = ipaddress.ip_address(client_address.split("%", 1)[0])
+            server = ipaddress.ip_address(server_address.split("%", 1)[0])
+            matched = False
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) < 5:
+                    continue
+                if f"pid={pid}," not in line and f"pid={pid})" not in line:
+                    continue
+                local = parse_endpoint(fields[3])
+                peer = parse_endpoint(fields[4])
+                if local is None or peer is None:
+                    continue
+                local_address, local_port = local
+                peer_address, peer_port = peer
+                if (
+                    local_port == server_port
+                    and same_address(local_address, server)
+                    and peer_port == client_port
+                    and same_address(peer_address, client)
+                ):
+                    matched = True
+                    break
+            if not matched:
+                all_matched = False
+                break
+        if all_matched:
+            sys.exit(0)
+        time.sleep(0.05)
+finally:
+    for connection in connections:
+        connection.close()
+sys.exit(1)
+PY
+}
+
+verify_service_identity() {
+    local release=$1 pid actual expected proxy host port
+    systemctl is-active --quiet "$SERVICE" || return 1
+    pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+    [ -n "$pid" ] && [ "$pid" != "0" ] && [ -d "/proc/$pid" ] || return 1
+    actual=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    expected=$(readlink -f "$release/bin/angara" 2>/dev/null || true)
+    [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
+    command -v ss >/dev/null 2>&1 || return 1
+    proxy=$(resolve_probe_proxy) || return 1
+    host=$(proxy_host "$proxy") || return 1
+    port=$(proxy_port "$proxy") || return 1
+    listener_owned_by_pid "$pid" "$host" "$port" || return 1
+    return 0
+}
+
+probe_once() {
+    local proxy=$1 code
+    local arguments=(--noproxy '' --proxy "$proxy" --connect-timeout 3 --max-time 5
+        -sS -o /dev/null -w '%{http_code}' "$PROBE_URL")
+    if [ -n "$PROBE_CACERT" ]; then
+        arguments=(--proxy-cacert "$PROBE_CACERT" "${arguments[@]}")
+    fi
+    code=$(curl "${arguments[@]}" 2>/dev/null || true)
+    case ",$PROBE_CODE," in
+        *",$code,"*) return 0 ;;
+    esac
+    return 1
+}
+
+probe_service() {
+    local expected=$1 proxy attempt
+    [ -n "$expected" ] || return 1
+    for attempt in $(seq 1 60); do
+        if verify_service_identity "$expected"; then
+            if [ "$NO_PROBE" -eq 1 ]; then
+                printf 'readiness=ok candidate=%s proxy=skipped url=skipped\n' \
+                    "$(basename "$expected")"
+                return 0
+            fi
+            if ! command -v curl >/dev/null 2>&1; then
+                printf 'error: curl is required for the readiness probe; pass --no-probe to skip it\n' >&2
+                return 1
+            fi
+            proxy=$(resolve_probe_proxy) \
+                || die "cannot derive a proxy URL from $SYSCONFDIR/angara.toml"
+            if probe_once "$proxy"; then
+                printf 'readiness=ok candidate=%s proxy=%s url=%s\n' \
+                    "$(basename "$expected")" "$proxy" "$PROBE_URL"
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+start_service() {
+    local expected=$1
+    [ -n "$expected" ] || die "start_service requires the expected release directory"
+    # An explicit maintenance command may recover a unit that previously hit
+    # its automatic start limit.  The unit's Restart=on-failure policy is still
+    # enforced for unexpected crashes.
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$SERVICE" || return 1
+    if ! probe_service "$expected"; then
+        journal_tail
+        return 1
+    fi
+    return 0
+}
+
+journal_tail() {
+    if command -v journalctl >/dev/null 2>&1; then
+        printf '%s\n' "---- journalctl -u $SERVICE (last 30 lines) ----" >&2
+        journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+    fi
+}
+
+restore_after_failure() {
+    local target=$1 previous=$2 saved_probe=$PROBE_PROXY
+    local links_ok=1 metadata_ok=1 service_ok=0
+    if [ -n "$target" ]; then
+        if service_active; then
+            systemctl stop "$SERVICE" || links_ok=0
+        fi
+        switch_current "$target" || links_ok=0
+        if [ -n "$previous" ]; then
+            set_previous "$previous" || links_ok=0
+        else
+            rm -f "$PREFIX/previous" "$PREFIX/previous.tmp" 2>/dev/null || links_ok=0
+        fi
+        install_release_metadata "$target" || metadata_ok=0
+        if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || metadata_ok=0
+        fi
+        # The operator's probe may point at the failed candidate's address;
+        # the restored release must be checked against its own listener.
+        PROBE_PROXY=
+        if start_service "$target"; then
+            service_ok=1
+        fi
+        PROBE_PROXY=$saved_probe
+        if [ "$links_ok" -eq 1 ] && [ "$metadata_ok" -eq 1 ] \
+            && [ "$service_ok" -eq 1 ]; then
+            return 0
+        fi
+        return 1
+    fi
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    return 1
+}
+
+activate_candidate() {
+    local release=$1 old_current=$2 old_previous=$3
+    ACTIVATION_RESTORED=0
+    if ! switch_current "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    if [ -n "$old_current" ] && [ "$old_current" != "$release" ]; then
+        if ! set_previous "$old_current"; then
+            if restore_after_failure "$old_current" "$old_previous"; then
+                ACTIVATION_RESTORED=1
+            fi
+            return 1
+        fi
+    fi
+    if ! install_release_metadata "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        if ! systemctl daemon-reload; then
+            if restore_after_failure "$old_current" "$old_previous"; then
+                ACTIVATION_RESTORED=1
+            fi
+            return 1
+        fi
+    fi
+    if ! start_service "$release"; then
+        if restore_after_failure "$old_current" "$old_previous"; then
+            ACTIVATION_RESTORED=1
+        fi
+        return 1
+    fi
+    return 0
+}
+
+command_install_or_upgrade() {
+    require_root
+    require_confirm
+    require_probe_curl
+    stage_archive
+    install_staged_candidate
+    preflight_release "$RELEASE_DIR"
+    check_release_metadata_conflicts
+    local backup old_current old_previous
+    backup=$(backup_config)
+    old_current=$(read_current_link || true)
+    old_previous=$(read_previous_link || true)
+    printf 'backup=%s\n' "$backup"
+    printf 'candidate=%s\n' "$STAGED_CANDIDATE"
+    printf 'archive_sha256=%s\n' "$ARCHIVE_SHA"
+    printf 'source_sha=%s\n' "$STAGED_SOURCE_SHA"
+    printf 'binary_sha256=%s\n' "$STAGED_BINARY_SHA"
+    printf 'previous=%s\n' "${old_current:-none}"
+
+    if service_active; then
+        stop_service
+    fi
+    if activate_candidate "$RELEASE_DIR" "$old_current" "$old_previous"; then
+        printf 'active=%s\n' "$STAGED_CANDIDATE"
+        printf 'service=%s\n' "$(systemctl show -p ActiveState --value "$SERVICE")"
+        return 0
+    fi
+
+    printf 'error: candidate %s did not become ready\n' "$STAGED_CANDIDATE" >&2
+    if [ -n "$old_current" ] && [ "$old_current" != "$RELEASE_DIR" ]; then
+        if [ "$ACTIVATION_RESTORED" -eq 1 ]; then
+            printf 'rollback=restored %s\n' "$(basename "$old_current")" >&2
+            printf 'retry_command=angaractl activate --candidate %s --confirm\n' \
+                "$(basename "$RELEASE_DIR")" >&2
+        else
+            printf 'rollback=FAILED; inspect journal and run: angaractl recover\n' >&2
+        fi
+    else
+        printf 'no previous release; service remains stopped\n' >&2
+    fi
+    exit 1
+}
+
+command_rollback() {
+    require_root
+    require_confirm
+    require_probe_curl
+    local previous current backup
+    previous=$(read_previous_link || true)
+    [ -n "$previous" ] || die "no previous release is recorded"
+    [ -d "$previous" ] || die "previous release directory is missing: $previous"
+    current=$(read_current_link || true)
+    backup=$(backup_config)
+    preflight_release "$previous"
+    check_release_metadata_conflicts
+    printf 'backup=%s\n' "$backup"
+    if service_active; then
+        stop_service
+    fi
+    if ! activate_candidate "$previous" "$current" "$previous"; then
+        die "rollback target $previous did not become ready"
+    fi
+    printf 'active=%s\n' "$(basename "$previous")"
+    printf 'previous=%s\n' "${current:-none}"
+}
+
+command_activate() {
+    require_root
+    require_confirm
+    require_probe_curl
+    [ -n "$CANDIDATE" ] || die "--candidate is required"
+    local release="$PREFIX/releases/$CANDIDATE"
+    [ -d "$release" ] || die "release does not exist: $release"
+    preflight_release "$release"
+    check_release_metadata_conflicts
+    local current previous backup
+    current=$(read_current_link || true)
+    previous=$(read_previous_link || true)
+    backup=$(backup_config)
+    printf 'backup=%s\n' "$backup"
+    if service_active; then
+        stop_service
+    fi
+    if ! activate_candidate "$release" "$current" "$previous"; then
+        die "candidate $CANDIDATE did not become ready"
+    fi
+    printf 'active=%s\n' "$CANDIDATE"
+}
+
+command_recover() {
+    require_root
+    require_probe_curl
+    local current backup
+    current=$(read_current_link || true)
+    [ -n "$current" ] || die "no current release is recorded"
+    [ -d "$current" ] || die "current release directory is missing: $current"
+    preflight_release "$current"
+    check_release_metadata_conflicts
+    backup=$(backup_config)
+    printf 'backup=%s\n' "$backup"
+    install_release_metadata "$current"
+    if [ "${UNIT_METADATA_CHANGED:-0}" -eq 1 ]; then
+        systemctl daemon-reload || die "systemctl daemon-reload failed"
+    fi
+    if service_active; then
+        systemctl restart "$SERVICE" || die "systemctl restart $SERVICE failed"
+    else
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$SERVICE" || die "systemctl start $SERVICE failed"
+    fi
+    probe_service "$current" || die "recovered service did not become ready"
+    printf 'active=%s\n' "$(basename "$current")"
+}
+
+command_status() {
+    printf 'service=%s\n' "$SERVICE"
+    printf 'active_state=%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    printf 'unit_state=%s\n' "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+    local pid
+    pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+    printf 'main_pid=%s\n' "${pid:-0}"
+    if [ -n "$pid" ] && [ "$pid" != "0" ] && [ -d "/proc/$pid" ]; then
+        printf 'exe=%s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        printf 'uid=%s\n' "$(awk '/^Uid:/{print $2}' "/proc/$pid/status")"
+        printf 'gid=%s\n' "$(awk '/^Gid:/{print $2}' "/proc/$pid/status")"
+        printf 'groups=%s\n' "$(awk '/^Groups:/{print $2}' "/proc/$pid/status")"
+        printf 'cap_effective=%s\n' "$(awk '/^CapEff:/{print $2}' "/proc/$pid/status")"
+        printf 'threads=%s\n' "$(awk '/^Threads:/{print $2}' "/proc/$pid/status")"
+    fi
+    printf 'current=%s\n' "$(read_current_link || true)"
+    printf 'previous=%s\n' "$(read_previous_link || true)"
+    printf 'release_count=%s\n' "$(find "$PREFIX/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    printf 'config_sha256=%s\n' "$(sha256sum "$SYSCONFDIR/angara.toml" 2>/dev/null | awk '{print $1}')"
+    printf 'unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$SERVICE" 2>/dev/null | awk '{print $1}')"
+    printf 'limits:\n'
+    systemctl show -p LimitNOFILE -p TasksMax -p KillMode -p TimeoutStopUSec -p Restart "$SERVICE" 2>/dev/null || true
+    printf 'listeners:\n'
+    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+        ss -ltnp 2>/dev/null | grep "pid=$pid," || true
+    fi
+}
+
+command_uninstall() {
+    require_root
+    require_confirm
+    if service_active; then
+        stop_service
+    fi
+    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$SERVICE"
+    rm -f "$BINDIR/angara" "$SBINDIR/angaractl"
+    rm -f "$PREFIX/current" "$PREFIX/previous"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    if [ "$PURGE" -eq 1 ]; then
+        rm -rf "$PREFIX" "$SYSCONFDIR" "$VARLIB"
+        printf 'purged=yes\n'
+    else
+        printf 'purged=no\n'
+        printf 'preserved=%s\n' "$SYSCONFDIR"
+        printf 'preserved=%s\n' "$PREFIX/releases"
+    fi
+}
+
+case "$COMMAND" in
+    install) command_install_or_upgrade ;;
+    upgrade) command_install_or_upgrade ;;
+    rollback) command_rollback ;;
+    activate) command_activate ;;
+    recover) command_recover ;;
+    status) command_status ;;
+    uninstall) command_uninstall ;;
+    *) die "unknown command: $COMMAND" ;;
+esac
