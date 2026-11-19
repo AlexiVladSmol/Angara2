@@ -28,7 +28,8 @@ trap cleanup EXIT HUP INT TERM
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 BASE="$TMP/noble-base.img"
 printf 'vm image: %s\n' "$IMAGE_URL" | tee "$TMP/vm.txt"
-curl -fL --retry 3 --retry-delay 5 "$IMAGE_URL" -o "$BASE"
+curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+    "$IMAGE_URL" -o "$BASE"
 qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$TMP/disk.qcow2" 8G >/dev/null
 
 SERVE="$TMP/serve"
@@ -43,6 +44,11 @@ VM_SCRIPT="$TMP/m08-vm-check.sh"
 cat >"$VM_SCRIPT" <<EOF
 #!/bin/bash
 set -euo pipefail
+if ! command -v curl >/dev/null 2>&1; then
+    echo M08_VM_RESULT=FAIL_NO_CURL >/dev/console
+    poweroff
+    exit 1
+fi
 if [ ! -e /var/lib/m08-vm-installed ]; then
     for _ in \$(seq 1 120); do
         if curl -fsS http://10.0.2.2:18088/angara.tar.gz -o /tmp/angara.tar.gz; then
@@ -93,9 +99,6 @@ cat >"$TMP/user-data" <<EOF
 #cloud-config
 ssh_pwauth: false
 disable_root: false
-package_update: true
-packages:
-  - curl
 write_files:
   - path: /usr/local/sbin/m08-vm-check.sh
     permissions: '0755'
