@@ -863,6 +863,78 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             debootstrap systemd-container
+      - name: Verify debootstrap timeout cleanup
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
+          TEST_TMPDIR=$(mktemp -d)
+          LOG=$(mktemp)
+          SERVER_LOG=$(mktemp)
+          SERVER_PID=
+          cleanup() {
+            [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
+            rm -rf "$TEST_TMPDIR" "$LOG" "$SERVER_LOG"
+          }
+          trap cleanup EXIT HUP INT TERM
+          python3 - <<'PY' >"$SERVER_LOG" 2>&1 &
+          import socket
+          import threading
+          import time
+
+          server = socket.socket()
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", 18089))
+          server.listen(32)
+
+          def hold(connection):
+              try:
+                  time.sleep(60)
+              finally:
+                  connection.close()
+
+          while True:
+              connection, _ = server.accept()
+              threading.Thread(target=hold, args=(connection,), daemon=True).start()
+          PY
+          SERVER_PID=$!
+          for _ in $(seq 1 100); do
+            if python3 - <<'PY' >/dev/null 2>&1
+          import socket
+          sock = socket.create_connection(("127.0.0.1", 18089), timeout=1)
+          sock.close()
+          PY
+            then
+              break
+            fi
+            sleep 0.1
+          done
+          set +e
+          sudo env M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_UBUNTU_MIRROR=http://127.0.0.1:18089/ubuntu/ \
+            M08_DEBOOTSTRAP_TIMEOUT=5 TMPDIR="$TEST_TMPDIR" \
+            bash tests/m08/boot.sh >"$LOG" 2>&1
+          CODE=$?
+          set -e
+          cat "$LOG"
+          if [ "$CODE" -eq 0 ]; then
+            echo "expected boot.sh to fail on debootstrap timeout" >&2
+            exit 1
+          fi
+          if ! grep -Fq "debootstrap timed out after 5s" "$LOG"; then
+            echo "missing debootstrap timeout message" >&2
+            exit 1
+          fi
+          if findmnt -rn -o TARGET | grep -Fq "$TEST_TMPDIR/"; then
+            echo "timeout left mounted filesystems under $TEST_TMPDIR" >&2
+            exit 1
+          fi
+          if [ -n "$(find "$TEST_TMPDIR" -mindepth 1 -print -quit)" ]; then
+            echo "timeout left files under $TEST_TMPDIR" >&2
+            exit 1
+          fi
+          echo "timeout path: code=$CODE mounts=none temp=empty"
       - name: Boot pristine rootfs
         run: |
           set -euo pipefail
