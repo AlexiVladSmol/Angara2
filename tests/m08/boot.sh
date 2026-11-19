@@ -12,6 +12,60 @@ SHA=${M08_SHA256:-}
 command -v systemd-nspawn >/dev/null 2>&1 || fail "systemd-nspawn is required (systemd-container)"
 command -v debootstrap >/dev/null 2>&1 || fail "debootstrap is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
+command -v timeout >/dev/null 2>&1 || fail "timeout is required"
+
+resolve_mirror_uri() {
+    local uri=$1 target
+    case "$uri" in
+        http://*|https://*)
+            printf '%s\n' "$uri"
+            ;;
+        mirror+file:*)
+            target=${uri#mirror+file:}
+            if [ -f "$target" ]; then
+                awk '!/^[[:space:]]*#/ && NF { print $1; exit }' "$target"
+            fi
+            ;;
+    esac
+}
+
+detect_ubuntu_mirror() {
+    local mirror= candidate=
+    if [ -n "${M08_UBUNTU_MIRROR:-}" ]; then
+        printf '%s\n' "$M08_UBUNTU_MIRROR"
+        return 0
+    fi
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+        while IFS= read -r candidate; do
+            mirror=$(resolve_mirror_uri "$candidate")
+            [ -n "$mirror" ] && break
+        done < <(awk '$1 == "URIs:" {
+            for (i = 2; i <= NF; i++) print $i
+        }' /etc/apt/sources.list.d/ubuntu.sources)
+    fi
+    if [ -z "$mirror" ] && [ -f /etc/apt/sources.list ]; then
+        mirror=$(awk '$1 == "deb" {
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^https?:\/\//) {
+                    print $i
+                    exit
+                }
+            }
+        }' /etc/apt/sources.list)
+    fi
+    if [ -z "$mirror" ]; then
+        mirror=http://archive.ubuntu.com/ubuntu/
+    fi
+    printf '%s\n' "$mirror"
+}
+
+UBUNTU_MIRROR=$(detect_ubuntu_mirror)
+DEBOOTSTRAP_TIMEOUT=${M08_DEBOOTSTRAP_TIMEOUT:-900}
+case "$DEBOOTSTRAP_TIMEOUT" in
+    ''|*[!0-9]*) fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer" ;;
+esac
+[ "$DEBOOTSTRAP_TIMEOUT" -gt 0 ] \
+    || fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer"
 
 TMP=$(mktemp -d)
 MACHINE="angara-boot-$$"
@@ -36,12 +90,25 @@ SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source
 [ -n "$SOURCE_SHA" ] || fail "manifest source SHA is missing"
 
 ROOT="$TMP/rootfs"
-log "debootstrap noble rootfs (this takes several minutes)"
-debootstrap --variant=minbase \
+log "ubuntu mirror: $UBUNTU_MIRROR"
+log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
+DEBOOTSTRAP_START=$(date +%s)
+set +e
+timeout "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
     --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
-    noble "$ROOT" http://archive.ubuntu.com/ubuntu/ \
-    >"$TMP/debootstrap.log" 2>&1 \
-    || fail "debootstrap failed; see $TMP/debootstrap.log"
+    noble "$ROOT" "$UBUNTU_MIRROR" \
+    >"$TMP/debootstrap.log" 2>&1
+DEBOOTSTRAP_CODE=$?
+set -e
+DEBOOTSTRAP_ELAPSED=$(($(date +%s) - DEBOOTSTRAP_START))
+if [ "$DEBOOTSTRAP_CODE" -ne 0 ]; then
+    tail -n 100 "$TMP/debootstrap.log" >&2 || true
+    if [ "$DEBOOTSTRAP_CODE" -eq 124 ]; then
+        fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s"
+    fi
+    fail "debootstrap failed with exit code ${DEBOOTSTRAP_CODE}"
+fi
+log "debootstrap completed in ${DEBOOTSTRAP_ELAPSED}s"
 
 install -d -m 0755 "$ROOT/tmp/release"
 cp -a "$TOP/." "$ROOT/tmp/release/"

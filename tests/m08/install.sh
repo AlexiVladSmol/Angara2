@@ -226,9 +226,12 @@ BAD_MANAGED="$TMP/bad-managed-stage"
 mkdir -p "$BAD_MANAGED/usr/local/bin"
 chmod 0777 "$BAD_MANAGED/usr/local/bin"
 if "$TOP/install.sh" --archive "$ARCHIVE" --sha256 "$ARCHIVE_SHA" \
-    --destdir "$BAD_MANAGED" >/dev/null 2>&1; then
+    --destdir "$BAD_MANAGED" >/dev/null 2>"$TMP/bad-managed.err"; then
     fail "group/world-writable managed directory was accepted"
 fi
+grep -Fq "managed directory is group/world writable: $BAD_MANAGED/usr/local/bin (777)" \
+    "$TMP/bad-managed.err" \
+    || fail "managed-directory rejection did not explain the 0777 directory"
 [ ! -e "$BAD_MANAGED/opt/angara" ] \
     || fail "managed-directory rejection wrote a release tree"
 [ ! -e "$BAD_MANAGED/etc/angara/angara.toml" ] \
