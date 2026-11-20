@@ -80,11 +80,14 @@ sample_process() {
             max_fd=0
             while true; do
                 if [ ! -d "/proc/$PID" ]; then break; fi
-                rss=$(awk '/^VmRSS:/{print $2}' "/proc/$PID/status" 2>/dev/null || echo 0)
-                fd=$(find "/proc/$PID/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
-                [ "$rss" -gt "$max_rss" ] && max_rss=$rss
-                [ "$fd" -gt "$max_fd" ] && max_fd=$fd
-                printf '%s %s\n' "$max_rss" "$max_fd" >"$file"
+                rss=$(awk '/^VmRSS:/{print $2}' "/proc/$PID/status" 2>/dev/null || true)
+                rss=${rss:-0}
+                fd=$(find "/proc/$PID/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l || true)
+                fd=${fd:-0}
+                if [ "$rss" -gt "$max_rss" ]; then max_rss=$rss; fi
+                if [ "$fd" -gt "$max_fd" ]; then max_fd=$fd; fi
+                printf '%s %s\n' "$max_rss" "$max_fd" >"$file.tmp" \
+                    && mv -f "$file.tmp" "$file" || true
                 sleep 0.2
             done
         ) &
@@ -118,8 +121,18 @@ run_transfer() {
     [ "$code" -eq 0 ] || fail "$label curl exit $code"
     assert_eq "$(wc -c <"$output")" "$bytes" "$label size"
     assert_eq "$(sha256 "$output")" "$expected" "$label hash"
-    read -r peak_rss peak_fd <"$TMP/peak-$label.txt"
-    [ "$peak_rss" -gt "$MAX_PEAK_RSS" ] && MAX_PEAK_RSS=$peak_rss
+    local sample="$TMP/peak-$label.txt"
+    [ -s "$sample" ] || fail "no resource sample for $label"
+    if ! read -r peak_rss peak_fd <"$sample"; then
+        fail "cannot read resource sample for $label"
+    fi
+    case "$peak_rss" in
+        ''|*[!0-9]*) fail "invalid RSS sample for $label: $peak_rss" ;;
+    esac
+    case "$peak_fd" in
+        ''|*[!0-9]*) fail "invalid FD sample for $label: $peak_fd" ;;
+    esac
+    if [ "$peak_rss" -gt "$MAX_PEAK_RSS" ]; then MAX_PEAK_RSS=$peak_rss; fi
     printf '%s bytes=%s elapsed_ms=%s peak_rss_kib=%s peak_fd=%s\n' \
         "$label" "$bytes" "$elapsed" "$peak_rss" "$peak_fd" \
         | tee -a "$REPORT_DIR/streaming.txt"
