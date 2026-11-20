@@ -68,17 +68,51 @@ esac
     || fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer"
 
 TMP=$(mktemp -d)
+ROOT="$TMP/rootfs"
 MACHINE="angara-boot-$$"
 NSPAWN_PID=
+DEBOOTSTRAP_PID=
+CLEANED=0
 cleanup() {
+    [ "$CLEANED" -eq 0 ] || return 0
+    CLEANED=1
     if [ -n "$NSPAWN_PID" ] && kill -0 "$NSPAWN_PID" 2>/dev/null; then
         machinectl terminate "$MACHINE" >/dev/null 2>&1 || true
         kill "$NSPAWN_PID" 2>/dev/null || true
         wait "$NSPAWN_PID" 2>/dev/null || true
     fi
-    rm -rf "$TMP"
+    if [ -n "$DEBOOTSTRAP_PID" ] \
+        && kill -0 "$DEBOOTSTRAP_PID" 2>/dev/null; then
+        kill -TERM "$DEBOOTSTRAP_PID" 2>/dev/null || true
+        wait "$DEBOOTSTRAP_PID" 2>/dev/null || true
+    fi
+    DEBOOTSTRAP_PID=
+    if [ -d "$ROOT" ] && command -v findmnt >/dev/null 2>&1; then
+        while IFS= read -r target; do
+            [ -n "$target" ] || continue
+            umount "$target" 2>/dev/null \
+                || umount -l "$target" 2>/dev/null \
+                || true
+        done < <(findmnt -rn -o TARGET | awk -v root="$ROOT/" \
+            'index($0, root) == 1 { print length($0), $0 }' \
+            | sort -rn | cut -d' ' -f2-)
+    fi
+    rm -rf --one-file-system "$TMP" 2>/dev/null || true
+    if [ -e "$TMP" ]; then
+        printf 'warning: cleanup left temporary path: %s\n' "$TMP" >&2
+    fi
+    return 0
 }
-trap cleanup EXIT HUP INT TERM
+on_signal() {
+    local code=$1
+    trap - EXIT HUP INT TERM
+    cleanup
+    exit "$code"
+}
+trap cleanup EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 umask 077
 
 printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
@@ -89,22 +123,27 @@ TOP=$(find "$TMP/release" -mindepth 1 -maxdepth 1 -type d -printf '%p\n')
 SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source_sha=//p')
 [ -n "$SOURCE_SHA" ] || fail "manifest source SHA is missing"
 
-ROOT="$TMP/rootfs"
 log "ubuntu mirror: $UBUNTU_MIRROR"
-log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
 DEBOOTSTRAP_START=$(date +%s)
 set +e
-timeout "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
+timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
     --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
     noble "$ROOT" "$UBUNTU_MIRROR" \
-    >"$TMP/debootstrap.log" 2>&1
+    >"$TMP/debootstrap.log" 2>&1 &
+DEBOOTSTRAP_PID=$!
+log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
+wait "$DEBOOTSTRAP_PID"
 DEBOOTSTRAP_CODE=$?
+DEBOOTSTRAP_PID=
 set -e
 DEBOOTSTRAP_ELAPSED=$(($(date +%s) - DEBOOTSTRAP_START))
 if [ "$DEBOOTSTRAP_CODE" -ne 0 ]; then
     tail -n 100 "$TMP/debootstrap.log" >&2 || true
     if [ "$DEBOOTSTRAP_CODE" -eq 124 ]; then
-        fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s"
+        fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s (SIGTERM)"
+    fi
+    if [ "$DEBOOTSTRAP_CODE" -eq 137 ]; then
+        fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s (SIGKILL)"
     fi
     fail "debootstrap failed with exit code ${DEBOOTSTRAP_CODE}"
 fi
