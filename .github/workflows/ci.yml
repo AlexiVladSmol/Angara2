@@ -882,8 +882,8 @@ jobs:
           SUDO_PID=
           cleanup() {
             [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
-            [ -z "$BOOT_PID" ] || kill -KILL "$BOOT_PID" 2>/dev/null || true
-            [ -z "$SUDO_PID" ] || kill -KILL "$SUDO_PID" 2>/dev/null || true
+            [ -z "$BOOT_PID" ] || sudo kill -KILL "$BOOT_PID" 2>/dev/null || true
+            [ -z "$SUDO_PID" ] || sudo kill -KILL "$SUDO_PID" 2>/dev/null || true
             sudo rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$PIDFILE" 2>/dev/null || true
             rm -f "$LOG" "$SECOND_LOG" "$SERVER_LOG"
           }
@@ -969,15 +969,15 @@ jobs:
             exit 1
           fi
           SIGNAL_START=$(date +%s)
-          kill -TERM "$BOOT_PID"
+          sudo kill -TERM "$BOOT_PID"
           for _ in $(seq 1 100); do
-            if ! kill -0 "$BOOT_PID" 2>/dev/null; then
+            if ! sudo kill -0 "$BOOT_PID" 2>/dev/null; then
               break
             fi
             sleep 0.1
           done
-          if kill -0 "$BOOT_PID" 2>/dev/null; then
-            kill -KILL "$BOOT_PID" 2>/dev/null || true
+          if sudo kill -0 "$BOOT_PID" 2>/dev/null; then
+            sudo kill -KILL "$BOOT_PID" 2>/dev/null || true
             echo "boot.sh did not exit within 10s of SIGTERM" >&2
             exit 1
           fi
