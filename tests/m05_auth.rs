@@ -1,15 +1,15 @@
-﻿//! Focused M05 tests: users snapshot, Basic guard, identity selectors, pool
+//! Focused M05 tests: users snapshot, Basic guard, identity selectors, pool
 //! isolation and the `users hash` CLI input contract.
 
 mod common;
 
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use angara::auth::{Argon2Verifier, PasswordVerifier as _, hash_password, prepare_password};
 use angara::config::Config;
@@ -968,12 +968,14 @@ fn run_hash(args: &[&str], stdin: Option<&[u8]>) -> Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn angara users hash");
     if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(input)
-            .expect("write stdin");
+        let mut pipe = child.stdin.take().expect("stdin");
+        if let Err(error) = pipe.write_all(input) {
+            assert_eq!(
+                error.kind(),
+                ErrorKind::BrokenPipe,
+                "write stdin: {error:?}"
+            );
+        }
     }
     child.wait_with_output().expect("wait for users hash")
 }
@@ -1075,6 +1077,54 @@ fn cli_users_hash_rejects_bad_stdin_and_surprising_inputs() {
     );
     assert_eq!(duplicate.status.code(), Some(2));
     assert!(duplicate.stdout.is_empty());
+    assert!(
+        !duplicate.stderr.is_empty(),
+        "duplicate argument error should be explained"
+    );
+}
+
+#[test]
+fn cli_users_hash_duplicate_stdin_eof_is_not_a_panic() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_angara"))
+        .args(["users", "hash", "--password-stdin", "--password-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn duplicate users hash");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("wait for duplicate users hash")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "duplicate users hash did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut pipe = child.stdin.take().expect("stdin");
+    let error = pipe
+        .write_all(b"secret\n")
+        .expect_err("write to an exited process must fail");
+    assert_eq!(error.kind(), ErrorKind::BrokenPipe, "{error:?}");
+    drop(pipe);
+
+    let output = child
+        .wait_with_output()
+        .expect("wait for duplicate users hash output");
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(
+        !output.stderr.is_empty(),
+        "duplicate argument error should be explained"
+    );
 }
 
 #[test]
