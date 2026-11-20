@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Shared helpers for the M08 Linux stand tests.
 set -euo pipefail
+set -E
+trap 'm08_rc=$?; case $- in *e*) printf "M08 FAIL: %s:%s: '\''%s'\'' exited %s\n" "${BASH_SOURCE[0]}" "$LINENO" "$BASH_COMMAND" "$m08_rc" >&2 ;; esac' ERR
 
 M08_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(CDPATH= cd -- "$M08_DIR/../.." && pwd)
