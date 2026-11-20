@@ -871,8 +871,10 @@ jobs:
           printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           TEST_TMPDIR=$(mktemp -d)
           SECOND_TMPDIR=$(mktemp -d)
+          THIRD_TMPDIR=$(mktemp -d)
           LOG=$(mktemp)
           SECOND_LOG=$(mktemp)
+          THIRD_LOG=$(mktemp)
           SERVER_LOG=$(mktemp)
           PIDFILE=$(mktemp)
           sudo chown root:root "$PIDFILE"
@@ -884,8 +886,8 @@ jobs:
             [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
             [ -z "$BOOT_PID" ] || sudo kill -KILL "$BOOT_PID" 2>/dev/null || true
             [ -z "$SUDO_PID" ] || sudo kill -KILL "$SUDO_PID" 2>/dev/null || true
-            sudo rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$PIDFILE" 2>/dev/null || true
-            rm -f "$LOG" "$SECOND_LOG" "$SERVER_LOG"
+            sudo rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$THIRD_TMPDIR" "$PIDFILE" 2>/dev/null || true
+            rm -f "$LOG" "$SECOND_LOG" "$THIRD_LOG" "$SERVER_LOG"
           }
           trap cleanup EXIT HUP INT TERM
           python3 - <<'PY' >"$SERVER_LOG" 2>&1 &
@@ -1006,6 +1008,43 @@ jobs:
             exit 1
           fi
           echo "signal path: code=$SIGNAL_CODE elapsed=${SIGNAL_ELAPSED}s mounts=none temp=empty"
+
+          WGET_START=$(date +%s)
+          set +e
+          sudo env M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_UBUNTU_MIRROR=http://127.0.0.1:18089/ubuntu/ \
+            M08_WGET_READ_TIMEOUT=3 M08_DEBOOTSTRAP_TIMEOUT=60 \
+            TMPDIR="$THIRD_TMPDIR" bash tests/m08/boot.sh \
+            >"$THIRD_LOG" 2>&1
+          WGET_CODE=$?
+          set -e
+          WGET_ELAPSED=$(($(date +%s) - WGET_START))
+          cat "$THIRD_LOG"
+          if [ "$WGET_CODE" -eq 0 ]; then
+            echo "expected boot.sh to fail on wget read timeout" >&2
+            exit 1
+          fi
+          if ! grep -Fq 'debootstrap failed with exit code' "$THIRD_LOG"; then
+            echo "missing ordinary debootstrap failure message" >&2
+            exit 1
+          fi
+          if grep -Fq 'timed out' "$THIRD_LOG"; then
+            echo "wget read timeout unexpectedly reached the outer timeout" >&2
+            exit 1
+          fi
+          if [ "$WGET_ELAPSED" -gt 45 ]; then
+            echo "wget read timeout path took ${WGET_ELAPSED}s" >&2
+            exit 1
+          fi
+          if findmnt -rn -o TARGET | grep -Fq "$THIRD_TMPDIR/"; then
+            echo "wget timeout cleanup left mounted filesystems under $THIRD_TMPDIR" >&2
+            exit 1
+          fi
+          if [ -n "$(sudo find "$THIRD_TMPDIR" -mindepth 1 -print -quit)" ]; then
+            echo "wget timeout cleanup left files under $THIRD_TMPDIR" >&2
+            exit 1
+          fi
+          echo "wget timeout path: code=$WGET_CODE elapsed=${WGET_ELAPSED}s mounts=none temp=empty"
       - name: Boot pristine rootfs
         run: |
           set -euo pipefail

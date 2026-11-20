@@ -61,14 +61,27 @@ detect_ubuntu_mirror() {
 
 UBUNTU_MIRROR=$(detect_ubuntu_mirror)
 DEBOOTSTRAP_TIMEOUT=${M08_DEBOOTSTRAP_TIMEOUT:-900}
+WGET_READ_TIMEOUT=${M08_WGET_READ_TIMEOUT:-60}
 case "$DEBOOTSTRAP_TIMEOUT" in
     ''|*[!0-9]*) fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer" ;;
 esac
 [ "$DEBOOTSTRAP_TIMEOUT" -gt 0 ] \
     || fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer"
+case "$WGET_READ_TIMEOUT" in
+    ''|*[!0-9]*) fail "M08_WGET_READ_TIMEOUT must be a positive integer" ;;
+esac
+[ "$WGET_READ_TIMEOUT" -gt 0 ] \
+    || fail "M08_WGET_READ_TIMEOUT must be a positive integer"
 
 TMP=$(mktemp -d)
 ROOT="$TMP/rootfs"
+cat >"$TMP/wgetrc" <<EOF
+read_timeout = ${WGET_READ_TIMEOUT}
+connect_timeout = 20
+dns_timeout = 20
+tries = 3
+waitretry = 2
+EOF
 MACHINE="angara-boot-$$"
 NSPAWN_PID=
 DEBOOTSTRAP_PID=
@@ -105,7 +118,8 @@ cleanup() {
 }
 on_signal() {
     local code=$1
-    trap - EXIT HUP INT TERM
+    trap - EXIT
+    trap '' HUP INT TERM
     cleanup
     exit "$code"
 }
@@ -124,9 +138,10 @@ SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source
 [ -n "$SOURCE_SHA" ] || fail "manifest source SHA is missing"
 
 log "ubuntu mirror: $UBUNTU_MIRROR"
+log "wget read timeout: ${WGET_READ_TIMEOUT}s"
 DEBOOTSTRAP_START=$(date +%s)
 set +e
-timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
+WGETRC="$TMP/wgetrc" timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
     --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
     noble "$ROOT" "$UBUNTU_MIRROR" \
     >"$TMP/debootstrap.log" 2>&1 &
