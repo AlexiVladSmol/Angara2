@@ -87,6 +87,7 @@ NSPAWN_PID=
 DEBOOTSTRAP_PID=
 CLEANED=0
 cleanup() {
+    trap '' HUP INT TERM
     [ "$CLEANED" -eq 0 ] || return 0
     CLEANED=1
     if [ -n "$NSPAWN_PID" ] && kill -0 "$NSPAWN_PID" 2>/dev/null; then
