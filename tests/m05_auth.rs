@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{ChildStdin, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -957,6 +957,14 @@ action = "allow"
     assert_eq!(error, OutboundError::AuthenticationRequired);
 }
 
+fn write_stdin_allowing_epipe(pipe: &mut ChildStdin, input: &[u8]) -> bool {
+    match pipe.write_all(input) {
+        Ok(()) => false,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => true,
+        Err(error) => panic!("write stdin: {error:?}"),
+    }
+}
+
 fn run_hash(args: &[&str], stdin: Option<&[u8]>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_angara"));
     command.args(args);
@@ -969,13 +977,7 @@ fn run_hash(args: &[&str], stdin: Option<&[u8]>) -> Output {
     let mut child = command.spawn().expect("spawn angara users hash");
     if let Some(input) = stdin {
         let mut pipe = child.stdin.take().expect("stdin");
-        if let Err(error) = pipe.write_all(input) {
-            assert_eq!(
-                error.kind(),
-                ErrorKind::BrokenPipe,
-                "write stdin: {error:?}"
-            );
-        }
+        write_stdin_allowing_epipe(&mut pipe, input);
     }
     child.wait_with_output().expect("wait for users hash")
 }
@@ -1110,10 +1112,10 @@ fn cli_users_hash_duplicate_stdin_eof_is_not_a_panic() {
     }
 
     let mut pipe = child.stdin.take().expect("stdin");
-    let error = pipe
-        .write_all(b"secret\n")
-        .expect_err("write to an exited process must fail");
-    assert_eq!(error.kind(), ErrorKind::BrokenPipe, "{error:?}");
+    assert!(
+        write_stdin_allowing_epipe(&mut pipe, b"secret\n"),
+        "write to an exited process should return BrokenPipe"
+    );
     drop(pipe);
 
     let output = child
