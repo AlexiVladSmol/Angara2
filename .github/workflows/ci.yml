@@ -870,12 +870,19 @@ jobs:
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
           TEST_TMPDIR=$(mktemp -d)
+          SECOND_TMPDIR=$(mktemp -d)
           LOG=$(mktemp)
+          SECOND_LOG=$(mktemp)
           SERVER_LOG=$(mktemp)
+          PIDFILE=$(mktemp)
           SERVER_PID=
+          BOOT_PID=
+          SUDO_PID=
           cleanup() {
             [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
-            rm -rf "$TEST_TMPDIR" "$LOG" "$SERVER_LOG"
+            [ -z "$BOOT_PID" ] || kill -KILL "$BOOT_PID" 2>/dev/null || true
+            [ -z "$SUDO_PID" ] || kill -KILL "$SUDO_PID" 2>/dev/null || true
+            rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$LOG" "$SECOND_LOG" "$SERVER_LOG" "$PIDFILE"
           }
           trap cleanup EXIT HUP INT TERM
           python3 - <<'PY' >"$SERVER_LOG" 2>&1 &
@@ -935,6 +942,67 @@ jobs:
             exit 1
           fi
           echo "timeout path: code=$CODE mounts=none temp=empty"
+
+          sudo env M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_UBUNTU_MIRROR=http://127.0.0.1:18089/ubuntu/ \
+            M08_DEBOOTSTRAP_TIMEOUT=120 TMPDIR="$SECOND_TMPDIR" \
+            BOOT_PIDFILE="$PIDFILE" \
+            bash -c 'echo $$ >"$BOOT_PIDFILE"; exec bash tests/m08/boot.sh' \
+            >"$SECOND_LOG" 2>&1 &
+          SUDO_PID=$!
+          for _ in $(seq 1 100); do
+            [ -s "$PIDFILE" ] && break
+            sleep 0.1
+          done
+          [ -s "$PIDFILE" ] || { cat "$SECOND_LOG" >&2; exit 1; }
+          BOOT_PID=$(cat "$PIDFILE")
+          for _ in $(seq 1 100); do
+            grep -Fq 'debootstrap noble rootfs' "$SECOND_LOG" && break
+            sleep 0.1
+          done
+          if ! grep -Fq 'debootstrap noble rootfs' "$SECOND_LOG"; then
+            cat "$SECOND_LOG" >&2
+            echo "boot.sh did not reach debootstrap before signal test" >&2
+            exit 1
+          fi
+          SIGNAL_START=$(date +%s)
+          kill -TERM "$BOOT_PID"
+          for _ in $(seq 1 100); do
+            if ! kill -0 "$BOOT_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          if kill -0 "$BOOT_PID" 2>/dev/null; then
+            kill -KILL "$BOOT_PID" 2>/dev/null || true
+            echo "boot.sh did not exit within 10s of SIGTERM" >&2
+            exit 1
+          fi
+          set +e
+          wait "$SUDO_PID"
+          SIGNAL_CODE=$?
+          set -e
+          SUDO_PID=
+          BOOT_PID=
+          SIGNAL_ELAPSED=$(($(date +%s) - SIGNAL_START))
+          cat "$SECOND_LOG"
+          if [ "$SIGNAL_CODE" -ne 143 ]; then
+            echo "boot.sh signal exit code was $SIGNAL_CODE, expected 143" >&2
+            exit 1
+          fi
+          if [ "$SIGNAL_ELAPSED" -gt 10 ]; then
+            echo "boot.sh cleanup after SIGTERM took ${SIGNAL_ELAPSED}s" >&2
+            exit 1
+          fi
+          if findmnt -rn -o TARGET | grep -Fq "$SECOND_TMPDIR/"; then
+            echo "SIGTERM cleanup left mounted filesystems under $SECOND_TMPDIR" >&2
+            exit 1
+          fi
+          if [ -n "$(find "$SECOND_TMPDIR" -mindepth 1 -print -quit)" ]; then
+            echo "SIGTERM cleanup left files under $SECOND_TMPDIR" >&2
+            exit 1
+          fi
+          echo "signal path: code=$SIGNAL_CODE elapsed=${SIGNAL_ELAPSED}s mounts=none temp=empty"
       - name: Boot pristine rootfs
         run: |
           set -euo pipefail

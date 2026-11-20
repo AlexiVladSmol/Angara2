@@ -71,6 +71,7 @@ TMP=$(mktemp -d)
 ROOT="$TMP/rootfs"
 MACHINE="angara-boot-$$"
 NSPAWN_PID=
+DEBOOTSTRAP_PID=
 CLEANED=0
 cleanup() {
     [ "$CLEANED" -eq 0 ] || return 0
@@ -80,6 +81,12 @@ cleanup() {
         kill "$NSPAWN_PID" 2>/dev/null || true
         wait "$NSPAWN_PID" 2>/dev/null || true
     fi
+    if [ -n "$DEBOOTSTRAP_PID" ] \
+        && kill -0 "$DEBOOTSTRAP_PID" 2>/dev/null; then
+        kill -TERM "$DEBOOTSTRAP_PID" 2>/dev/null || true
+        wait "$DEBOOTSTRAP_PID" 2>/dev/null || true
+    fi
+    DEBOOTSTRAP_PID=
     if [ -d "$ROOT" ] && command -v findmnt >/dev/null 2>&1; then
         while IFS= read -r target; do
             [ -n "$target" ] || continue
@@ -91,6 +98,9 @@ cleanup() {
             | sort -rn | cut -d' ' -f2-)
     fi
     rm -rf --one-file-system "$TMP" 2>/dev/null || true
+    if [ -e "$TMP" ]; then
+        printf 'warning: cleanup left temporary path: %s\n' "$TMP" >&2
+    fi
     return 0
 }
 on_signal() {
@@ -114,14 +124,17 @@ SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source
 [ -n "$SOURCE_SHA" ] || fail "manifest source SHA is missing"
 
 log "ubuntu mirror: $UBUNTU_MIRROR"
-log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
 DEBOOTSTRAP_START=$(date +%s)
 set +e
 timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
     --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
     noble "$ROOT" "$UBUNTU_MIRROR" \
-    >"$TMP/debootstrap.log" 2>&1
+    >"$TMP/debootstrap.log" 2>&1 &
+DEBOOTSTRAP_PID=$!
+log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
+wait "$DEBOOTSTRAP_PID"
 DEBOOTSTRAP_CODE=$?
+DEBOOTSTRAP_PID=
 set -e
 DEBOOTSTRAP_ELAPSED=$(($(date +%s) - DEBOOTSTRAP_START))
 if [ "$DEBOOTSTRAP_CODE" -ne 0 ]; then
