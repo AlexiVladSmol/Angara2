@@ -875,6 +875,8 @@ jobs:
           SECOND_LOG=$(mktemp)
           SERVER_LOG=$(mktemp)
           PIDFILE=$(mktemp)
+          sudo chown root:root "$PIDFILE"
+          sudo chmod 0644 "$PIDFILE"
           SERVER_PID=
           BOOT_PID=
           SUDO_PID=
@@ -882,7 +884,8 @@ jobs:
             [ -z "$SERVER_PID" ] || kill "$SERVER_PID" 2>/dev/null || true
             [ -z "$BOOT_PID" ] || kill -KILL "$BOOT_PID" 2>/dev/null || true
             [ -z "$SUDO_PID" ] || kill -KILL "$SUDO_PID" 2>/dev/null || true
-            rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$LOG" "$SECOND_LOG" "$SERVER_LOG" "$PIDFILE"
+            sudo rm -rf "$TEST_TMPDIR" "$SECOND_TMPDIR" "$PIDFILE" 2>/dev/null || true
+            rm -f "$LOG" "$SECOND_LOG" "$SERVER_LOG"
           }
           trap cleanup EXIT HUP INT TERM
           python3 - <<'PY' >"$SERVER_LOG" 2>&1 &
@@ -937,7 +940,7 @@ jobs:
             echo "timeout left mounted filesystems under $TEST_TMPDIR" >&2
             exit 1
           fi
-          if [ -n "$(find "$TEST_TMPDIR" -mindepth 1 -print -quit)" ]; then
+          if [ -n "$(sudo find "$TEST_TMPDIR" -mindepth 1 -print -quit)" ]; then
             echo "timeout left files under $TEST_TMPDIR" >&2
             exit 1
           fi
@@ -998,7 +1001,7 @@ jobs:
             echo "SIGTERM cleanup left mounted filesystems under $SECOND_TMPDIR" >&2
             exit 1
           fi
-          if [ -n "$(find "$SECOND_TMPDIR" -mindepth 1 -print -quit)" ]; then
+          if [ -n "$(sudo find "$SECOND_TMPDIR" -mindepth 1 -print -quit)" ]; then
             echo "SIGTERM cleanup left files under $SECOND_TMPDIR" >&2
             exit 1
           fi
