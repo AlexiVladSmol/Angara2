@@ -20,12 +20,13 @@ use crate::http::ResponseBody;
 use crate::http::connect::TunnelSetup;
 use crate::http::headers;
 use crate::http::interim::InterimSender;
+use crate::http::parent_client::{self, BoxedIo, ParentError};
 use crate::http::pool::{
     Lease, LeaseRequestBody, LeaseResponseBody, OriginPool, PoolBody, PooledSender,
 };
 use crate::limits::CapController;
-use crate::logging::{Event, LogRecord, Logger, Outcome, Reason};
-use crate::outbound::{OutboundError, OutboundService, RequestContext};
+use crate::logging::{Event, LogRecord, Logger, Outcome, Reason, RouteKind};
+use crate::outbound::{OutboundError, OutboundPlan, OutboundService, RequestContext};
 use crate::policy::{self, RequestMeta};
 use crate::snapshot::SnapshotStore;
 use crate::target::{self, CanonicalTarget, TargetError};
@@ -53,6 +54,108 @@ pub struct ClientInfo {
     pub request_id: u64,
 }
 
+/// Route metadata filled after the outbound plan is selected.
+#[derive(Clone, Debug, Default)]
+struct RouteInfo {
+    parent_id: Option<String>,
+    kind: Option<RouteKind>,
+}
+
+struct ForwardParts {
+    method: Method,
+    target: CanonicalTarget,
+    target_text: String,
+    body: Incoming,
+    headers: http::HeaderMap,
+    nominations: Vec<http::header::HeaderName>,
+    request_chunked: bool,
+    request_had_content_length: bool,
+    interim: InterimSender,
+    request_body_bytes: Arc<AtomicU64>,
+}
+
+enum ParentOpenError {
+    Outbound(OutboundError),
+    Parent(ParentError),
+    MissingParent,
+}
+
+impl ParentOpenError {
+    fn response(self) -> Response<ResponseBody> {
+        match self {
+            Self::Outbound(error) => {
+                let (status, close) = outbound_status(error);
+                headers::error_response(status, close)
+            }
+            Self::Parent(error) => headers::error_response(error.status(), true),
+            Self::MissingParent => headers::error_response(StatusCode::INTERNAL_SERVER_ERROR, true),
+        }
+    }
+}
+
+fn finalize_upstream_response(
+    response: Response<Incoming>,
+    lease: Lease,
+    method: &Method,
+    request_chunked: bool,
+) -> Result<Response<ResponseBody>, ()> {
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS || response.status().is_informational()
+    {
+        lease.abort();
+        return Err(());
+    }
+    if headers::validate_framing(response.headers()).is_err() {
+        lease.abort();
+        return Err(());
+    }
+    let original_headers = response.headers().clone();
+    let mut response_headers = original_headers.clone();
+    let response_nominations = match headers::filter_hop_by_hop(&mut response_headers, false) {
+        Ok(names) => names,
+        Err(()) => {
+            lease.abort();
+            return Err(());
+        }
+    };
+    let response_trailer_names =
+        match headers::trailer_names(&original_headers, &response_nominations) {
+            Ok(names) => names,
+            Err(()) => {
+                lease.abort();
+                return Err(());
+            }
+        };
+    let response_trailer_nominated = response_nominations.contains(&http::header::TRAILER);
+    headers::append_via(&mut response_headers);
+    if request_chunked {
+        // Hyper normalizes CL+TE to TE before the service runs. M03 keeps the
+        // conservative safe outcome: a chunked request closes the client
+        // connection after the response.
+        response_headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+    }
+    let status = response.status();
+    let response_body = response.into_body();
+    let body_length = response_body.size_hint().exact();
+    if headers::response_has_body(method, status) {
+        if let Some(length) = body_length {
+            headers::set_content_length(&mut response_headers, length);
+        } else if !response_trailer_nominated {
+            headers::set_trailer_names(&mut response_headers, &response_trailer_names);
+        }
+    } else if status != StatusCode::NO_CONTENT {
+        headers::keep_representation_length(&mut response_headers, &original_headers);
+    }
+    let body = LeaseResponseBody::new(response_body, lease, response_nominations).boxed();
+    let mut local = Response::new(body);
+    *local.status_mut() = status;
+    *local.version_mut() = Version::HTTP_11;
+    *local.headers_mut() = response_headers;
+    Ok(local)
+}
+
 /// Immutable terminal metadata for one HTTP exchange.
 #[derive(Clone, Debug)]
 pub struct ExchangeMeta {
@@ -63,6 +166,7 @@ pub struct ExchangeMeta {
     listener_id: String,
     status: Option<StatusCode>,
     request_body_bytes: Arc<AtomicU64>,
+    route: Arc<Mutex<RouteInfo>>,
 }
 
 impl ExchangeMeta {
@@ -79,6 +183,17 @@ impl ExchangeMeta {
     /// Observed request DATA bytes at terminal time.
     pub fn request_body_bytes(&self) -> u64 {
         self.request_body_bytes.load(Ordering::Relaxed)
+    }
+}
+
+fn set_route(route: &Arc<Mutex<RouteInfo>>, plan: &OutboundPlan) {
+    if let Ok(mut route) = route.lock() {
+        route.parent_id = plan.parent_id().map(str::to_owned);
+        route.kind = Some(if plan.parent().is_some() {
+            RouteKind::Parent
+        } else {
+            RouteKind::Direct
+        });
     }
 }
 
@@ -532,12 +647,54 @@ impl Proxy {
                 return Err(headers::error_response(status, close));
             }
         };
-        let origin = match self.outbound.open_plan_with(config, &plan).await {
+        let connected = match self.outbound.open_plan_with(config, &plan).await {
             Ok(origin) => origin,
             Err(outbound_error) => {
                 let (status, close) = outbound_status(outbound_error);
                 return Err(headers::error_response(status, close));
             }
+        };
+        let tunnel_generation = connected.endpoint().generation();
+        let parent_id = plan.parent_id().map(str::to_owned);
+        let route = if plan.parent().is_some() {
+            RouteKind::Parent
+        } else {
+            RouteKind::Direct
+        };
+        let origin: BoxedIo = if let Some(parent) = plan.parent() {
+            let Some(target_endpoint) = plan.target_endpoint() else {
+                return Err(headers::error_response(StatusCode::BAD_GATEWAY, true));
+            };
+            let deadline = tokio::time::Instant::from_std(plan.deadline());
+            let io = match parent_client::connect_io(
+                connected,
+                parent,
+                config.limits().idle_timeout(),
+                deadline,
+            )
+            .await
+            {
+                Ok(io) => io,
+                Err(error) => {
+                    return Err(headers::error_response(error.status(), true));
+                }
+            };
+            match parent_client::open_tunnel(
+                io,
+                parent,
+                target_endpoint,
+                config.http().response_header_timeout(),
+                deadline,
+            )
+            .await
+            {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    return Err(headers::error_response(error.status(), true));
+                }
+            }
+        } else {
+            Box::new(connected)
         };
 
         let body = http_body_util::Full::new(bytes::Bytes::new())
@@ -554,7 +711,6 @@ impl Proxy {
                         .boxed(),
                 )
             });
-        let tunnel_generation = origin.endpoint().generation();
         let setup = TunnelSetup {
             on_upgrade,
             origin,
@@ -566,6 +722,8 @@ impl Proxy {
                 self.logger(),
                 tunnel_generation,
                 client.connection_id,
+                parent_id,
+                route,
             ),
         };
         self.telemetry
@@ -588,6 +746,7 @@ impl Proxy {
         self.telemetry.http_started.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.snapshots.load();
         let request_body_bytes = Arc::new(AtomicU64::new(0));
+        let route = Arc::new(Mutex::new(RouteInfo::default()));
         let mut meta = ExchangeMeta {
             generation: snapshot.generation(),
             started,
@@ -596,6 +755,7 @@ impl Proxy {
             listener_id: client.listener_id.clone(),
             status: None,
             request_body_bytes,
+            route: Arc::clone(&route),
         };
         let mut terminal =
             ExchangeTerminal::new(Arc::clone(&self.telemetry), self.logger(), meta.clone());
@@ -608,6 +768,7 @@ impl Proxy {
                 interim,
                 &snapshot,
                 Arc::clone(&meta.request_body_bytes),
+                Arc::clone(&route),
             )
             .await
         };
@@ -636,6 +797,7 @@ impl Proxy {
                 listener_id: client.listener_id.clone(),
                 status: None,
                 request_body_bytes: Arc::new(AtomicU64::new(0)),
+                route: Arc::new(Mutex::new(RouteInfo::default())),
             },
             disarmed: false,
         }
@@ -664,6 +826,7 @@ impl Proxy {
         interim: InterimSender,
         snapshot: &Arc<crate::snapshot::RuntimeSnapshot>,
         request_body_bytes: Arc<AtomicU64>,
+        route: Arc<Mutex<RouteInfo>>,
     ) -> Response<ResponseBody> {
         if self.is_draining() {
             return headers::error_response(StatusCode::SERVICE_UNAVAILABLE, true);
@@ -828,6 +991,29 @@ impl Proxy {
                 return headers::error_response(status, close);
             }
         };
+        set_route(&route, &plan);
+
+        if plan.parent().is_some() {
+            return self
+                .forward_parent(
+                    config,
+                    &plan,
+                    ForwardParts {
+                        method: method.clone(),
+                        target: target.clone(),
+                        target_text: target_text.clone(),
+                        body: request.into_body(),
+                        headers: request_headers,
+                        nominations: request_nominations,
+                        request_chunked,
+                        request_had_content_length,
+                        interim,
+                        request_body_bytes,
+                    },
+                    &route,
+                )
+                .await;
+        }
 
         let lease = match self.pool.checkout(&plan) {
             Some(lease) => lease,
@@ -887,65 +1073,10 @@ impl Proxy {
                     lease.abort();
                     return headers::error_response(StatusCode::BAD_GATEWAY, true);
                 }
-                if response.status() == StatusCode::SWITCHING_PROTOCOLS
-                    || response.status().is_informational()
-                {
-                    lease.abort();
-                    return headers::error_response(StatusCode::BAD_GATEWAY, true);
+                match finalize_upstream_response(response, lease, &method, request_chunked) {
+                    Ok(response) => response,
+                    Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),
                 }
-                if headers::validate_framing(response.headers()).is_err() {
-                    lease.abort();
-                    return headers::error_response(StatusCode::BAD_GATEWAY, true);
-                }
-                let original_headers = response.headers().clone();
-                let mut response_headers = original_headers.clone();
-                let response_nominations =
-                    match headers::filter_hop_by_hop(&mut response_headers, false) {
-                        Ok(names) => names,
-                        Err(()) => {
-                            lease.abort();
-                            return headers::error_response(StatusCode::BAD_GATEWAY, true);
-                        }
-                    };
-                let response_trailer_names =
-                    match headers::trailer_names(&original_headers, &response_nominations) {
-                        Ok(names) => names,
-                        Err(()) => {
-                            lease.abort();
-                            return headers::error_response(StatusCode::BAD_GATEWAY, true);
-                        }
-                    };
-                let response_trailer_nominated =
-                    response_nominations.contains(&http::header::TRAILER);
-                headers::append_via(&mut response_headers);
-                if request_chunked {
-                    // Hyper normalizes CL+TE to TE before the service runs.
-                    // M03 keeps the conservative safe outcome: a chunked
-                    // request closes the client connection after the response.
-                    response_headers.insert(
-                        http::header::CONNECTION,
-                        http::HeaderValue::from_static("close"),
-                    );
-                }
-                let status = response.status();
-                let response_body = response.into_body();
-                let body_length = response_body.size_hint().exact();
-                if headers::response_has_body(&method, status) {
-                    if let Some(length) = body_length {
-                        headers::set_content_length(&mut response_headers, length);
-                    } else if !response_trailer_nominated {
-                        headers::set_trailer_names(&mut response_headers, &response_trailer_names);
-                    }
-                } else if status != StatusCode::NO_CONTENT {
-                    headers::keep_representation_length(&mut response_headers, &original_headers);
-                }
-                let body =
-                    LeaseResponseBody::new(response_body, lease, response_nominations).boxed();
-                let mut local = Response::new(body);
-                *local.status_mut() = status;
-                *local.version_mut() = Version::HTTP_11;
-                *local.headers_mut() = response_headers;
-                local
             }
             Ok(Err(_)) => {
                 lease.abort();
@@ -956,6 +1087,193 @@ impl Proxy {
                 headers::error_response(StatusCode::GATEWAY_TIMEOUT, true)
             }
         }
+    }
+
+    async fn forward_parent(
+        &self,
+        config: &Config,
+        plan: &OutboundPlan,
+        parts: ForwardParts,
+        route: &Arc<Mutex<RouteInfo>>,
+    ) -> Response<ResponseBody> {
+        set_route(route, plan);
+        let Some(parent) = plan.parent().cloned() else {
+            return headers::error_response(StatusCode::INTERNAL_SERVER_ERROR, true);
+        };
+        let Some(target_endpoint) = plan.target_endpoint() else {
+            return headers::error_response(StatusCode::BAD_GATEWAY, true);
+        };
+        let use_tunnel = plan.target().host().as_domain().is_some()
+            || (parts.method == Method::OPTIONS && options_without_path(&parts.target_text));
+        let response_timeout = config.http().response_header_timeout();
+        let deadline = tokio::time::Instant::from_std(plan.deadline());
+
+        let (lease, uri) = if use_tunnel {
+            let (io, _parent_endpoint) = match self.open_parent_io(config, plan).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return error.response();
+                }
+            };
+            let tunnel = match parent_client::open_tunnel(
+                io,
+                &parent,
+                target_endpoint,
+                response_timeout,
+                deadline,
+            )
+            .await
+            {
+                Ok(tunnel) => tunnel,
+                Err(error) => {
+                    return headers::error_response(error.status(), true);
+                }
+            };
+            let sender = match self.handshake_parent_io(tunnel, config).await {
+                Ok(sender) => sender,
+                Err(error) => {
+                    return headers::error_response(error.status(), true);
+                }
+            };
+            let lease = self.pool.new_parent_lease(plan, target_endpoint, sender);
+            let uri = if parts.method == Method::OPTIONS && options_without_path(&parts.target_text)
+            {
+                "*".to_owned()
+            } else {
+                headers::origin_form(&parts.target).to_owned()
+            };
+            (lease, uri)
+        } else {
+            let (io, parent_endpoint) = match self.open_parent_io(config, plan).await {
+                Ok(value) => value,
+                Err(error) => return error.response(),
+            };
+            let sender = match self.handshake_parent_io(io, config).await {
+                Ok(sender) => sender,
+                Err(error) => return headers::error_response(error.status(), true),
+            };
+            let lease = self.pool.new_parent_lease(plan, parent_endpoint, sender);
+            let path = parts
+                .target
+                .path_and_query()
+                .map(|path| path.as_str())
+                .unwrap_or("/");
+            let authority = parent_client::connect_authority(target_endpoint);
+            (lease, format!("http://{authority}{path}"))
+        };
+
+        let body_length = parts.body.size_hint().exact();
+        let mut request_headers = parts.headers;
+        if parts.request_had_content_length
+            && let Some(length) = body_length
+        {
+            headers::set_content_length(&mut request_headers, length);
+        }
+        if !use_tunnel && let Some(authorization) = parent.authorization() {
+            request_headers.insert(http::header::PROXY_AUTHORIZATION, authorization);
+        }
+
+        let request_body = LeaseRequestBody::new(
+            parts.body,
+            lease.clone(),
+            parts.nominations,
+            parts.request_body_bytes,
+        )
+        .boxed();
+        let mut upstream_request = Request::new(request_body);
+        *upstream_request.method_mut() = parts.method.clone();
+        *upstream_request.uri_mut() = uri
+            .parse()
+            .unwrap_or_else(|_| "/".parse().expect("static origin-form"));
+        *upstream_request.version_mut() = Version::HTTP_11;
+        *upstream_request.headers_mut() = request_headers;
+
+        let interim_callback = parts.interim.clone();
+        hyper::ext::on_informational(&mut upstream_request, move |response| {
+            let _ = interim_callback.send_interim(response.status(), response.headers());
+        });
+
+        let mut sender = match lease.take_sender() {
+            Some(sender) => sender,
+            None => {
+                lease.abort();
+                return headers::error_response(StatusCode::BAD_GATEWAY, true);
+            }
+        };
+        let result =
+            tokio::time::timeout(response_timeout, sender.send_request(upstream_request)).await;
+        match result {
+            Ok(Ok(response)) => {
+                lease.put_sender(sender);
+                if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                    lease.abort();
+                    return headers::error_response(StatusCode::BAD_GATEWAY, true);
+                }
+                if parts.interim.failed() {
+                    lease.abort();
+                    return headers::error_response(StatusCode::BAD_GATEWAY, true);
+                }
+                match finalize_upstream_response(
+                    response,
+                    lease,
+                    &parts.method,
+                    parts.request_chunked,
+                ) {
+                    Ok(response) => response,
+                    Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),
+                }
+            }
+            Ok(Err(_)) => {
+                lease.abort();
+                headers::error_response(StatusCode::BAD_GATEWAY, true)
+            }
+            Err(_) => {
+                lease.abort();
+                headers::error_response(StatusCode::GATEWAY_TIMEOUT, true)
+            }
+        }
+    }
+
+    async fn open_parent_io(
+        &self,
+        config: &Config,
+        plan: &OutboundPlan,
+    ) -> Result<(BoxedIo, std::net::SocketAddr), ParentOpenError> {
+        let connected = self
+            .outbound
+            .open_plan_with(config, plan)
+            .await
+            .map_err(ParentOpenError::Outbound)?;
+        let endpoint = connected.endpoint().endpoint();
+        let parent = plan.parent().ok_or(ParentOpenError::MissingParent)?;
+        let deadline = tokio::time::Instant::from_std(plan.deadline());
+        let io =
+            parent_client::connect_io(connected, parent, config.limits().idle_timeout(), deadline)
+                .await
+                .map_err(ParentOpenError::Parent)?;
+        Ok((io, endpoint))
+    }
+
+    async fn handshake_parent_io(
+        &self,
+        io: BoxedIo,
+        config: &Config,
+    ) -> Result<PooledSender, ParentError> {
+        let handshake = client_http1::Builder::new()
+            .max_headers(config.http().max_headers())
+            .max_header_size(config.limits().max_header_bytes() as usize)
+            .max_buf_size(connection_buffer_size(config))
+            .handshake::<_, PoolBody>(TokioIo::new(io))
+            .await
+            .map_err(|_| ParentError::Protocol)?;
+        let (sender, connection) = handshake;
+        let task = self
+            .origin_tasks
+            .spawn(async move {
+                let _ = connection.await;
+            })
+            .await;
+        Ok(PooledSender::new(sender, task))
     }
 
     async fn open_new_connection(
@@ -1052,6 +1370,10 @@ fn log_terminal_with_reason(
     record.elapsed_ms = Some(u64::try_from(meta.started.elapsed().as_millis()).unwrap_or(u64::MAX));
     record.request_body_bytes = Some(request_body_bytes);
     record.response_body_bytes = Some(response_body_bytes);
+    if let Ok(route) = meta.route.lock() {
+        record.parent_id = route.parent_id.clone();
+        record.route = route.kind;
+    }
     logger.log(record);
 }
 
@@ -1087,7 +1409,10 @@ fn outbound_status(error: OutboundError) -> (StatusCode, bool) {
         OutboundError::DnsTimeout | OutboundError::ConnectTimeout | OutboundError::TotalTimeout => {
             (StatusCode::GATEWAY_TIMEOUT, true)
         }
-        OutboundError::RouteInvalid => (StatusCode::INTERNAL_SERVER_ERROR, true),
+        OutboundError::RouteInvalid | OutboundError::ParentInvalid => {
+            (StatusCode::INTERNAL_SERVER_ERROR, true)
+        }
+        OutboundError::ParentLoop => (StatusCode::BAD_GATEWAY, true),
         OutboundError::DnsFailed
         | OutboundError::DnsNoAddresses
         | OutboundError::DnsTooManyAddresses

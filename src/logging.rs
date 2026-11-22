@@ -81,6 +81,16 @@ pub enum Outcome {
     ShuttingDown,
 }
 
+/// Selected next-hop kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteKind {
+    /// Direct origin connection.
+    Direct,
+    /// Connection through a configured parent.
+    Parent,
+}
+
 /// Finite safe reason class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +147,12 @@ pub struct LogRecord {
     /// Configured egress ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_id: Option<String>,
+    /// Configured parent ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Selected next-hop kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteKind>,
     /// Configured matched rule ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
@@ -202,6 +218,8 @@ impl LogRecord {
             listener_id: None,
             listeners: None,
             egress_id: None,
+            parent_id: None,
+            route: None,
             rule_id: None,
             status: None,
             elapsed_ms: None,

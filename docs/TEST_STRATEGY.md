@@ -141,6 +141,20 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 
 Полный перечень содержит 18 групп. Проверить происхождение артефакта, безопасную установку, реальный systemd, смену версии A→B→A, две сети и несколько CPU. Для каждого результата фиксировать полный SHA и SHA-256 архива. Часовой сценарий должен запускаться до слияния на ветке реализации или на отдельной VM. Регрессию и отрицательные сценарии M01–M07 сохранить. [M08-r1](tasks/M08_RELEASE_CANDIDATE.md)
 
+### Контракт приёмки M09 (PARENT-01)
+
+Локальные проверки: `cargo test --locked --test config_m09` (9 тестов) и `cargo test --locked --test m09_parent` (19 тестов). Они покрывают:
+
+- старый direct-конфиг, default parent, `next_hop = "direct"`, неизвестные ID, restart/hot reload;
+- HTTP к IP-литералу в absolute-form и HTTP к домену через внешний `CONNECT <verified-ip>:<port>` с origin-form внутри туннеля;
+- клиентский CONNECT через parent, IPv6 authority, большой потоковый POST;
+- разделение client/parent/origin credentials, parent 407/не-2xx → 502, timeout → 504, отсутствие direct fallback;
+- TLS parent: пользовательский CA, DNS SAN и IP SAN, неверное имя, недоверенный CA;
+- reload routing, два Angara (Via loop), self-route, 10 HTTP + 10 CONNECT клиентов и bounded shutdown;
+- JSON `parent_id`/`route` без секретов.
+
+Реальный Squid на Ubuntu 24.04: HTTP parent, `CONNECT` к проверенному IP для доменного HTTP и клиентского CONNECT, отдельный экземпляр на своём порту, ограниченный список CONNECT-портов и проверка отказа при снятии разрешения. HTTPS-parent проверяется локальным TLS fixture: Squid как HTTPS parent не является стандартным режимом. Режимы с parent Basic auth проверены локальным контрольным parent; для реального Squid smoke использовался анонимный HTTP parent. Это ограничение фиксируется в отчёте PR, а не выдаётся за проверенное.
+
 ## 6. Как Codex принимает тесты
 
 Codex оценивает соответствие сценария требованию, проверяет отрицательные случаи и качество assertions. Независимо запускает доступные существенные проверки либо читает реальные CI logs для точного SHA; недоступный локальный runtime указывает как ограничение. Самоотчёт DeepSeek без воспроизводимых команд и результатов недостаточен.

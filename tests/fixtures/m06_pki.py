@@ -7,6 +7,7 @@ directory and is never committed.
 
 import argparse
 import datetime
+import ipaddress
 import os
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -56,7 +57,9 @@ def ca_certificate(subject, issuer, public_key, issuer_key, path_length):
     )
 
 
-def leaf_certificate(common_name, san, issuer, issuer_key, public_key, expired=False):
+def leaf_certificate(
+    common_name, san, issuer, issuer_key, public_key, expired=False, ip_sans=()
+):
     builder = (
         x509.CertificateBuilder()
         .subject_name(name(common_name))
@@ -70,7 +73,10 @@ def leaf_certificate(common_name, san, issuer, issuer_key, public_key, expired=F
             else now() + datetime.timedelta(days=2)
         )
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(value) for value in san]),
+            x509.SubjectAlternativeName(
+                [x509.DNSName(value) for value in san]
+                + [x509.IPAddress(ipaddress.ip_address(value)) for value in ip_sans]
+            ),
             critical=False,
         )
         .add_extension(
@@ -164,6 +170,21 @@ def generate(directory):
         os.path.join(directory, "proxy_chain_leaf_only.pem"),
         pem_certificate(proxy_leaf),
     )
+
+    proxy_ip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    proxy_ip_leaf = leaf_certificate(
+        "127.0.0.1",
+        [],
+        proxy_intermediate_name,
+        proxy_intermediate_key,
+        proxy_ip_key.public_key(),
+        ip_sans=["127.0.0.1"],
+    )
+    write(
+        os.path.join(directory, "proxy_ip_chain.pem"),
+        pem_certificate(proxy_ip_leaf) + pem_certificate(proxy_intermediate),
+    )
+    write(os.path.join(directory, "proxy_ip_key.pem"), pem_key(proxy_ip_key))
 
     p256_key = ec.generate_private_key(ec.SECP256R1())
     p256_leaf = leaf_certificate(

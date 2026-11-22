@@ -473,7 +473,14 @@ mod tests {
         let telemetry = Telemetry::with_detailed(false);
         let (logger, receiver) =
             Logger::channel(8, crate::config::LogLevel::Info, Arc::clone(&telemetry));
-        let mut gauge = TunnelGauge::new(Arc::clone(&telemetry), logger, 3, 7);
+        let mut gauge = TunnelGauge::new(
+            Arc::clone(&telemetry),
+            logger,
+            3,
+            7,
+            None,
+            crate::logging::RouteKind::Direct,
+        );
         assert_eq!(telemetry.snapshot().connect_active, 1);
         let end = TunnelEnd::Complete {
             drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),

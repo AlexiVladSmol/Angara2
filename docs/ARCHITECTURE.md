@@ -15,14 +15,15 @@
 | auth | Разбор proxy credentials и проверка локальных пользователей | Разрешение доступа к назначениям |
 | policy | Правила источника, пользователя, authority и конечного IP | Выполнение сетевого соединения |
 | target | Каноническое назначение, DNS, проверка IP-кандидатов | Самостоятельный обход ACL |
-| routing | Выбор egress-профиля по listener, источнику, identity и назначению | Выдача права доступа вместо ACL |
+| routing | Выбор egress-профиля и next hop (direct/parent) по listener, источнику, identity и назначению | Выдача права доступа вместо ACL |
+| parent | Определения parent, credentials и TLS-доверие к parent | Разрешение доступа к назначению вместо ACL |
 | transport | Соединение с разрешённым endpoint через выбранный egress, deadlines и отмена | Повторное разрешение имени без проверки |
 | control | Внутренние операции управления и ограниченные снимки состояния, по мере M07/M11 | Forwarding и обработка UI |
 | proxy/http | HTTP/1.1 forwarding, заголовки и потоковые тела | Хранение пользовательских паролей |
 | proxy/connect | Установка CONNECT и двусторонняя передача байтов | Расшифровка TLS сайта |
 | telemetry | Структурированные события, счётчики и длительности | Сбор содержимого трафика |
 
-Модули parent и cache обязательны в M09/M10; их подробные контракты фиксируются до реализации. До этого достаточно явных границ transport и HTTP forwarding; универсальная система плагинов не проектируется заранее.
+Parent реализован в M09; cache обязателен в M10. Универсальная система плагинов не проектируется заранее: контракт parent использует существующие config, routing, resolver, transport и HTTP forwarding.
 
 ## 2. Поток обработки
 
@@ -163,7 +164,7 @@ Bind IP задаёт адрес источника, но не гарантиру
 
 Ошибка обязательного listener прерывает запуск и закрывает уже открытые listeners. Несовместимые IPv4/IPv6 bind, отсутствующий исходящий адрес, конфликты wildcard/listener и неизвестный egress_id дают явный отказ. Проверка check остаётся без сети; фактическая возможность bind проверяется в serve. При исчезновении исходящего адреса запросы завершаются ошибкой, без неявного выхода через другой профиль.
 
-Connection pool не объединяет разные egress, parent credentials и TLS-параметры. Reload поколения не позволяет старому соединению обходить новые ACL. Будущий parent выбирается после проверки доступа и получает свой egress-профиль; TLS к parent использует тот же выбранный dial, затем проверяет сертификат по имени parent.
+Connection pool не объединяет разные egress, parent credentials и TLS-параметры. Reload поколения не позволяет старому соединению обходить новые ACL. Parent выбирается после проверки доступа и получает свой egress-профиль; TLS к parent использует тот же выбранный dial, затем проверяет сертификат по имени parent. В M09 parent-соединения не переиспользуются; direct pool сохраняет прежнее поведение.
 
 Тесты используют два локальных адреса для переносимого сценария и отдельный стенд с network namespaces/veth для подтверждения двух интерфейсов. Отсутствие прав для второго стенда отмечается как skip с причиной, не как доказанная поддержка NIC.
 
@@ -177,9 +178,17 @@ Connection pool не объединяет разные egress, parent credential
 
 Контракт управления допускает status, ограниченные metrics/events, check_config и apply_config с ожидаемым поколением, чтобы два клиента не перезаписывали изменения. Перезапуск процесса, немедленный отзыв туннелей и ротация сертификатов не становятся обещанными командами UI до реализации соответствующих операций ядра.
 
-## 12. Обязательные будущие расширения
+## 12. Parent proxy и HTTP cache
 
-Parent proxy получает собственный backend transport и отдельные credentials. Нельзя переслать клиентский Proxy-Authorization родителю как его credential. Проверка TLS parent, петли, CONNECT через parent и ошибки маршрута требуют отдельного задания.
+### Parent proxy (M09)
+
+Именованные `[[parents]]` задают `id`, `endpoint` (`host:port`, IPv6 в скобках), `transport = "http" | "https"`, необязательные `credentials_file` и `ca_file`. `routing.default_parent` и `routing.rules[].next_hop` выбирают direct или конкретный parent; `next_hop = "direct"` явно обходит default parent. Старые конфиги без parents и next_hop остаются direct.
+
+Порядок: source/auth/ACL и DNS/IP-проверки target → выбор next hop → dial. Для доменного HTTP Angara разрешает имя, применяет ACL к конечному IP и отправляет parent `CONNECT <verified-ip>:<port>`; после 2xx внутри туннеля идёт origin-form с исходным Host, path/query. Для HTTP к IP-литералу parent получает absolute-form с проверенным IP и исходным Host. Клиентский CONNECT передаёт parent числовой IP:port, а TLS сайта остаётся сквозным. Parent endpoint разрешается отдельно через существующий resolver и dial-бюджет; IP-политика target к parent не применяется, потому что parent — доверенная инфраструктура администратора.
+
+Клиентский `Proxy-Authorization` поглощается Angara. Basic parent добавляется только в запрос/внешний CONNECT к этому parent; origin его не видит. Для HTTPS проверяется имя или IP SAN; по умолчанию используется системный bundle `/etc/ssl/certs/ca-certificates.crt`, либо `ca_file`. Ошибка parent никогда не переключает запрос в direct или другой parent. Parent 407/не-2xx CONNECT → 502 без challenge/body; connect/TLS/protocol → 502; timeout до ответа клиенту → 504.
+
+Parent definitions, transport, CA и содержимое credentials применяются при restart; `routing` (default_parent/next_hop) входит в hot reload. `Via: 1.1 angara` добавляется к parent CONNECT и пересылаемым запросам; входящий Via с `angara` отклоняется. Очевидный self-route проверяется в `check` и повторно перед dial с учётом loopback/wildcard. Parent pool reuse в M09 не включён; разные parent/credentials/TLS-контексты не смешиваются.
 
 HTTP cache подключается между разрешением запроса и HTTP forward. Доступ проверяется до чтения из кэша. Политика обязана учитывать Cache-Control, Vary, freshness, validators и разделение пользователей. Первая ограниченная версия может обходить Authorization, Cookie, Range, Set-Cookie и неподдержанные Vary; это консервативное ограничение Angara, не утверждение, что RFC запрещает кэшировать их во всех случаях. CONNECT и TLS содержимого сайтов в кэш не входят. Дисковый cache, crash recovery и eviction планируются после корректного ограниченного cache.
 

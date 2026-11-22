@@ -364,7 +364,102 @@ sudo /usr/local/sbin/angaractl uninstall --confirm --purge
 Перед удалением сделайте резервную копию конфигурации и ключей. Откат
 бинарника не восстанавливает пароль, users-файл или ACL автоматически.
 
-## 9. Типичные неисправности
+## 9. Parent proxy (M09)
+
+Parent нужен, когда Angara должна выходить в сеть через другой HTTP-прокси, например Squid. Выбор задаётся в `routing`; остальные клиенты могут продолжать работать напрямую.
+
+```toml
+[[parents]]
+id = "squid"
+endpoint = "127.0.0.1:13128"     # host:port; IPv6: "[::1]:13128"
+transport = "http"                # "http" | "https"
+
+[routing]
+default_egress = "system"
+default_parent = "squid"
+
+[[routing.rules]]
+id = "direct-lab"
+egress_id = "system"
+next_hop = "direct"               # явный direct при настроенном default parent
+ports = [18080]
+```
+
+Правило выбирает один next hop: `direct` или parent. Если `next_hop` не указан, используется `default_parent`; если и его нет — direct. Ошибка parent не переключает запрос в direct и не выбирает другой parent. Parent definitions, transport, CA и credentials применяются после restart; изменения `routing` входят в hot reload (SIGHUP).
+
+### Credentials parent
+
+Пароль хранится отдельно, не в основном TOML:
+
+```toml
+# parent-credentials.toml
+version = 1
+username = "angara-parent"
+password = "replace-me"
+```
+
+```sh
+sudo chown root:angara /etc/angara/parent-credentials.toml
+sudo chmod 0600 /etc/angara/parent-credentials.toml
+```
+
+Укажите файл в parent:
+
+```toml
+[[parents]]
+id = "squid"
+endpoint = "parent.example:3128"
+transport = "https"
+credentials_file = "parent-credentials.toml"
+ca_file = "parent-ca.pem"          # необязательно; иначе системный bundle
+```
+
+Файл credentials должен принадлежать root или служебному UID и не быть доступен group/other. Для `https` проверяется DNS-имя или IP SAN. Без `ca_file` используется `/etc/ssl/certs/ca-certificates.crt` (Ubuntu). Basic поверх открытого HTTP передаёт credentials обратимо закодированными; в рабочем окружении используйте TLS.
+
+### Что видит parent
+
+- HTTP к домену: Angara разрешает имя, применяет ACL/IP-политику и отправляет parent `CONNECT <числовой-ip>:<порт>`. После 2xx внутри туннеля идёт origin-form с исходным `Host`, path/query.
+- HTTP к IP-литералу: parent получает absolute-form `http://<проверенный-ip>:<порт>/...` с исходным `Host`.
+- Клиентский CONNECT: parent получает `CONNECT <числовой-ip>:<порт>`; TLS сайта остаётся сквозным.
+
+Клиентский `Proxy-Authorization` поглощается Angara. Credentials parent добавляются только в запрос/внешний CONNECT к parent. `Via: 1.1 angara` помогает обнаружить петлю; входящий `Via` с `angara` отклоняется.
+
+### Ошибки
+
+| Ответ | Причина |
+| --- | --- |
+| 502 | parent недоступен, TLS/имя/CA не прошли, parent отверг CONNECT или вернул 407 |
+| 504 | истёк срок ожидания ответа parent до начала ответа клиенту |
+| 200/4xx | обычный HTTP-ответ parent, кроме 407, передаётся по общим правилам |
+
+### Проверка со Squid
+
+На тестовой VM можно поднять отдельный Squid на `13128`, не трогая системный `squid.service`:
+
+```sh
+http_port 127.0.0.1:13128
+acl localnet src 127.0.0.1/32
+acl SSL_ports port 80 443 18080
+acl CONNECT method CONNECT
+http_access allow CONNECT localnet SSL_ports
+http_access deny CONNECT !SSL_ports
+http_access allow localnet
+http_access deny all
+```
+
+Проверка:
+
+```sh
+angara check --config /etc/angara/angara.toml
+curl -x http://127.0.0.1:3128 http://127.0.0.1:18080/
+curl -p -x http://127.0.0.1:3128 http://127.0.0.1:18080/
+```
+
+Для домена добавьте тестовое имя в `/etc/hosts` и проверьте `curl -x ... http://origin.test:18080/`; в access log Squid должен быть `CONNECT 127.0.0.1:18080`, а не имя. Отдельно убедитесь, что CONNECT к порту вне `SSL_ports` даёт 502.
+
+Ограничения M09: parent-соединения не переиспользуются; IP-политика target не применяется к самому parent (это инфраструктура администратора); Squid как HTTPS parent не является стандартным режимом, TLS parent проверяется отдельным fixture.
+
+## 10. Типичные неисправности
 
 | Симптом | Что проверить |
 | --- | --- |

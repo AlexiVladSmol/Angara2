@@ -17,6 +17,7 @@ use tokio::sync::Semaphore;
 use crate::auth::{AuthMode, VerifiedIdentity};
 use crate::config::{Config, EgressMode};
 use crate::limits::{CapController, CapPermit};
+use crate::parent::{PreparedParent, is_self_route_addr};
 use crate::policy::{self, PolicyError, RequestMeta};
 use crate::resolver::{ResolveError, Resolver, SystemResolver};
 use crate::routing::{self, RoutingError};
@@ -81,6 +82,8 @@ impl RequestContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedEndpoint {
     endpoint: SocketAddr,
+    target_endpoint: SocketAddr,
+    parent_id: Option<String>,
     target: CanonicalTarget,
     egress_id: String,
     matched_rule_id: String,
@@ -88,9 +91,19 @@ pub struct AuthorizedEndpoint {
 }
 
 impl AuthorizedEndpoint {
-    /// Successful destination socket address.
+    /// Actual parent or direct socket address that was dialed.
     pub fn endpoint(&self) -> SocketAddr {
         self.endpoint
+    }
+
+    /// Verified destination socket address selected for this request.
+    pub fn target_endpoint(&self) -> SocketAddr {
+        self.target_endpoint
+    }
+
+    /// Selected parent ID, or `None` for direct.
+    pub fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
     }
 
     /// Original canonical target.
@@ -194,6 +207,10 @@ pub enum OutboundError {
     DestinationDenied,
     /// Configured routing is inconsistent.
     RouteInvalid,
+    /// Configured parent reference is inconsistent.
+    ParentInvalid,
+    /// A parent endpoint resolves to an own listener.
+    ParentLoop,
     /// DNS budget is exhausted.
     DnsBusy,
     /// DNS-specific timeout elapsed.
@@ -229,6 +246,8 @@ impl fmt::Display for OutboundError {
             Self::AccessDenied => "request is denied by access rules",
             Self::DestinationDenied => "destination address is denied",
             Self::RouteInvalid => "egress route is invalid",
+            Self::ParentInvalid => "parent route is invalid",
+            Self::ParentLoop => "parent route points to an own listener",
             Self::DnsBusy => "DNS budget is exhausted",
             Self::DnsTimeout => "DNS lookup timed out",
             Self::DnsFailed => "system resolver failed",
@@ -255,7 +274,10 @@ impl std::error::Error for OutboundError {}
 pub struct OutboundPlan {
     target: CanonicalTarget,
     egress: crate::config::EgressProfile,
+    parent: Option<Arc<PreparedParent>>,
     matched_rule_id: String,
+    routing_rule_id: Option<String>,
+    target_endpoints: Vec<SocketAddr>,
     endpoints: Vec<SocketAddr>,
     generation: u64,
     deadline: Instant,
@@ -270,7 +292,10 @@ impl fmt::Debug for OutboundPlan {
             .debug_struct("OutboundPlan")
             .field("target", &self.target)
             .field("egress_id", &self.egress.id())
+            .field("parent_id", &self.parent.as_ref().map(|parent| parent.id()))
             .field("matched_rule_id", &self.matched_rule_id)
+            .field("routing_rule_id", &self.routing_rule_id)
+            .field("target_endpoints", &self.target_endpoints)
             .field("endpoints", &self.endpoints)
             .field("generation", &self.generation)
             .field("listener_id", &self.listener_id)
@@ -289,12 +314,38 @@ impl OutboundPlan {
         self.egress.id()
     }
 
-    /// Matched pre-DNS rule ID.
+    /// Selected parent, or `None` for direct.
+    pub fn parent(&self) -> Option<&Arc<PreparedParent>> {
+        self.parent.as_ref()
+    }
+
+    /// Selected parent ID, or `None` for direct.
+    pub fn parent_id(&self) -> Option<&str> {
+        self.parent.as_ref().map(|parent| parent.id())
+    }
+
+    /// Matched pre-DNS access rule ID.
     pub fn matched_rule_id(&self) -> &str {
         &self.matched_rule_id
     }
 
-    /// Allowed endpoints in resolver order after IP and family checks.
+    /// Matched routing rule, when the defaults were not used.
+    pub fn routing_rule_id(&self) -> Option<&str> {
+        self.routing_rule_id.as_deref()
+    }
+
+    /// First verified destination endpoint selected for a parent request.
+    pub fn target_endpoint(&self) -> Option<SocketAddr> {
+        self.target_endpoints.first().copied()
+    }
+
+    /// All verified destination endpoints after IP and family checks.
+    pub fn target_endpoints(&self) -> &[SocketAddr] {
+        &self.target_endpoints
+    }
+
+    /// Dial endpoints: verified targets for direct, resolved parents for a
+    /// parent route.
     pub fn endpoints(&self) -> &[SocketAddr] {
         &self.endpoints
     }
@@ -512,14 +563,86 @@ impl OutboundService {
         let matched_rule = policy::check_request(config.access(), &meta).map_err(map_policy)?;
         let matched_rule_id = matched_rule.id().to_owned();
 
-        let egress = routing::select_egress(config.routing(), config.egress(), &meta)
-            .map_err(map_routing)?
-            .clone();
+        let route = routing::select_route(config, &meta).map_err(map_routing)?;
+        let egress = route.egress().clone();
+        let parent = route.parent().cloned();
+        let routing_rule_id = route.routing_rule_id().map(str::to_owned);
 
         check_deadline(deadline)?;
+        let addresses = self.resolve_host(target.host(), deadline, config).await?;
 
-        let addresses = match target.host() {
-            Host::Ip(ip) => vec![*ip],
+        let mut allowed = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Ok(address) = policy::check_ip(config.access(), address) {
+                allowed.push(address);
+            }
+        }
+        check_deadline(deadline)?;
+        if allowed.is_empty() {
+            return Err(OutboundError::DestinationDenied);
+        }
+
+        let target_port = target.port();
+        let target_endpoints = allowed
+            .into_iter()
+            .filter(|ip| egress_accepts(&egress, *ip))
+            .map(|ip| SocketAddr::new(ip, target_port))
+            .collect::<Vec<_>>();
+        check_deadline(deadline)?;
+        if target_endpoints.is_empty() {
+            return Err(OutboundError::NoCompatibleAddress);
+        }
+
+        let endpoints = if let Some(parent) = parent.as_ref() {
+            let parent_address = parent.endpoint();
+            let addresses = self
+                .resolve_host(parent_address.host(), deadline, config)
+                .await?;
+            let parent_port = parent_address.port();
+            let endpoints = addresses
+                .into_iter()
+                .filter(|ip| egress_accepts(&egress, *ip))
+                .map(|ip| SocketAddr::new(ip, parent_port))
+                .collect::<Vec<_>>();
+            check_deadline(deadline)?;
+            if endpoints.is_empty() {
+                return Err(OutboundError::NoCompatibleAddress);
+            }
+            if endpoints
+                .iter()
+                .any(|endpoint| is_self_route_addr(*endpoint, config.listeners()))
+            {
+                return Err(OutboundError::ParentLoop);
+            }
+            endpoints
+        } else {
+            target_endpoints.clone()
+        };
+
+        Ok(OutboundPlan {
+            target,
+            egress,
+            parent,
+            matched_rule_id,
+            routing_rule_id,
+            target_endpoints,
+            endpoints,
+            generation,
+            deadline,
+            listener_id: context.listener_id().to_owned(),
+            identity: identity.map(|identity| identity.username().to_owned()),
+            auth_snapshot_id: identity.map(VerifiedIdentity::snapshot_id),
+        })
+    }
+
+    async fn resolve_host(
+        &self,
+        host: &Host,
+        deadline: Instant,
+        config: &Config,
+    ) -> Result<Vec<IpAddr>, OutboundError> {
+        match host {
+            Host::Ip(ip) => Ok(vec![*ip]),
             Host::Domain(domain) => {
                 let result = self.resolver.resolve(domain.as_str(), deadline).await;
                 let addresses = match result {
@@ -534,47 +657,9 @@ impl OutboundService {
                     }
                 };
                 check_deadline(deadline)?;
-                prepare_addresses(addresses, config.dns().max_answers())?
-            }
-        };
-
-        let mut allowed = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            if let Ok(address) = policy::check_ip(config.access(), address) {
-                allowed.push(address);
+                prepare_addresses(addresses, config.dns().max_answers())
             }
         }
-        check_deadline(deadline)?;
-        if allowed.is_empty() {
-            return Err(OutboundError::DestinationDenied);
-        }
-
-        let endpoints = allowed
-            .into_iter()
-            .filter_map(|ip| {
-                let compatible = match egress.mode() {
-                    EgressMode::System => true,
-                    EgressMode::BindIp(bind_ip) => bind_ip.is_ipv4() == ip.is_ipv4(),
-                };
-                compatible.then(|| SocketAddr::new(ip, target.port()))
-            })
-            .collect::<Vec<_>>();
-        check_deadline(deadline)?;
-        if endpoints.is_empty() {
-            return Err(OutboundError::NoCompatibleAddress);
-        }
-
-        Ok(OutboundPlan {
-            target,
-            egress,
-            matched_rule_id,
-            endpoints,
-            generation,
-            deadline,
-            listener_id: context.listener_id().to_owned(),
-            identity: identity.map(|identity| identity.username().to_owned()),
-            auth_snapshot_id: identity.map(VerifiedIdentity::snapshot_id),
-        })
     }
 
     /// Opens a new checked connection for an authorized plan.
@@ -628,11 +713,18 @@ impl OutboundService {
                     self.telemetry
                         .outbound_active
                         .fetch_add(1, Ordering::AcqRel);
+                    let target_endpoint = if plan.parent.is_some() {
+                        plan.target_endpoint().unwrap_or(endpoint)
+                    } else {
+                        endpoint
+                    };
                     return Ok(Connected {
                         stream,
                         _permit: outbound_permit,
                         endpoint: AuthorizedEndpoint {
                             endpoint,
+                            target_endpoint,
+                            parent_id: plan.parent_id().map(str::to_owned),
                             target: plan.target.clone(),
                             egress_id: plan.egress_id().to_owned(),
                             matched_rule_id: plan.matched_rule_id.clone(),
@@ -679,6 +771,13 @@ fn check_deadline(deadline: Instant) -> Result<(), OutboundError> {
     }
 }
 
+fn egress_accepts(egress: &crate::config::EgressProfile, ip: IpAddr) -> bool {
+    match egress.mode() {
+        EgressMode::System => true,
+        EgressMode::BindIp(bind_ip) => bind_ip.is_ipv4() == ip.is_ipv4(),
+    }
+}
+
 fn prepare_addresses(
     addresses: Vec<IpAddr>,
     max_answers: usize,
@@ -708,8 +807,11 @@ fn map_policy(error: PolicyError) -> OutboundError {
     }
 }
 
-fn map_routing(_error: RoutingError) -> OutboundError {
-    OutboundError::RouteInvalid
+fn map_routing(error: RoutingError) -> OutboundError {
+    match error {
+        RoutingError::RouteInvalid => OutboundError::RouteInvalid,
+        RoutingError::ParentInvalid => OutboundError::ParentInvalid,
+    }
 }
 
 fn map_resolve(error: ResolveError) -> OutboundError {

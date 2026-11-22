@@ -168,3 +168,9 @@ M06 [ACCEPTED Codex](https://github.com/AlexeiSmol/Angara/pull/19#issuecomment-6
 | D59 | Тестовый стенд владельца (Ubuntu 24.04, 1 vCPU, 1 ГБ RAM) используется ревьюером для проверки скриптов на архивах из CI. Сборка на стенде не выполняется | Стенд предоставлен владельцем 19 ноября 2026 года |
 
 Доработки после слияния M08, все — только тесты и CI: #27/#28 — зеркало и таймаут `debootstrap` в boot-проверке; #29/#30 — жёсткий таймаут, размонтирование rootfs и сигналы; #31/#32 — нестабильный тест `m05_auth` (BrokenPipe); #33/#34 — таймауты `wget` для `debootstrap`; #35/#36 — сигналы во время очистки и общий helper записи stdin; #37/#38 — молчаливое падение `streaming.sh` и общий trap `ERR`. [Заключение M08](https://github.com/AlexiVladSmol/Angara/pull/25#issuecomment-7001950215)
+
+## M09 — parent proxy — 22 ноября 2026 года
+
+| ID | Решение | Основание |
+| --- | --- | --- |
+| D62 | Для M09 parent получает числовой IP, проверенный Angara (вариант 1): доменный HTTP и клиентский CONNECT используют внешний `CONNECT <verified-ip>:<port>`, HTTP к IP-литералу — absolute-form с проверенным IP. Ошибка parent не переключает запрос в direct или другой parent. Parent definitions, transport, CA и содержимое credentials применяются при restart; routing (default_parent/next_hop) входит в hot reload. Parent pool reuse в M09 не включён | Выбор владельца от 19 ноября 2026 года, зафиксирован в Issue #42 |

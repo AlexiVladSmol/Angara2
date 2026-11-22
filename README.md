@@ -22,7 +22,7 @@
 - Локальные пользователи, Basic proxy authentication, ACL по источнику, пользователю, домену, IP и порту назначения.
 - Ограничения соединений и времени ожидания, потоковая передача, журналы, systemd.
 - Несколько входных адресов и выбор исходящего адреса по правилам; сетевые профили не смешиваются при повторном использовании соединений.
-- Кэширование HTTP и parent proxy — обязательные последующие этапы M09/M10.
+- Parent proxy реализован в M09; кэширование HTTP — обязательный следующий этап M10.
 - Далее — современный TUI через общий слой управления; локальная web-панель рассматривается отдельно, ориентир 127.0.0.1:7029.
 
 HTTPS внутри CONNECT остаётся сквозным: TLS содержимого сайта завершается у клиента и сайта. TLS-вход к Angara защищает отдельно участок «клиент → прокси». Подмена сертификатов сайтов в первый выпуск не входит.
@@ -980,9 +980,34 @@ production default `2`, чтобы контролируемый поток 10/20
 меняются. На 2-vCPU runner сравниваются 1 и 2 workers; конфигурация 4 workers
 недоступна и отмечается ограничением, а не pass.
 
+## M09: parent proxy (v0.2)
+
+M09 добавляет именованные `[[parents]]` и выбор next hop в `routing`:
+
+```toml
+[[parents]]
+id = "squid"
+endpoint = "127.0.0.1:13128"
+transport = "http"               # "http" | "https"
+credentials_file = "parent-credentials.toml"  # optional
+ca_file = "parent-ca.pem"        # optional, https only
+
+[routing]
+default_egress = "system"
+default_parent = "squid"
+
+[[routing.rules]]
+id = "direct-lab"
+egress_id = "system"
+next_hop = "direct"
+ports = [18080]
+```
+
+Angara проверяет target ACL/DNS/IP до выбора parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
+
 ## Текущее состояние
 
-M00–M08 приняты и слиты. Кандидат v0.1 принят на `515365a` с архивом B
+M00–M08 приняты и слиты. M09 (parent proxy) реализован и передан на ревью; слияние и выпуск v0.2 остаются решениями владельца. Кандидат v0.1 принят на `515365a` с архивом B
 SHA-256 `e6fba6415f5d143d79d9c202a88a7c64abd9fe698ef186c672492bea1ed2dc8c`; полный
 прогон CI вместе с часовым soak — [run 44315861684](https://github.com/AlexiVladSmol/Angara/actions/runs/44315861684).
 M08 слит через PR #25 (`b1e82ef`). После слияния доработаны только тесты и CI
