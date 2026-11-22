@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 use crate::auth::{AuthMode, VerifiedIdentity};
 use crate::config::{Config, EgressMode};
 use crate::limits::{CapController, CapPermit};
-use crate::parent::{PreparedParent, is_self_route_addr};
+use crate::parent::{PreparedParent, is_self_route_addr_runtime};
 use crate::policy::{self, PolicyError, RequestMeta};
 use crate::resolver::{ResolveError, Resolver, SystemResolver};
 use crate::routing::{self, RoutingError};
@@ -610,7 +610,7 @@ impl OutboundService {
             }
             if endpoints
                 .iter()
-                .any(|endpoint| is_self_route_addr(*endpoint, config.listeners()))
+                .any(|endpoint| is_self_route_addr_runtime(*endpoint, config.listeners()))
             {
                 return Err(OutboundError::ParentLoop);
             }

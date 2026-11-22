@@ -353,6 +353,36 @@ pub(crate) fn is_self_route_addr(address: SocketAddr, listeners: &[Listener]) ->
     })
 }
 
+/// Runtime check that also covers a wildcard listener on a local interface IP.
+///
+/// This is deliberately separate from the offline `check` path: a safe UDP
+/// connect probe observes the selected local address without sending traffic.
+pub(crate) fn is_self_route_addr_runtime(address: SocketAddr, listeners: &[Listener]) -> bool {
+    is_self_route_addr(address, listeners)
+        || listeners.iter().any(|listener| {
+            listener.bind().port() == address.port()
+                && listener.bind().ip().is_unspecified()
+                && is_local_ip(address.ip())
+        })
+}
+
+fn is_local_ip(ip: IpAddr) -> bool {
+    let bind = match ip {
+        IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        IpAddr::V6(_) => SocketAddr::from(([0_u16; 8], 0)),
+    };
+    let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+        return false;
+    };
+    if socket.connect(SocketAddr::new(ip, 9)).is_err() {
+        return false;
+    }
+    socket
+        .local_addr()
+        .map(|local| local.ip() == ip)
+        .unwrap_or(false)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCredentials {
