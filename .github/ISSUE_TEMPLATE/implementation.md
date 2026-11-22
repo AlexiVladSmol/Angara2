@@ -8,7 +8,8 @@ title: "[Mxx] "
 
 Статус: PROPOSED / BLOCKED / READY / IMPLEMENTING / REVIEW / ACCEPTED / DONE.
 Исполнитель: DeepSeek V4.1 Flash 1017.
-Проектирование и ревью: Codex.
+Проектирование и постановка: ChatGPT Astra 6.2.
+Код-ревью: Claude Opus 5.5.
 Согласование спорных решений: владелец проекта.
 
 ## Цель и поведение
