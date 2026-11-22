@@ -369,6 +369,10 @@ sudo /usr/local/sbin/angaractl uninstall --confirm --purge
 Parent нужен, когда Angara должна выходить в сеть через другой HTTP-прокси, например Squid. Выбор задаётся в `routing`; остальные клиенты могут продолжать работать напрямую.
 
 ```toml
+[runtime]
+worker_threads = "auto"
+instance_id = "edge-a"            # уникален для цепочки Angara
+
 [[parents]]
 id = "squid"
 endpoint = "127.0.0.1:13128"     # host:port; IPv6: "[::1]:13128"
@@ -387,6 +391,8 @@ ports = [18080]
 
 Правило выбирает один next hop: `direct` или parent. Если `next_hop` не указан, используется `default_parent`; если и его нет — direct. Ошибка parent не переключает запрос в direct и не выбирает другой parent. Parent definitions, transport, CA и credentials применяются после restart; изменения `routing` входят в hot reload (SIGHUP).
 
+`runtime.instance_id` добавляется в `Via` как `1.1 angara-<id>`. У каждого экземпляра в цепочке Angara должен быть свой `instance_id`; по умолчанию используется `<hostname>-<port>`. Angara отклоняет запрос только при возврате собственного идентификатора и продолжает чужую цепочку. Прокси, которые вырезают `Via`, ослабляют эту защиту; это документированное ограничение.
+
 ### Credentials parent
 
 Пароль хранится отдельно, не в основном TOML:
@@ -399,8 +405,8 @@ password = "replace-me"
 ```
 
 ```sh
-sudo chown root:angara /etc/angara/parent-credentials.toml
-sudo chmod 0600 /etc/angara/parent-credentials.toml
+sudo install -m 0640 -o root -g angara \
+  parent-credentials.toml /etc/angara/parent-credentials.toml
 ```
 
 Укажите файл в parent:
@@ -414,7 +420,7 @@ credentials_file = "parent-credentials.toml"
 ca_file = "parent-ca.pem"          # необязательно; иначе системный bundle
 ```
 
-Файл credentials должен принадлежать root или служебному UID и не быть доступен group/other. Для `https` проверяется DNS-имя или IP SAN. Без `ca_file` используется `/etc/ssl/certs/ca-certificates.crt` (Ubuntu). Basic поверх открытого HTTP передаёт credentials обратимо закодированными; в рабочем окружении используйте TLS.
+Файл credentials должен принадлежать root или служебному UID и не быть доступен на запись group/other; режим `0640 root:angara` разрешает чтение службе и соответствует рецепту выше. Для `https` проверяется DNS-имя или IP SAN. Без `ca_file` используется `/etc/ssl/certs/ca-certificates.crt` (Ubuntu). Basic поверх открытого HTTP передаёт credentials обратимо закодированными; в рабочем окружении используйте TLS.
 
 ### Что видит parent
 

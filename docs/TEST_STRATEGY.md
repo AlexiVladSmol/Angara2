@@ -143,15 +143,21 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 
 ### Контракт приёмки M09 (PARENT-01)
 
-Локальные проверки: `cargo test --locked --test config_m09` (10 тестов) и `cargo test --locked --test m09_parent` (19 тестов). Они покрывают:
+Локальные проверки: `cargo test --locked --test config_m09` (11 тестов) и `cargo test --locked --test m09_parent` (26 тестов).
 
-- старый direct-конфиг, default parent, `next_hop = "direct"`, неизвестные ID, restart/hot reload;
-- HTTP к IP-литералу в absolute-form и HTTP к домену через внешний `CONNECT <verified-ip>:<port>` с origin-form внутри туннеля;
-- клиентский CONNECT через parent, IPv6 authority, большой потоковый POST;
-- разделение client/parent/origin credentials, parent 407/не-2xx → 502, timeout → 504, отсутствие direct fallback;
-- TLS parent: пользовательский CA, DNS SAN и IP SAN, неверное имя, недоверенный CA;
-- reload routing, два Angara (Via loop), self-route, 10 HTTP + 10 CONNECT клиентов и bounded shutdown;
-- JSON `parent_id`/`route` без секретов.
+| Строка PARENT-01 | Тесты |
+| --- | --- |
+| Старый конфиг, выбор по правилам, default и явный direct | `m09_cfg01`, `m09_cfg02`, `m09_parent07`, `m09_parent13`, `m09_parent22` |
+| HTTP и HTTPS до parent; HTTP к имени/IP, клиентский CONNECT, path/query, Host, IPv6, большой POST | `m09_parent01`, `m09_parent02`, `m09_parent03`, `m09_parent08`, `m09_parent09`, `m09_parent12`, `m09_parent15` |
+| Разделение секретов | `m09_parent04`, `m09_parent14`, `m09_parent23` |
+| Клиентские отказы и DNS | `m09_parent20` (IP deny, нулевые счётчики), `m09_parent21` (ACL deny, нулевые счётчики), `m09_parent02` (parent получает числовой IP) |
+| HTTP к имени через туннель | `m09_parent02`, `m09_parent05`, `m09_parent11` |
+| TLS и отказы parent | `m09_parent05`, `m09_parent06`, `m09_parent08`, `m09_parent10`, `m09_parent11`, `m09_parent19`, `m09_parent25` (обрыв без replay POST) |
+| Сетевой интерфейс и поколения | `m09_parent13`, `m09_parent23` (два parent/credentials), `m09_parent24` (bind_ip source + IPv6 target) |
+| Петли и ресурсы | `m09_parent16a` (A→B без петли, оба Via), `m09_parent16b` (петля, счётчик на вернувшемся A), `m09_parent17` (10 HTTP + 10 CONNECT), `m09_parent18` (tunnel log) |
+| Совместимость со Squid | реальный Squid smoke на Ubuntu 24.04; см. отчёт PR |
+
+Дополнительно: `m09_cfg11` проверяет `runtime.instance_id` и стабильный default; `m09_cfg03`/`m09_cfg04` — неизвестные/зарезервированные ID; `m09_cfg07` — режимы credentials 0600/0640/0644; `m09_cfg10` — непригодный parent IP.
 
 Реальный Squid на Ubuntu 24.04: HTTP parent, `CONNECT` к проверенному IP для доменного HTTP и клиентского CONNECT, отдельный экземпляр на своём порту, ограниченный список CONNECT-портов и проверка отказа при снятии разрешения. HTTPS-parent проверяется локальным TLS fixture: Squid как HTTPS parent не является стандартным режимом. Режимы с parent Basic auth проверены локальным контрольным parent; для реального Squid smoke использовался анонимный HTTP parent. Это ограничение фиксируется в отчёте PR, а не выдаётся за проверенное.
 

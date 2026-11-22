@@ -51,7 +51,7 @@ fn m04_spike_connect_upgrade_preserves_early_and_origin_first_bytes() {
                 Arc::clone(&tunnel),
             );
             let idle_state = io.idle_state();
-            let (_hub, interim_rx) = InterimHub::new();
+            let (_hub, interim_rx) = InterimHub::new("test".to_owned());
             let writer = writer_loop(
                 write_half,
                 bridge_reader,

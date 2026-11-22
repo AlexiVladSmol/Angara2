@@ -307,6 +307,11 @@ impl Config {
         &self.runtime
     }
 
+    /// Stable instance suffix used in `Via`.
+    pub fn instance_id(&self) -> &str {
+        self.runtime.instance_id()
+    }
+
     /// Resource limits shared by listeners.
     pub fn limits(&self) -> &Limits {
         &self.limits
@@ -543,12 +548,18 @@ impl fmt::Debug for AuthConfig {
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     worker_threads: WorkerThreads,
+    instance_id: String,
 }
 
 impl RuntimeConfig {
     /// Configured worker-thread policy.
     pub fn worker_threads(&self) -> WorkerThreads {
         self.worker_threads
+    }
+
+    /// Stable instance suffix used in the `Via` pseudonym.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 }
 
@@ -1446,6 +1457,13 @@ fn validate_with(
     let operations = validate_operations(raw.operations)?;
     let observability = validate_observability(raw.observability)?;
     let (listeners, prepared_tls) = validate_listeners(raw.listeners, base_dir, previous)?;
+    let instance_id = match &raw.runtime.instance_id {
+        Some(value) => {
+            validate_policy_id(value, "runtime.instance_id")?;
+            value.clone()
+        }
+        None => default_instance_id(&listeners),
+    };
     let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
     let auth = validate_auth(raw.auth, base_dir)?;
     for (index, listener) in listeners.iter().enumerate() {
@@ -1484,6 +1502,7 @@ fn validate_with(
         schema_version: SCHEMA_VERSION,
         runtime: RuntimeConfig {
             worker_threads: raw.runtime.worker_threads,
+            instance_id,
         },
         limits,
         listeners,
@@ -2147,6 +2166,33 @@ fn validate_connect(raw: Option<RawConnect>) -> Result<ConnectConfig, ConfigErro
     })
 }
 
+fn default_instance_id(listeners: &[Listener]) -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok());
+    let host = host.as_deref().unwrap_or("local").trim();
+    let mut sanitized = String::new();
+    for character in host.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            sanitized.push(character);
+        }
+        if sanitized.len() >= 32 {
+            break;
+        }
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("local");
+    }
+    let port = listeners
+        .first()
+        .map(|listener| listener.bind().port())
+        .unwrap_or(0);
+    let mut id = format!("{sanitized}-{port}");
+    id.truncate(MAX_ID_BYTES);
+    id
+}
+
 fn validate_parents(
     raw: Option<Vec<RawParent>>,
     base_dir: Option<&Path>,
@@ -2758,6 +2804,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawRuntime {
     worker_threads: WorkerThreads,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -783,7 +783,7 @@ async fn serve_client<S>(
         Arc::clone(&output),
         Arc::clone(&tunnel_mode),
     );
-    let (hub, interim_receiver) = InterimHub::new();
+    let (hub, interim_receiver) = InterimHub::new(config.instance_id().to_owned());
     let connection_id = proxy.next_connection_id();
     let client = ClientInfo {
         peer: peer.ip(),

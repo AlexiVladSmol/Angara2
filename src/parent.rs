@@ -518,10 +518,10 @@ fn read_bounded(
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if metadata.mode() & 0o077 != 0 {
+            if metadata.mode() & 0o027 != 0 {
                 return Err(ParentPrepError::new(
                     field,
-                    "credentials file must not be accessible by group or others",
+                    "credentials file must not be writable by group or accessible by others",
                 ));
             }
             #[cfg(target_os = "linux")]

@@ -64,6 +64,8 @@ pub enum ParentMode {
     RejectConnect(FixedResponse),
     /// Wait before processing the request.
     Delay(Duration),
+    /// Close the connection after recording a non-CONNECT request.
+    Abort,
 }
 
 /// One request observed by the stand.
@@ -310,6 +312,9 @@ async fn handle(
 
     if let ParentMode::Delay(delay) = mode_value {
         tokio::time::sleep(delay).await;
+    }
+    if matches!(mode_value, ParentMode::Abort) {
+        return Err(io::Error::other("synthetic parent abort").into());
     }
     if let ParentMode::Fixed(response) = mode_value {
         return fixed_response(response);

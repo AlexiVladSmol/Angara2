@@ -218,6 +218,10 @@ credentials_file = "{}"
         matches!(error, ConfigError::Validation { ref path, .. } if path == "parents[0].credentials_file")
     );
 
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o640))
+        .expect("set group-readable mode");
+    Config::parse(&text).expect("root:angara 0640 credentials");
+
     fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).expect("set private mode");
     Config::parse(&text).expect("private credentials");
 
@@ -296,6 +300,37 @@ default_parent = "squid"
     );
     let error = Config::load_for_reload(&config_path, &initial).expect_err("changed parent");
     assert!(matches!(error, ConfigError::RestartRequired { ref path, .. } if path == "parents"));
+}
+
+#[test]
+fn m09_cfg11_instance_id_is_explicit_or_stably_defaulted() {
+    let text = base("127.0.0.1:3128").replace(
+        "[runtime]\nworker_threads = 2",
+        "[runtime]\nworker_threads = 2\ninstance_id = \"edge-a\"",
+    );
+    let config = Config::parse(&text).expect("explicit instance id");
+    assert_eq!(config.instance_id(), "edge-a");
+    assert_eq!(config.runtime().instance_id(), "edge-a");
+
+    let invalid = base("127.0.0.1:3128").replace(
+        "[runtime]\nworker_threads = 2",
+        "[runtime]\nworker_threads = 2\ninstance_id = \"bad/id\"",
+    );
+    let error = Config::parse(&invalid).expect_err("invalid instance id");
+    assert!(
+        matches!(error, ConfigError::Validation { ref path, .. } if path == "runtime.instance_id")
+    );
+
+    let first = Config::parse(&base("127.0.0.1:3128"))
+        .expect("default instance id")
+        .instance_id()
+        .to_owned();
+    let second = Config::parse(&base("127.0.0.1:3128"))
+        .expect("default instance id")
+        .instance_id()
+        .to_owned();
+    assert!(!first.is_empty());
+    assert_eq!(first, second);
 }
 
 #[test]

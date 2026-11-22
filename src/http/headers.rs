@@ -148,13 +148,18 @@ pub fn filter_trailers(headers: &mut HeaderMap, nominated: &[HeaderName]) -> Res
     Ok(())
 }
 
-/// Adds `Via: 1.1 angara` while preserving previous values.
-pub fn append_via(headers: &mut HeaderMap) {
-    headers.append(VIA, HeaderValue::from_static("1.1 angara"));
+/// Adds the instance-specific `Via: 1.1 angara-<id>` while preserving values.
+pub fn append_via(headers: &mut HeaderMap, instance_id: &str) {
+    let value = format!("1.1 angara-{instance_id}");
+    headers.append(
+        VIA,
+        HeaderValue::from_str(&value).expect("validated instance id"),
+    );
 }
 
-/// Detects Angara's own received-by token in the input Via chain.
-pub fn via_has_angara(headers: &HeaderMap) -> bool {
+/// Detects this instance's own received-by token in the input Via chain.
+pub fn via_has_angara(headers: &HeaderMap, instance_id: &str) -> bool {
+    let own = format!("angara-{instance_id}");
     for value in headers.get_all(VIA) {
         let Ok(value) = value.to_str() else {
             continue;
@@ -164,7 +169,7 @@ pub fn via_has_angara(headers: &HeaderMap) -> bool {
             let _protocol = parts.next();
             if let Some(received_by) = parts.next() {
                 let host = received_by.split(':').next().unwrap_or(received_by);
-                if host.eq_ignore_ascii_case("angara") {
+                if host.eq_ignore_ascii_case(&own) {
                     return true;
                 }
             }

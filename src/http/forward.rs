@@ -98,6 +98,7 @@ fn finalize_upstream_response(
     lease: Lease,
     method: &Method,
     request_chunked: bool,
+    instance_id: &str,
 ) -> Result<Response<ResponseBody>, ()> {
     if response.status() == StatusCode::SWITCHING_PROTOCOLS || response.status().is_informational()
     {
@@ -126,7 +127,7 @@ fn finalize_upstream_response(
             }
         };
     let response_trailer_nominated = response_nominations.contains(&http::header::TRAILER);
-    headers::append_via(&mut response_headers);
+    headers::append_via(&mut response_headers, instance_id);
     if request_chunked {
         // Hyper normalizes CL+TE to TE before the service runs. M03 keeps the
         // conservative safe outcome: a chunked request closes the client
@@ -564,7 +565,10 @@ impl Proxy {
         if headers::has_upgrade(request.headers()) {
             return Err(error(StatusCode::BAD_REQUEST));
         }
-        if headers::via_has_angara(request.headers()) {
+        if headers::via_has_angara(request.headers(), config.instance_id()) {
+            self.telemetry
+                .via_loop_rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Err(error(StatusCode::LOOP_DETECTED));
         }
         if headers::validate_framing(request.headers()).is_err() {
@@ -683,6 +687,7 @@ impl Proxy {
                 io,
                 parent,
                 target_endpoint,
+                config.instance_id(),
                 config.http().response_header_timeout(),
                 deadline,
             )
@@ -872,7 +877,10 @@ impl Proxy {
         if headers::has_upgrade(request.headers()) {
             return headers::error_response(StatusCode::NOT_IMPLEMENTED, true);
         }
-        if headers::via_has_angara(request.headers()) {
+        if headers::via_has_angara(request.headers(), config.instance_id()) {
+            self.telemetry
+                .via_loop_rejected
+                .fetch_add(1, Ordering::Relaxed);
             return headers::error_response(StatusCode::LOOP_DETECTED, true);
         }
 
@@ -968,7 +976,7 @@ impl Proxy {
         if let Some(value) = max_forwards {
             headers::set_max_forwards(&mut request_headers, value - 1);
         }
-        headers::append_via(&mut request_headers);
+        headers::append_via(&mut request_headers, config.instance_id());
 
         let plan = match self
             .outbound
@@ -1073,7 +1081,13 @@ impl Proxy {
                     lease.abort();
                     return headers::error_response(StatusCode::BAD_GATEWAY, true);
                 }
-                match finalize_upstream_response(response, lease, &method, request_chunked) {
+                match finalize_upstream_response(
+                    response,
+                    lease,
+                    &method,
+                    request_chunked,
+                    config.instance_id(),
+                ) {
                     Ok(response) => response,
                     Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),
                 }
@@ -1119,6 +1133,7 @@ impl Proxy {
                 io,
                 &parent,
                 target_endpoint,
+                config.instance_id(),
                 response_timeout,
                 deadline,
             )
@@ -1218,6 +1233,7 @@ impl Proxy {
                     lease,
                     &parts.method,
                     parts.request_chunked,
+                    config.instance_id(),
                 ) {
                     Ok(response) => response,
                     Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),

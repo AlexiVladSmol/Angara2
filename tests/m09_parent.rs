@@ -59,6 +59,13 @@ default_egress = "system"
     text
 }
 
+fn with_instance(text: String, instance_id: &str) -> String {
+    text.replace(
+        "[runtime]\nworker_threads = 2",
+        &format!("[runtime]\nworker_threads = 2\ninstance_id = \"{instance_id}\""),
+    )
+}
+
 async fn start_with_resolver(
     text: &str,
     answers: Vec<IpAddr>,
@@ -578,7 +585,75 @@ async fn m09_parent18_tunnel_log_has_parent_route() {
 }
 
 #[tokio::test]
-async fn m09_parent16_two_angara_loop_is_rejected_by_via() {
+async fn m09_parent16a_two_angara_without_loop_forward_successfully() {
+    let dir = TempDir::new("m09-chain-ok");
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"chain-ok"))
+        .await
+        .expect("origin");
+    let port_a = m03::free_port();
+    let mut port_b = m03::free_port();
+    while port_b == port_a {
+        port_b = m03::free_port();
+    }
+
+    let config_b = with_instance(m03::config(&format!("127.0.0.1:{port_b}")), "b");
+    let path_b = dir.write("proxy-b.toml", &config_b);
+    let server_b =
+        HttpServer::bind_with_path(Arc::new(Config::load(&path_b).expect("B config")), path_b)
+            .await
+            .expect("bind B");
+
+    let config_a = with_instance(
+        {
+            let mut text = m03::config(&format!("127.0.0.1:{port_a}"));
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "b"
+endpoint = "127.0.0.1:{port_b}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "b"
+"#
+            ));
+            text
+        },
+        "a",
+    );
+    let path_a = dir.write("proxy-a.toml", &config_a);
+    let server_a =
+        HttpServer::bind_with_path(Arc::new(Config::load(&path_a).expect("A config")), path_a)
+            .await
+            .expect("bind A");
+
+    let response = get(
+        SocketAddr::from(([127, 0, 0, 1], port_a)),
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 200);
+    let requests = origin.requests.lock().expect("origin requests").clone();
+    assert_eq!(requests.len(), 1);
+    let via = requests[0]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("via"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(via.contains("angara-a"), "via: {via}");
+    assert!(via.contains("angara-b"), "via: {via}");
+    drop(requests);
+
+    server_a.shutdown().await;
+    server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent16b_two_angara_loop_is_rejected_on_returning_instance() {
     let dir = TempDir::new("m09-loop");
     let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"loop-must-not-reach"))
         .await
@@ -589,10 +664,11 @@ async fn m09_parent16_two_angara_loop_is_rejected_by_via() {
         port_b = m03::free_port();
     }
 
-    let config_b = {
-        let mut text = m03::config(&format!("127.0.0.1:{port_b}"));
-        text.push_str(&format!(
-            r#"
+    let config_b = with_instance(
+        {
+            let mut text = m03::config(&format!("127.0.0.1:{port_b}"));
+            text.push_str(&format!(
+                r#"
 [[parents]]
 id = "a"
 endpoint = "127.0.0.1:{port_a}"
@@ -602,19 +678,22 @@ transport = "http"
 default_egress = "system"
 default_parent = "a"
 "#
-        ));
-        text
-    };
+            ));
+            text
+        },
+        "b",
+    );
     let path_b = dir.write("proxy-b.toml", &config_b);
     let server_b =
         HttpServer::bind_with_path(Arc::new(Config::load(&path_b).expect("B config")), path_b)
             .await
             .expect("bind B");
 
-    let config_a = {
-        let mut text = m03::config(&format!("127.0.0.1:{port_a}"));
-        text.push_str(&format!(
-            r#"
+    let config_a = with_instance(
+        {
+            let mut text = m03::config(&format!("127.0.0.1:{port_a}"));
+            text.push_str(&format!(
+                r#"
 [[parents]]
 id = "b"
 endpoint = "127.0.0.1:{port_b}"
@@ -624,9 +703,11 @@ transport = "http"
 default_egress = "system"
 default_parent = "b"
 "#
-        ));
-        text
-    };
+            ));
+            text
+        },
+        "a",
+    );
     let path_a = dir.write("proxy-a.toml", &config_a);
     let server_a =
         HttpServer::bind_with_path(Arc::new(Config::load(&path_a).expect("A config")), path_a)
@@ -641,6 +722,20 @@ default_parent = "b"
     .await;
     assert_eq!(response.head.status, 508);
     assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        server_a
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        server_b
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 
     server_a.shutdown().await;
     server_b.shutdown().await;
@@ -812,6 +907,256 @@ default_parent = "parent"
     assert!(!serialized.contains("parent-secret"));
     assert!(!serialized.contains("client-secret"));
     assert!(!serialized.contains("Basic "));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent20_ip_denied_before_parent_dial() {
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"must-not-reach"))
+        .await
+        .expect("origin");
+    let parent = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent");
+    let text = config_with_parent(Some(parent.address), Some("parent"), "", &[]);
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+
+    let response = get(proxy, "http://192.0.2.1/", "192.0.2.1").await;
+    assert_eq!(response.head.status, 403);
+    assert_eq!(parent.request_count(), 0);
+    assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent21_client_acl_deny_has_zero_parent_and_origin_counters() {
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"must-not-reach"))
+        .await
+        .expect("origin");
+    let parent = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent");
+    let text = config_with_parent(Some(parent.address), Some("parent"), "", &[]).replace(
+        "[[access.rules]]\nid = \"allow\"\naction = \"allow\"",
+        "[[access.rules]]\nid = \"deny\"\naction = \"deny\"",
+    );
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+
+    let response = get(
+        proxy,
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 403);
+    assert_eq!(parent.request_count(), 0);
+    assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent22_two_listeners_select_different_next_hops_at_runtime() {
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"listeners-ok"))
+        .await
+        .expect("origin");
+    let parent = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent");
+    let text = m03::config("127.0.0.1:3128")
+        .replace(
+            "[[listeners]]\nid = \"proxy\"\nbind = \"127.0.0.1:3128\"\ntransport = \"http\"",
+            "[[listeners]]\nid = \"via-parent\"\nbind = \"127.0.0.1:3128\"\ntransport = \"http\"\n\n[[listeners]]\nid = \"direct\"\nbind = \"127.0.0.1:3129\"\ntransport = \"http\"",
+        )
+        .replace(
+            "[routing]\ndefault_egress = \"system\"",
+            &format!(
+                "[[parents]]\nid = \"parent\"\nendpoint = \"{}\"\ntransport = \"http\"\n\n[routing]\ndefault_egress = \"system\"\ndefault_parent = \"parent\"\n\n[[routing.rules]]\nid = \"direct-listener\"\negress_id = \"system\"\nnext_hop = \"direct\"\nlisteners = [\"direct\"]",
+                parent.address
+            ),
+        );
+    // The base helper has no routing table; append it for this test.
+    let text = if text.contains("[routing]") {
+        text
+    } else {
+        format!(
+            "{text}\n[[parents]]\nid = \"parent\"\nendpoint = \"{}\"\ntransport = \"http\"\n\n[routing]\ndefault_egress = \"system\"\ndefault_parent = \"parent\"\n\n[[routing.rules]]\nid = \"direct-listener\"\negress_id = \"system\"\nnext_hop = \"direct\"\nlisteners = [\"direct\"]\n",
+            parent.address
+        )
+    };
+    let config = Arc::new(Config::parse(&text).expect("two-listener config"));
+    let server = HttpServer::bind_ephemeral(config)
+        .await
+        .expect("bind proxy");
+    let addresses = server
+        .addresses()
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let via_parent = addresses["via-parent"];
+    let direct = addresses["direct"];
+
+    let response = get(
+        via_parent,
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(parent.request_count(), 1);
+    let response = get(
+        direct,
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(parent.request_count(), 1);
+    let requests = origin.requests.lock().expect("origin requests").clone();
+    assert_eq!(requests.len(), 2);
+    drop(requests);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent23_two_parents_keep_credentials_separate() {
+    let dir = TempDir::new("m09-two-parents");
+    let creds_a = dir.write(
+        "parent-a.toml",
+        "version = 1\nusername = \"a-user\"\npassword = \"a-secret\"\n",
+    );
+    let creds_b = dir.write(
+        "parent-b.toml",
+        "version = 1\nusername = \"b-user\"\npassword = \"b-secret\"\n",
+    );
+    for path in [&creds_a, &creds_b] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+            .expect("credentials mode");
+    }
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"two-parents"))
+        .await
+        .expect("origin");
+    let parent_a = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent A");
+    let parent_b = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent B");
+    let text = m03::config("127.0.0.1:3128")
+        .replace(
+            "[[listeners]]\nid = \"proxy\"\nbind = \"127.0.0.1:3128\"\ntransport = \"http\"",
+            "[[listeners]]\nid = \"listener-a\"\nbind = \"127.0.0.1:3128\"\ntransport = \"http\"\n\n[[listeners]]\nid = \"listener-b\"\nbind = \"127.0.0.1:3129\"\ntransport = \"http\"",
+        );
+    let text = format!(
+        "{text}\n[[parents]]\nid = \"a\"\nendpoint = \"{}\"\ntransport = \"http\"\ncredentials_file = \"{}\"\n\n[[parents]]\nid = \"b\"\nendpoint = \"{}\"\ntransport = \"http\"\ncredentials_file = \"{}\"\n\n[routing]\ndefault_egress = \"system\"\ndefault_parent = \"a\"\n\n[[routing.rules]]\nid = \"via-b\"\negress_id = \"system\"\nnext_hop = \"b\"\nlisteners = [\"listener-b\"]\n",
+        parent_a.address,
+        creds_a.display(),
+        parent_b.address,
+        creds_b.display()
+    );
+    let config = Arc::new(Config::parse(&text).expect("two-parent config"));
+    let server = HttpServer::bind_ephemeral(config)
+        .await
+        .expect("bind proxy");
+    let addresses = server
+        .addresses()
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let response = get(
+        addresses["listener-a"],
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 200);
+    let response = get(
+        addresses["listener-b"],
+        &format!("http://{}/", origin.address),
+        &origin.address.to_string(),
+    )
+    .await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(
+        parent_a.requests()[0].proxy_authorization.as_deref(),
+        Some("Basic YS11c2VyOmEtc2VjcmV0")
+    );
+    assert_eq!(
+        parent_b.requests()[0].proxy_authorization.as_deref(),
+        Some("Basic Yi11c2VyOmItc2VjcmV0")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent24_egress_source_ip_reaches_parent_and_ipv6_target() {
+    let origin = m04::spawn_echo_origin_at("[::1]:0".parse().expect("IPv6 loopback"), None)
+        .await
+        .expect("IPv6 echo origin");
+    let parent = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent");
+    let text = config_with_parent(
+        Some(parent.address),
+        Some("parent"),
+        "",
+        &[origin.address.port()],
+    )
+    .replace(
+        "[routing]\ndefault_egress = \"system\"",
+        "[[egress]]\nid = \"v4-source\"\nmode = \"bind_ip\"\nbind_ip = \"127.0.0.2\"\n\n[routing]\ndefault_egress = \"v4-source\"",
+    )
+    .replace(
+        "networks = [\"127.0.0.0/8\"]",
+        "networks = [\"127.0.0.0/8\", \"::1/128\"]",
+    );
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+
+    let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+    let authority = format!("[::1]:{}", origin.address.port());
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(client.read_head().await.expect("CONNECT head").status, 200);
+    client.send(b"s").await.expect("send tunnel byte");
+    assert_eq!(client.read_exact_bytes(1).await.expect("read byte"), b"s");
+    let requests = parent.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].peer.ip(),
+        std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent25_parent_abort_does_not_replay_post() {
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"must-not-reach"))
+        .await
+        .expect("origin");
+    let parent = m09::spawn_parent(ParentMode::Abort).await.expect("parent");
+    let text = config_with_parent(Some(parent.address), Some("parent"), "", &[]);
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+
+    let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+    let body = b"partially-sent-body";
+    let request = format!(
+        "POST http://{}/upload HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
+        origin.address,
+        origin.address,
+        body.len()
+    );
+    client.send(request.as_bytes()).await.expect("send head");
+    client.send(body).await.expect("send body");
+    let response = client.read_response().await.expect("read response");
+    assert_eq!(response.head.status, 502);
+    assert_eq!(parent.request_count(), 1);
+    assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     server.shutdown().await;
 }

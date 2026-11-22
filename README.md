@@ -985,6 +985,10 @@ production default `2`, чтобы контролируемый поток 10/20
 M09 добавляет именованные `[[parents]]` и выбор next hop в `routing`:
 
 ```toml
+[runtime]
+worker_threads = "auto"
+instance_id = "edge-a"           # optional; unique in an Angara chain
+
 [[parents]]
 id = "squid"
 endpoint = "127.0.0.1:13128"
@@ -1003,7 +1007,9 @@ next_hop = "direct"
 ports = [18080]
 ```
 
-Angara проверяет target ACL/DNS/IP до подключения к parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
+Angara проверяет target ACL/DNS/IP до подключения к parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются.
+
+`runtime.instance_id` задаёт стабильный суффикс `Via`: запрос содержит `1.1 angara-<id>`, а отклоняется только возврат *собственного* идентификатора. По умолчанию используется `<hostname>-<port>`; для цепочки Angara задайте разные `instance_id` явно. Прокси, которые вырезают `Via`, ограничивают эту защиту. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
 
 ## Текущее состояние
 

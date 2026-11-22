@@ -35,10 +35,15 @@ fn connect_config_tuned(ports: &[u16], idle_ms: u64, half_close_ms: u64) -> Stri
         .join(", ");
     format!(
         "{}\n[connect]\nallowed_ports = [{ports}]\nhalf_close_timeout_ms = {half_close_ms}\n",
-        config("127.0.0.1:3128").replace(
-            "idle_timeout_ms = 5000",
-            &format!("idle_timeout_ms = {idle_ms}")
-        )
+        config("127.0.0.1:3128")
+            .replace(
+                "[runtime]\nworker_threads = 2",
+                "[runtime]\nworker_threads = 2\ninstance_id = \"test\"",
+            )
+            .replace(
+                "idle_timeout_ms = 5000",
+                &format!("idle_timeout_ms = {idle_ms}"),
+            )
     )
 }
 
@@ -175,7 +180,7 @@ fn m04_con02_invalid_connect_is_rejected_without_dial() {
                 vec![400],
             ),
             (
-                format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\nVia: 1.1 angara\r\n\r\n").into_bytes(),
+                format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\nVia: 1.1 angara-test\r\n\r\n").into_bytes(),
                 vec![508],
             ),
             (

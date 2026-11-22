@@ -5,6 +5,8 @@ schema_version = 1
 
 [runtime]
 worker_threads = "auto"
+# Уникальный суффикс Via для цепочки Angara; по умолчанию hostname-port.
+instance_id = "edge-a"
 
 [limits]
 max_connections = 256

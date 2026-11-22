@@ -93,6 +93,7 @@ pub(crate) async fn open_tunnel(
     io: BoxedIo,
     parent: &PreparedParent,
     target: SocketAddr,
+    instance_id: &str,
     response_timeout: Duration,
     deadline: Instant,
 ) -> Result<BoxedIo, ParentError> {
@@ -119,9 +120,11 @@ pub(crate) async fn open_tunnel(
             .headers_mut()
             .insert(PROXY_AUTHORIZATION, authorization);
     }
-    request
-        .headers_mut()
-        .append(VIA, http::HeaderValue::from_static("1.1 angara"));
+    let via = format!("1.1 angara-{instance_id}");
+    request.headers_mut().append(
+        VIA,
+        http::HeaderValue::from_str(&via).expect("validated instance id"),
+    );
 
     let now = Instant::now();
     let remaining = deadline

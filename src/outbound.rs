@@ -583,11 +583,13 @@ impl OutboundService {
         }
 
         let target_port = target.port();
-        let target_endpoints = allowed
+        let mut target_endpoints = allowed
             .into_iter()
-            .filter(|ip| egress_accepts(&egress, *ip))
             .map(|ip| SocketAddr::new(ip, target_port))
             .collect::<Vec<_>>();
+        if parent.is_none() {
+            target_endpoints.retain(|endpoint| egress_accepts(&egress, endpoint.ip()));
+        }
         check_deadline(deadline)?;
         if target_endpoints.is_empty() {
             return Err(OutboundError::NoCompatibleAddress);
