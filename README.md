@@ -1003,7 +1003,7 @@ next_hop = "direct"
 ports = [18080]
 ```
 
-Angara проверяет target ACL/DNS/IP до выбора parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
+Angara проверяет target ACL/DNS/IP до подключения к parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
 
 ## Текущее состояние
 

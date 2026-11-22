@@ -143,7 +143,7 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 
 ### Контракт приёмки M09 (PARENT-01)
 
-Локальные проверки: `cargo test --locked --test config_m09` (9 тестов) и `cargo test --locked --test m09_parent` (19 тестов). Они покрывают:
+Локальные проверки: `cargo test --locked --test config_m09` (10 тестов) и `cargo test --locked --test m09_parent` (19 тестов). Они покрывают:
 
 - старый direct-конфиг, default parent, `next_hop = "direct"`, неизвестные ID, restart/hot reload;
 - HTTP к IP-литералу в absolute-form и HTTP к домену через внешний `CONNECT <verified-ip>:<port>` с origin-form внутри туннеля;

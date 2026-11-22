@@ -70,8 +70,21 @@ impl ParentEndpoint {
     pub(crate) fn parse(value: &str) -> Result<Self, ParentPrepError> {
         let target = CanonicalTarget::parse(&http::Method::CONNECT, value)
             .map_err(|_| ParentPrepError::new("endpoint", "must be host:port"))?;
+        let host = target.host().clone();
+        if let Host::Ip(ip) = &host {
+            let invalid = match *ip {
+                IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast(),
+                IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+            };
+            if invalid {
+                return Err(ParentPrepError::new(
+                    "endpoint",
+                    "parent endpoint must be a specific unicast address",
+                ));
+            }
+        }
         Ok(Self {
-            host: target.host().clone(),
+            host,
             port: target.port(),
         })
     }

@@ -299,6 +299,24 @@ default_parent = "squid"
 }
 
 #[test]
+fn m09_cfg10_unspecified_parent_address_is_rejected() {
+    let text = with_parent(
+        "127.0.0.1:3128",
+        r#"
+[[parents]]
+id = "squid"
+endpoint = "0.0.0.0:13128"
+transport = "http"
+"#,
+        "",
+    );
+    let error = Config::parse(&text).expect_err("unspecified parent");
+    assert!(
+        matches!(error, ConfigError::Validation { ref path, .. } if path == "parents[0].endpoint")
+    );
+}
+
+#[test]
 fn m09_cfg09_invalid_endpoint_and_transport_are_rejected() {
     let bad_endpoint = with_parent(
         "127.0.0.1:3128",
