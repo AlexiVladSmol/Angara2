@@ -697,6 +697,7 @@ jobs:
           default_parent = "synthetic"
           EOF
           chmod 0644 "$TMP/proxy.toml"
+          sudo chown root:root "$TMP/proxy.toml"
           sudo -u angara "$M08_BIN" check --config "$TMP/proxy.toml"
 
   functional:
