@@ -203,6 +203,14 @@ pub enum TlsParentClose {
     AfterClientEofWithoutCloseNotify,
     /// Drop the TLS stream immediately after the 200 response.
     AbortAfterConnect,
+    /// Send `tls_parent_payload(len)` right after the 200 response, then drop
+    /// the TLS stream without close_notify before the client ends its side.
+    SendThenDropWithoutCloseNotify(usize),
+}
+
+/// Deterministic payload sent by `TlsParentClose::SendThenDropWithoutCloseNotify`.
+pub fn tls_parent_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
 }
 
 /// One-shot TLS parent used to exercise missing close_notify handling.
@@ -258,6 +266,13 @@ pub async fn spawn_one_shot_tls_parent(
                     }
                 }
                 let _ = tls.write_all(b"parent-payload").await;
+                drop(tls);
+            }
+            TlsParentClose::SendThenDropWithoutCloseNotify(len) => {
+                let payload = tls_parent_payload(len);
+                if tls.write_all(&payload).await.is_ok() {
+                    let _ = tls.flush().await;
+                }
                 drop(tls);
             }
         }

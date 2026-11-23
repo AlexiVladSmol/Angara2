@@ -38,6 +38,10 @@ pub(crate) struct TunnelGauge {
     parent_id: Option<String>,
     route: RouteKind,
     progress: Option<Arc<TunnelProgress>>,
+    /// The relay already ended with an I/O failure; dropping the gauge before
+    /// `finish` (a forced shutdown during the final writer drain) records that
+    /// failure instead of a cancellation.
+    io_failed: bool,
     finished: bool,
 }
 
@@ -59,12 +63,19 @@ impl TunnelGauge {
             parent_id,
             route,
             progress: None,
+            io_failed: false,
             finished: false,
         }
     }
 
     pub(crate) fn attach_progress(&mut self, progress: Arc<TunnelProgress>) {
         self.progress = Some(progress);
+    }
+
+    /// Records that the relay already ended with `TunnelEnd::Io`, before any
+    /// further await that may be cancelled.
+    pub(crate) fn record_io_failure(&mut self) {
+        self.io_failed = true;
     }
 
     pub(crate) fn finish(&mut self, end: &TunnelEnd) {
@@ -124,7 +135,12 @@ impl TunnelGauge {
 impl Drop for TunnelGauge {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish(&TunnelEnd::Cancelled);
+            let end = if self.io_failed {
+                TunnelEnd::Io
+            } else {
+                TunnelEnd::Cancelled
+            };
+            self.finish(&end);
         }
     }
 }

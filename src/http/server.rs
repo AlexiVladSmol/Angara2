@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, Transport};
-use crate::http::connect::{TunnelEnd, TunnelProgress, TunnelSetup};
+use crate::http::connect::{TunnelEnd, TunnelGauge, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, ExchangeMeta, Proxy};
 use crate::http::headers;
 use crate::http::idle::IdleState;
@@ -399,29 +399,72 @@ impl Drop for HttpServer {
 /// Completes the final bridge/socket writer after the relay has ended. A relay
 /// `Complete` is only successful when that writer also drains within the
 /// existing first-EOF deadline.
+///
+/// A relay `Io` failure still drains the writer, bounded by
+/// `half_close_timeout` from now: bytes the relay already handed to the bridge
+/// were received from the origin/parent and belong to the client. The end
+/// stays `Io` whether or not that drain succeeds.
 async fn finalize_tunnel<W>(
     mut end: TunnelEnd,
     writer: &mut W,
     writer_done: bool,
     idle_timeout: Duration,
+    half_close_timeout: Duration,
 ) -> (TunnelEnd, bool)
 where
     W: Future<Output = std::io::Result<()>> + Unpin,
 {
-    if let TunnelEnd::Complete { drain_deadline } = &end
-        && !writer_done
-    {
-        let drain = match drain_deadline {
-            Some(deadline) => tokio::time::timeout_at(*deadline, writer).await,
-            None => tokio::time::timeout(idle_timeout, writer).await,
-        };
-        match drain {
-            Ok(Ok(())) => return (end, true),
-            Ok(Err(_)) => end = TunnelEnd::Io,
-            Err(_) => end = TunnelEnd::HalfCloseTimeout,
+    if writer_done {
+        return (end, writer_done);
+    }
+    match &end {
+        TunnelEnd::Complete { drain_deadline } => {
+            let drain = match drain_deadline {
+                Some(deadline) => tokio::time::timeout_at(*deadline, writer).await,
+                None => tokio::time::timeout(idle_timeout, writer).await,
+            };
+            match drain {
+                Ok(Ok(())) => return (end, true),
+                Ok(Err(_)) => end = TunnelEnd::Io,
+                Err(_) => end = TunnelEnd::HalfCloseTimeout,
+            }
         }
+        TunnelEnd::Io => {
+            if let Ok(Ok(())) = tokio::time::timeout(half_close_timeout, writer).await {
+                return (end, true);
+            }
+        }
+        TunnelEnd::Idle | TunnelEnd::HalfCloseTimeout | TunnelEnd::Cancelled => {}
     }
     (end, writer_done)
+}
+
+/// Drains the final writer and records the tunnel end exactly once. A relay
+/// `Io` is recorded in the gauge before the drain, so a forced shutdown that
+/// aborts the drain still reports the I/O failure rather than a cancellation.
+/// A forced shutdown before any I/O failure is known stays a cancellation.
+async fn complete_tunnel<W>(
+    mut gauge: TunnelGauge,
+    relay_end: TunnelEnd,
+    writer: &mut W,
+    writer_done: bool,
+    idle_timeout: Duration,
+    half_close_timeout: Duration,
+) where
+    W: Future<Output = std::io::Result<()>> + Unpin,
+{
+    if matches!(relay_end, TunnelEnd::Io) {
+        gauge.record_io_failure();
+    }
+    let (final_end, _) = finalize_tunnel(
+        relay_end,
+        writer,
+        writer_done,
+        idle_timeout,
+        half_close_timeout,
+    )
+    .await;
+    gauge.finish(&final_end);
 }
 
 #[cfg(test)]
@@ -434,8 +477,14 @@ mod tests {
             drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
         };
         let mut writer = std::future::pending::<std::io::Result<()>>();
-        let (final_end, done) =
-            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        let (final_end, done) = finalize_tunnel(
+            end,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
         assert!(!done);
     }
@@ -446,8 +495,14 @@ mod tests {
             drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
         };
         let mut writer = Box::pin(async { Ok(()) });
-        let (final_end, done) =
-            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        let (final_end, done) = finalize_tunnel(
+            end,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(final_end, TunnelEnd::Complete { .. }));
         assert!(done);
     }
@@ -458,10 +513,216 @@ mod tests {
             drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(1)),
         };
         let mut writer = Box::pin(async { Err(std::io::Error::other("synthetic writer failure")) });
-        let (final_end, done) =
-            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        let (final_end, done) = finalize_tunnel(
+            end,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(final_end, TunnelEnd::Io));
         assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_io_drains_pending_writer_and_stays_io() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&drained);
+        let mut writer = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::Release);
+            Ok(())
+        });
+        let (final_end, done) = finalize_tunnel(
+            TunnelEnd::Io,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(done);
+        assert!(drained.load(Ordering::Acquire), "writer was not drained");
+    }
+
+    #[tokio::test]
+    async fn relay_io_writer_drain_is_bounded_by_half_close_timeout() {
+        const HALF_CLOSE: Duration = Duration::from_millis(1000);
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let started = tokio::time::Instant::now();
+        let mut finalize = Box::pin(finalize_tunnel(
+            TunnelEnd::Io,
+            &mut writer,
+            false,
+            Duration::from_secs(30),
+            HALF_CLOSE,
+        ));
+        // Well before the deadline the drain is still waiting on the writer.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut finalize)
+                .await
+                .is_err(),
+            "drain gave up on a pending writer before the deadline"
+        );
+        // The upper bound is enforced while waiting, so a drain that never ends
+        // fails here instead of hanging the test run.
+        let (final_end, done) = tokio::time::timeout_at(started + Duration::from_secs(5), finalize)
+            .await
+            .expect("drain overran the 5 s bound");
+        let elapsed = started.elapsed();
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(!done);
+        assert!(elapsed >= HALF_CLOSE, "drain ended early: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn relay_io_writer_failure_stays_io() {
+        let mut writer = Box::pin(async { Err(std::io::Error::other("synthetic writer failure")) });
+        let (final_end, done) = finalize_tunnel(
+            TunnelEnd::Io,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(!done);
+    }
+
+    #[tokio::test]
+    async fn relay_io_after_writer_error_does_not_wait() {
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            finalize_tunnel(
+                TunnelEnd::Io,
+                &mut writer,
+                true,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        let (final_end, done) = result.expect("finalize waited on a finished writer");
+        assert!(matches!(final_end, TunnelEnd::Io));
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn relay_cancelled_does_not_drain_writer() {
+        let mut writer = std::future::pending::<std::io::Result<()>>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            finalize_tunnel(
+                TunnelEnd::Cancelled,
+                &mut writer,
+                false,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        let (final_end, done) = result.expect("cancelled relay waited on the writer");
+        assert!(matches!(final_end, TunnelEnd::Cancelled));
+        assert!(!done);
+    }
+
+    /// Writer that reports its first poll and then never completes.
+    struct SignalPending(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Future for SignalPending {
+        type Output = std::io::Result<()>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(polled) = self.0.take() {
+                let _ = polled.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Runs `complete_tunnel` with a writer stuck in Pending, aborts it once
+    /// the writer was polled, and returns the telemetry and the log records.
+    async fn abort_during_drain(
+        relay_end: TunnelEnd,
+    ) -> (crate::telemetry::MetricsSnapshot, Vec<serde_json::Value>) {
+        use crate::logging::Logger;
+        use crate::telemetry::Telemetry;
+
+        let telemetry = Telemetry::with_detailed(false);
+        let (logger, receiver) =
+            Logger::channel(8, crate::config::LogLevel::Info, Arc::clone(&telemetry));
+        let gauge = TunnelGauge::new(
+            Arc::clone(&telemetry),
+            logger,
+            3,
+            7,
+            None,
+            crate::logging::RouteKind::Direct,
+        );
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut writer = SignalPending(Some(polled_tx));
+            complete_tunnel(
+                gauge,
+                relay_end,
+                &mut writer,
+                false,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), polled_rx)
+            .await
+            .expect("writer was polled")
+            .expect("writer signal");
+        assert_eq!(telemetry.snapshot().connect_active, 1);
+        task.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("abort stops the drain immediately");
+        assert!(joined.expect_err("task was aborted").is_cancelled());
+        let mut records = Vec::new();
+        while let Ok(record) = receiver.recv_timeout(Duration::from_millis(200)) {
+            records.push(serde_json::from_str(&record).expect("JSON"));
+        }
+        (telemetry.snapshot(), records)
+    }
+
+    #[tokio::test]
+    async fn relay_io_abort_during_drain_records_io_failure() {
+        let (metrics, records) = abort_during_drain(TunnelEnd::Io).await;
+        assert_eq!(metrics.connect_active, 0);
+        assert_eq!(metrics.connect_finished, 1);
+        assert_eq!(metrics.connect_error, 1);
+        assert_eq!(metrics.connect_cancelled, 0);
+        assert_eq!(records.len(), 1, "records: {records:?}");
+        assert_eq!(records[0]["event"], "tunnel_finished");
+        assert_eq!(records[0]["outcome"], "failed");
+        assert_eq!(records[0]["reason"], "error");
+    }
+
+    #[tokio::test]
+    async fn relay_abort_before_io_is_known_stays_cancelled() {
+        let end = TunnelEnd::Complete {
+            drain_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+        };
+        let (metrics, records) = abort_during_drain(end).await;
+        assert_eq!(metrics.connect_active, 0);
+        assert_eq!(metrics.connect_finished, 1);
+        assert_eq!(metrics.connect_error, 0);
+        assert_eq!(metrics.connect_cancelled, 1);
+        assert_eq!(records.len(), 1, "records: {records:?}");
+        assert_eq!(records[0]["event"], "tunnel_finished");
+        assert_eq!(records[0]["outcome"], "cancelled");
+        assert_eq!(records[0]["reason"], "shutdown");
     }
 
     #[tokio::test]
@@ -486,8 +747,14 @@ mod tests {
             drain_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
         };
         let mut writer = std::future::pending::<std::io::Result<()>>();
-        let (final_end, done) =
-            finalize_tunnel(end, &mut writer, false, Duration::from_secs(1)).await;
+        let (final_end, done) = finalize_tunnel(
+            end,
+            &mut writer,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(final_end, TunnelEnd::HalfCloseTimeout));
         assert!(!done);
         assert_eq!(telemetry.snapshot().connect_active, 1);
@@ -980,11 +1247,15 @@ async fn serve_client<S>(
                         None if writer_error => TunnelEnd::Io,
                         None => TunnelEnd::Cancelled,
                     };
-                    let (final_end, _) =
-                        finalize_tunnel(relay_end, &mut writer, writer_done, idle_timeout)
-                            .await;
-                    gauge.finish(&final_end);
-                    drop(gauge);
+                    complete_tunnel(
+                        gauge,
+                        relay_end,
+                        &mut writer,
+                        writer_done,
+                        idle_timeout,
+                        half_close_timeout,
+                    )
+                    .await;
                     drop(writer);
                     output.close();
                     return;
