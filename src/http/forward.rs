@@ -67,6 +67,7 @@ struct ForwardParts {
     target_text: String,
     body: Incoming,
     headers: http::HeaderMap,
+    via: Vec<http::HeaderValue>,
     nominations: Vec<http::header::HeaderName>,
     request_chunked: bool,
     request_had_content_length: bool,
@@ -683,11 +684,13 @@ impl Proxy {
                     return Err(headers::error_response(error.status(), true));
                 }
             };
+            let incoming_via = headers::via_chain(request.headers());
             match parent_client::open_tunnel(
                 io,
                 parent,
                 target_endpoint,
                 config.instance_id(),
+                &incoming_via,
                 config.http().response_header_timeout(),
                 deadline,
             )
@@ -939,6 +942,7 @@ impl Proxy {
             None => RequestContext::new(client.peer, client.listener_id.clone()),
         };
         let original_request_headers = request.headers().clone();
+        let incoming_via = headers::via_chain(&original_request_headers);
         if max_forwards == Some(0) {
             let has_body = request_chunked
                 || request
@@ -1012,6 +1016,7 @@ impl Proxy {
                         target_text: target_text.clone(),
                         body: request.into_body(),
                         headers: request_headers,
+                        via: incoming_via,
                         nominations: request_nominations,
                         request_chunked,
                         request_had_content_length,
@@ -1134,6 +1139,7 @@ impl Proxy {
                 &parent,
                 target_endpoint,
                 config.instance_id(),
+                &parts.via,
                 response_timeout,
                 deadline,
             )

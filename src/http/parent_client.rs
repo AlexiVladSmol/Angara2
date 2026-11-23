@@ -89,11 +89,17 @@ pub(crate) async fn connect_io(
 }
 
 /// Sends one CONNECT to the parent and returns the upgraded origin stream.
+///
+/// `incoming_via` is the chain received from the client or the request being
+/// forwarded. It is preserved in order and this instance's token is appended
+/// last, so a parent running Angara can reject the returning identifier before
+/// another dial.
 pub(crate) async fn open_tunnel(
     io: BoxedIo,
     parent: &PreparedParent,
     target: SocketAddr,
     instance_id: &str,
+    incoming_via: &[http::HeaderValue],
     response_timeout: Duration,
     deadline: Instant,
 ) -> Result<BoxedIo, ParentError> {
@@ -119,6 +125,9 @@ pub(crate) async fn open_tunnel(
         request
             .headers_mut()
             .insert(PROXY_AUTHORIZATION, authorization);
+    }
+    for value in incoming_via {
+        request.headers_mut().append(VIA, value.clone());
     }
     let via = format!("1.1 angara-{instance_id}");
     request.headers_mut().append(

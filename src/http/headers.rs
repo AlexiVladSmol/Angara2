@@ -157,6 +157,11 @@ pub fn append_via(headers: &mut HeaderMap, instance_id: &str) {
     );
 }
 
+/// Clones the incoming `Via` chain for an outbound parent CONNECT.
+pub fn via_chain(headers: &HeaderMap) -> Vec<HeaderValue> {
+    headers.get_all(VIA).iter().cloned().collect()
+}
+
 /// Detects this instance's own received-by token in the input Via chain.
 pub fn via_has_angara(headers: &HeaderMap, instance_id: &str) -> bool {
     let own = format!("angara-{instance_id}");

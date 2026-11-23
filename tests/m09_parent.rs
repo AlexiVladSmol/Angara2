@@ -741,6 +741,408 @@ default_parent = "b"
     server_b.shutdown().await;
 }
 
+struct LoopPair {
+    server_a: HttpServer,
+    proxy_a: SocketAddr,
+    server_b: HttpServer,
+}
+
+/// Starts A and B pointing at each other. A is ephemeral and resolves
+/// `origin.test` to loopback; B binds the pre-selected port referenced by A.
+async fn start_loop_pair(dir: &TempDir, allowed_port: u16) -> LoopPair {
+    let port_b = m03::free_port();
+    let config_a = with_instance(
+        {
+            let mut text = m03::config("127.0.0.1:3128");
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "b"
+endpoint = "127.0.0.1:{port_b}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "b"
+
+[connect]
+allowed_ports = [{allowed_port}]
+"#
+            ));
+            text
+        },
+        "edge-a",
+    );
+    let resolver = Arc::new(ScriptedResolver::new(vec![Ok(vec![IpAddr::V4(
+        Ipv4Addr::LOCALHOST,
+    )])]));
+    let (server_a, proxy_a) = start_with_scripted(&config_a, resolver).await;
+
+    let config_b = with_instance(
+        {
+            let mut text = m03::config(&format!("127.0.0.1:{port_b}"));
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "a"
+endpoint = "{proxy_a}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "a"
+
+[connect]
+allowed_ports = [{allowed_port}]
+"#
+            ));
+            text
+        },
+        "edge-b",
+    );
+    let path_b = dir.write("proxy-b.toml", &config_b);
+    let server_b =
+        HttpServer::bind_with_path(Arc::new(Config::load(&path_b).expect("B config")), path_b)
+            .await
+            .expect("bind B");
+    LoopPair {
+        server_a,
+        proxy_a,
+        server_b,
+    }
+}
+
+struct ChainPair {
+    server_a: HttpServer,
+    proxy_a: SocketAddr,
+    server_b: HttpServer,
+}
+
+/// Starts B forwarding to a control parent, then A forwarding to B.
+async fn start_chain(dir: &TempDir, control: &m09::ParentStand, allowed_port: u16) -> ChainPair {
+    let port_b = m03::free_port();
+    let config_b = with_instance(
+        {
+            let mut text = m03::config(&format!("127.0.0.1:{port_b}"));
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "control"
+endpoint = "{}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "control"
+
+[connect]
+allowed_ports = [443, {allowed_port}]
+"#,
+                control.address
+            ));
+            text
+        },
+        "edge-b",
+    );
+    let path_b = dir.write("chain-b.toml", &config_b);
+    let server_b =
+        HttpServer::bind_with_path(Arc::new(Config::load(&path_b).expect("B config")), path_b)
+            .await
+            .expect("bind B");
+
+    let config_a = with_instance(
+        {
+            let mut text = m03::config("127.0.0.1:3128");
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "b"
+endpoint = "127.0.0.1:{port_b}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "b"
+
+[connect]
+allowed_ports = [{allowed_port}]
+"#
+            ));
+            text
+        },
+        "edge-a",
+    );
+    let resolver = Arc::new(ScriptedResolver::new(vec![Ok(vec![IpAddr::V4(
+        Ipv4Addr::LOCALHOST,
+    )])]));
+    let (server_a, proxy_a) = start_with_scripted(&config_a, resolver).await;
+    ChainPair {
+        server_a,
+        proxy_a,
+        server_b,
+    }
+}
+
+async fn connect_from(source: Ipv4Addr, address: SocketAddr) -> RawClient {
+    let socket = tokio::net::TcpSocket::new_v4().expect("source socket");
+    socket
+        .bind(SocketAddr::new(IpAddr::V4(source), 0))
+        .expect("bind source address");
+    let stream = socket.connect(address).await.expect("connect source");
+    RawClient::from_stream(stream)
+}
+
+#[tokio::test]
+async fn m09_parent16c_two_angara_connect_loop_is_rejected() {
+    let dir = TempDir::new("m09-connect-loop");
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let pair = start_loop_pair(&dir, echo.address.port()).await;
+
+    let mut client = RawClient::connect(pair.proxy_a).await.expect("connect A");
+    let authority = echo.address.to_string();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    let head = client.read_head().await.expect("head");
+    assert_eq!(head.status, 502);
+    assert_eq!(echo.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        pair.server_a
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        pair.server_b
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        pair.server_a
+            .telemetry()
+            .http_started
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        pair.server_b
+            .telemetry()
+            .http_started
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    drop(client);
+    pair.server_a.shutdown().await;
+    pair.server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent16d_two_angara_domain_loop_is_rejected() {
+    let dir = TempDir::new("m09-domain-loop");
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"loop-must-not-reach"))
+        .await
+        .expect("origin");
+    let pair = start_loop_pair(&dir, origin.address.port()).await;
+    let host = format!("origin.test:{}", origin.address.port());
+
+    let response = get(pair.proxy_a, &format!("http://{host}/loop"), &host).await;
+    assert_eq!(response.head.status, 502);
+    assert_eq!(origin.accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        pair.server_a
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        pair.server_b
+            .telemetry()
+            .via_loop_rejected
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        pair.server_a
+            .telemetry()
+            .http_started
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        pair.server_b
+            .telemetry()
+            .http_started
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    pair.server_a.shutdown().await;
+    pair.server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent16e_two_angara_chain_preserves_connect_via() {
+    let dir = TempDir::new("m09-chain-connect");
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let control = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("control parent");
+    let chain = start_chain(&dir, &control, echo.address.port()).await;
+
+    let mut client = RawClient::connect(chain.proxy_a).await.expect("connect A");
+    let authority = echo.address.to_string();
+    let request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nVia: 1.1 client-proxy\r\n\r\n"
+    );
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(client.read_head().await.expect("head").status, 200);
+    client.send(b"x").await.expect("send byte");
+    assert_eq!(client.read_exact_bytes(1).await.expect("read byte"), b"x");
+    drop(client);
+
+    let recorded = control.requests();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].method, "CONNECT");
+    assert_eq!(
+        recorded[0].via,
+        vec!["1.1 client-proxy", "1.1 angara-edge-a", "1.1 angara-edge-b"]
+    );
+
+    chain.server_a.shutdown().await;
+    chain.server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent16f_two_angara_chain_preserves_domain_http_via() {
+    let dir = TempDir::new("m09-chain-domain");
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"chain-domain-ok"))
+        .await
+        .expect("origin");
+    let control = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("control parent");
+    let chain = start_chain(&dir, &control, origin.address.port()).await;
+    let host = format!("origin.test:{}", origin.address.port());
+
+    let response = get(chain.proxy_a, &format!("http://{host}/chain"), &host).await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.text(), "chain-domain-ok");
+
+    let recorded = control.requests();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].method, "CONNECT");
+    assert_eq!(
+        recorded[0].via,
+        vec!["1.1 angara-edge-a", "1.1 angara-edge-b"]
+    );
+    let origin_requests = origin.requests.lock().expect("origin requests").clone();
+    assert_eq!(origin_requests.len(), 1);
+    assert_eq!(origin_requests[0].target, "/chain");
+    drop(origin_requests);
+
+    chain.server_a.shutdown().await;
+    chain.server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent27_angara_parent_http_port_acl_recipe() {
+    let dir = TempDir::new("m09-parent-http-acl");
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"acl-recipe-ok"))
+        .await
+        .expect("origin");
+    let port_b = m03::free_port();
+    let origin_port = origin.address.port();
+
+    let config_b = m03::config(&format!("127.0.0.1:{port_b}")).replace(
+        "[[access.rules]]\nid = \"allow\"\naction = \"allow\"\n",
+        &format!(
+            r#"[[access.rules]]
+id = "connect-http-only-from-angara-a"
+action = "allow"
+sources = ["127.0.0.1/32"]
+methods = ["CONNECT"]
+ports = [{origin_port}]
+
+[[access.rules]]
+id = "connect-http-deny-others"
+action = "deny"
+methods = ["CONNECT"]
+ports = [{origin_port}]
+
+[[access.rules]]
+id = "allow"
+action = "allow"
+"#
+        ),
+    ) + &format!("\n[connect]\nallowed_ports = [443, {origin_port}]\n");
+    let path_b = dir.write("parent-b.toml", &config_b);
+    let server_b =
+        HttpServer::bind_with_path(Arc::new(Config::load(&path_b).expect("B config")), path_b)
+            .await
+            .expect("bind B");
+
+    let config_a = with_instance(
+        {
+            let mut text = m03::config("127.0.0.1:3128");
+            text.push_str(&format!(
+                r#"
+[[parents]]
+id = "b"
+endpoint = "127.0.0.1:{port_b}"
+transport = "http"
+
+[routing]
+default_egress = "system"
+default_parent = "b"
+"#
+            ));
+            text
+        },
+        "edge-a",
+    );
+    let resolver = Arc::new(ScriptedResolver::new(vec![Ok(vec![IpAddr::V4(
+        Ipv4Addr::LOCALHOST,
+    )])]));
+    let (server_a, proxy_a) = start_with_scripted(&config_a, resolver).await;
+    let host = format!("origin.test:{origin_port}");
+
+    let response = get(proxy_a, &format!("http://{host}/via-a"), &host).await;
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.text(), "acl-recipe-ok");
+
+    let other_source = Ipv4Addr::new(127, 0, 0, 2);
+    let mut denied = connect_from(other_source, SocketAddr::from(([127, 0, 0, 1], port_b))).await;
+    let authority = origin.address.to_string();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    denied.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(denied.read_head().await.expect("head").status, 403);
+    drop(denied);
+
+    let mut direct = connect_from(other_source, SocketAddr::from(([127, 0, 0, 1], port_b))).await;
+    let request = format!(
+        "GET http://{}/direct HTTP/1.1\r\nHost: {}\r\n\r\n",
+        origin.address, origin.address
+    );
+    direct.send(request.as_bytes()).await.expect("send GET");
+    let response = direct.read_response().await.expect("read response");
+    assert_eq!(response.head.status, 200);
+    assert_eq!(response.text(), "acl-recipe-ok");
+    drop(direct);
+
+    let origin_requests = origin.requests.lock().expect("origin requests").clone();
+    assert_eq!(origin_requests.len(), 2);
+    assert_eq!(origin_requests[0].target, "/via-a");
+    assert_eq!(origin_requests[1].target, "/direct");
+    drop(origin_requests);
+
+    server_a.shutdown().await;
+    server_b.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m09_parent17_concurrent_http_and_connect_then_shutdown() {
     let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"concurrent-ok"))
