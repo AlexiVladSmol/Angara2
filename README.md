@@ -1010,7 +1010,7 @@ ports = [18080]
 
 Angara проверяет target ACL/DNS/IP до подключения к parent. Доменный HTTP и клиентский CONNECT уходят родителю как `CONNECT <проверенный-ip>:<порт>`; HTTP к IP-литералу — в absolute-form. Ошибка parent не даёт fallback в direct, parent 407/не-2xx CONNECT преобразуется в 502, timeout — в 504. Parent definitions/credentials/CA требуют restart; `routing` перезагружается атомарно. Parent-соединения в M09 не переиспользуются.
 
-`runtime.instance_id` задаёт стабильный суффикс `Via`: запрос содержит `1.1 angara-<id>`, а отклоняется только возврат *собственного* идентификатора. По умолчанию используется `<hostname>-<port>`; для цепочки Angara задайте разные `instance_id` явно. Прокси, которые вырезают `Via`, ограничивают эту защиту. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
+`runtime.instance_id` задаёт стабильный суффикс `Via`: HTTP-запрос и внешний CONNECT содержат полученную цепочку и `1.1 angara-<id>` последним, а отклоняется только возврат *собственного* идентификатора. По умолчанию используется `<hostname>-<port>`; для цепочки Angara задайте разные `instance_id` явно. Прокси, которые вырезают `Via`, ограничивают эту защиту. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
 
 ## Текущее состояние
 
