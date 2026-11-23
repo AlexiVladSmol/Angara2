@@ -246,12 +246,26 @@ pub(crate) struct ConnectTerminal {
     telemetry: Arc<Telemetry>,
     logger: Logger,
     meta: ExchangeMeta,
+    parent_failure: bool,
     disarmed: bool,
 }
 
 impl ConnectTerminal {
     pub(crate) fn disarm(&mut self) {
         self.disarmed = true;
+    }
+
+    /// Records the selected parent route before a parent dial/handshake.
+    pub(crate) fn set_parent_route(&mut self, plan: &OutboundPlan) {
+        if plan.parent().is_none() {
+            return;
+        }
+        set_route(&self.meta.route, plan);
+    }
+
+    /// Parent failures use the same terminal reason as HTTP-to-name exchanges.
+    pub(crate) fn mark_parent_failure(&mut self) {
+        self.parent_failure = true;
     }
 
     pub(crate) fn reject(&mut self, status: StatusCode) {
@@ -264,13 +278,18 @@ impl ConnectTerminal {
         self.telemetry
             .connect_rejected
             .fetch_add(1, Ordering::Relaxed);
+        let reason = if self.parent_failure {
+            Reason::Error
+        } else {
+            Reason::Rejected
+        };
         log_terminal_with_reason(
             &self.telemetry,
             &self.logger,
             &self.meta,
             crate::http::BodyOutcome::Failed,
             0,
-            Some(Reason::Rejected),
+            Some(reason),
         );
     }
 }
@@ -548,6 +567,7 @@ impl Proxy {
         client: ClientInfo,
         on_upgrade: OnUpgrade,
         snapshot: &Arc<crate::snapshot::RuntimeSnapshot>,
+        terminal: &mut ConnectTerminal,
     ) -> Result<(Response<ResponseBody>, TunnelSetup), Response<ResponseBody>> {
         let error = |status: StatusCode| headers::error_response(status, true);
         if self.is_draining() {
@@ -652,6 +672,10 @@ impl Proxy {
                 return Err(headers::error_response(status, close));
             }
         };
+        if plan.parent().is_some() {
+            terminal.set_parent_route(&plan);
+            terminal.mark_parent_failure();
+        }
         let connected = match self.outbound.open_plan_with(config, &plan).await {
             Ok(origin) => origin,
             Err(outbound_error) => {
@@ -666,6 +690,9 @@ impl Proxy {
         } else {
             RouteKind::Direct
         };
+        let origin_tls = plan
+            .parent()
+            .is_some_and(|parent| parent.transport() == crate::parent::ParentTransport::Https);
         let origin: BoxedIo = if let Some(parent) = plan.parent() {
             let Some(target_endpoint) = plan.target_endpoint() else {
                 return Err(headers::error_response(StatusCode::BAD_GATEWAY, true));
@@ -722,6 +749,7 @@ impl Proxy {
         let setup = TunnelSetup {
             on_upgrade,
             origin,
+            origin_tls,
             deadline: tokio::time::Instant::now() + config.limits().idle_timeout(),
             idle_timeout: config.limits().idle_timeout(),
             half_close_timeout: config.connect().half_close_timeout(),
@@ -807,6 +835,7 @@ impl Proxy {
                 request_body_bytes: Arc::new(AtomicU64::new(0)),
                 route: Arc::new(Mutex::new(RouteInfo::default())),
             },
+            parent_failure: false,
             disarmed: false,
         }
     }

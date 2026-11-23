@@ -822,7 +822,13 @@ async fn serve_client<S>(
                     exchange_started,
                 );
                 match proxy
-                    .handle_connect(request, request_client, on_upgrade, &connect_snapshot)
+                    .handle_connect(
+                        request,
+                        request_client,
+                        on_upgrade,
+                        &connect_snapshot,
+                        &mut connect_terminal,
+                    )
                     .await
                 {
                     Ok((response, setup)) => {
@@ -923,6 +929,7 @@ async fn serve_client<S>(
                     let TunnelSetup {
                         on_upgrade,
                         origin,
+                        origin_tls,
                         deadline,
                         idle_timeout,
                         half_close_timeout,
@@ -946,6 +953,7 @@ async fn serve_client<S>(
                     let mut tunnel = Box::pin(crate::http::connect::run(
                         TokioIo::new(upgraded),
                         origin,
+                        origin_tls,
                         idle_timeout,
                         half_close_timeout,
                         Arc::clone(&tunnel_progress),

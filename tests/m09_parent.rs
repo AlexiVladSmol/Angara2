@@ -16,7 +16,7 @@ use angara::transport::TcpDialer;
 use tokio_rustls::TlsAcceptor;
 
 use common::m03::{self, RawClient};
-use common::m09::{self, FixedResponse, ParentMode};
+use common::m09::{self, FixedResponse, ParentMode, TlsParentClose};
 use common::{TempDir, m04, m06};
 use support::ScriptedResolver;
 
@@ -1046,6 +1046,139 @@ async fn m09_parent16f_two_angara_chain_preserves_domain_http_via() {
 
     chain.server_a.shutdown().await;
     chain.server_b.shutdown().await;
+}
+
+fn tls_parent_config(dir: &TempDir, parent: SocketAddr, connect_port: u16) -> String {
+    let ca = dir.path().join("proxy_ca.pem");
+    let mut text = m03::config("127.0.0.1:3128");
+    text.push_str(&format!(
+        r#"
+[[parents]]
+id = "parent"
+endpoint = "127.0.0.1:{}"
+transport = "https"
+ca_file = "{}"
+
+[routing]
+default_egress = "system"
+default_parent = "parent"
+
+[connect]
+allowed_ports = [{}]
+"#,
+        parent.port(),
+        ca.display(),
+        connect_port
+    ));
+    text
+}
+
+#[tokio::test]
+async fn m09_parent28_tls_parent_without_close_notify_is_completed() {
+    let dir = TempDir::new("m09-tls-no-close");
+    m06::generate_pki(dir.path());
+    let acceptor = TlsAcceptor::from(m06::server_config(
+        &dir.path().join("proxy_ip_chain.pem"),
+        &dir.path().join("proxy_ip_key.pem"),
+    ));
+    let parent =
+        m09::spawn_one_shot_tls_parent(acceptor, TlsParentClose::AfterClientEofWithoutCloseNotify)
+            .await
+            .expect("TLS parent");
+    let target = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = tls_parent_config(&dir, parent.address, target.address.port());
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) = Logger::channel(128, LogLevel::Info, telemetry);
+    server.set_logger(logger);
+
+    let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+    let authority = target.address.to_string();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(client.read_head().await.expect("head").status, 200);
+    client.send(b"hello").await.expect("send payload");
+    client.shutdown_write().await.expect("half-close client");
+    assert_eq!(
+        client
+            .read_exact_bytes(b"parent-payload".len())
+            .await
+            .expect("parent payload"),
+        b"parent-payload"
+    );
+    let _ = client.read_until_eof().await;
+
+    let record = receive_event(&receiver, "tunnel_finished");
+    assert_eq!(record["outcome"], "success");
+    assert_eq!(record["reason"], "completed");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent29_tls_parent_abort_before_client_eof_fails() {
+    let dir = TempDir::new("m09-tls-abort");
+    m06::generate_pki(dir.path());
+    let acceptor = TlsAcceptor::from(m06::server_config(
+        &dir.path().join("proxy_ip_chain.pem"),
+        &dir.path().join("proxy_ip_key.pem"),
+    ));
+    let parent = m09::spawn_one_shot_tls_parent(acceptor, TlsParentClose::AbortAfterConnect)
+        .await
+        .expect("TLS parent");
+    let target = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = tls_parent_config(&dir, parent.address, target.address.port());
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) = Logger::channel(128, LogLevel::Info, telemetry);
+    server.set_logger(logger);
+
+    let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+    let authority = target.address.to_string();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(client.read_head().await.expect("head").status, 200);
+    let _ = client.read_until_eof().await;
+
+    let record = receive_event(&receiver, "tunnel_finished");
+    assert_eq!(record["outcome"], "failed");
+    assert_eq!(record["reason"], "error");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent30_parent_reject_connect_logs_parent_route() {
+    let echo = m04::spawn_echo_origin(None).await.expect("echo");
+    let parent = m09::spawn_parent(ParentMode::RejectConnect(FixedResponse::new(407, b"")))
+        .await
+        .expect("parent");
+    let text = config_with_parent(
+        Some(parent.address),
+        Some("parent"),
+        "",
+        &[echo.address.port()],
+    );
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) = Logger::channel(128, LogLevel::Info, telemetry);
+    server.set_logger(logger);
+
+    for status in [407, 503] {
+        parent.set_mode(ParentMode::RejectConnect(FixedResponse::new(status, b"")));
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+        let authority = echo.address.to_string();
+        let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        client.send(request.as_bytes()).await.expect("send CONNECT");
+        assert_eq!(client.read_head().await.expect("head").status, 502);
+        let record = receive_event(&receiver, "request_finished");
+        assert_eq!(record["status"], 502);
+        assert_eq!(record["parent_id"], "parent");
+        assert_eq!(record["route"], "parent");
+        assert_eq!(record["reason"], "error");
+    }
+
+    server.shutdown().await;
 }
 
 #[tokio::test]

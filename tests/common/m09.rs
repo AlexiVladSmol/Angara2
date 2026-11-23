@@ -22,7 +22,7 @@ use hyper::client::conn::http1 as client_http1;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -193,6 +193,76 @@ pub async fn spawn_tls_parent(acceptor: TlsAcceptor, mode: ParentMode) -> io::Re
         mode: parent_mode,
         task,
     })
+}
+
+/// How a one-shot raw TLS parent ends its CONNECT tunnel.
+#[derive(Clone, Copy, Debug)]
+pub enum TlsParentClose {
+    /// Read the client half-close, send one payload, then drop the TLS stream
+    /// without sending close_notify.
+    AfterClientEofWithoutCloseNotify,
+    /// Drop the TLS stream immediately after the 200 response.
+    AbortAfterConnect,
+}
+
+/// One-shot TLS parent used to exercise missing close_notify handling.
+pub struct OneShotTlsParent {
+    pub address: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl Drop for OneShotTlsParent {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn spawn_one_shot_tls_parent(
+    acceptor: TlsAcceptor,
+    close: TlsParentClose,
+) -> io::Result<OneShotTlsParent> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut tls) = acceptor.accept(stream).await else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match tls.read_exact(&mut byte).await {
+                Ok(_) => head.push(byte[0]),
+                Err(_) => return,
+            }
+        }
+        if tls
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match close {
+            TlsParentClose::AbortAfterConnect => {
+                drop(tls);
+            }
+            TlsParentClose::AfterClientEofWithoutCloseNotify => {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match tls.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = tls.write_all(b"parent-payload").await;
+                drop(tls);
+            }
+        }
+    });
+    Ok(OneShotTlsParent { address, task })
 }
 
 async fn serve<S>(
