@@ -21,6 +21,7 @@ const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 pub(crate) struct TunnelSetup {
     pub(crate) on_upgrade: OnUpgrade,
     pub(crate) origin: BoxedIo,
+    pub(crate) origin_tls: bool,
     pub(crate) deadline: Instant,
     pub(crate) idle_timeout: Duration,
     pub(crate) half_close_timeout: Duration,
@@ -144,9 +145,64 @@ pub(crate) enum TunnelEnd {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    ClientToOrigin,
+    OriginToClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation {
+    Read,
+    Shutdown,
+    Write,
+}
+
+struct CopyError {
+    direction: Direction,
+    operation: Operation,
+    source: io::Error,
+}
+
+impl CopyError {
+    fn new(direction: Direction, operation: Operation, source: io::Error) -> Self {
+        Self {
+            direction,
+            operation,
+            source,
+        }
+    }
+
+    /// A TLS parent may close its read side without sending close_notify after
+    /// the client has already ended its write side. The byte stream is complete
+    /// at that point; the shutdown error is only the peer's half-close.
+    fn is_tls_parent_shutdown(&self) -> bool {
+        self.direction == Direction::ClientToOrigin
+            && self.operation == Operation::Shutdown
+            && matches!(
+                self.source.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+            )
+    }
+
+    /// Missing close_notify from a TLS parent is treated as EOF only after the
+    /// client has finished its own direction. A reset before that point remains
+    /// a failure.
+    fn is_tls_parent_eof(&self, client_done: bool) -> bool {
+        client_done
+            && self.direction == Direction::OriginToClient
+            && self.operation == Operation::Read
+            && self.source.kind() == io::ErrorKind::UnexpectedEof
+    }
+}
+
 pub(crate) async fn run(
     client: TokioIo<Upgraded>,
     origin: BoxedIo,
+    origin_tls: bool,
     idle_timeout: Duration,
     half_close_timeout: Duration,
     progress: Arc<TunnelProgress>,
@@ -160,12 +216,14 @@ pub(crate) async fn run(
         origin_write,
         Arc::clone(&progress),
         Arc::clone(&state),
+        Direction::ClientToOrigin,
     ));
     let mut origin_to_client = Box::pin(copy_direction(
         origin_read,
         client_write,
         Arc::clone(&progress),
         Arc::clone(&state),
+        Direction::OriginToClient,
     ));
     let idle = wait_idle(Arc::clone(&progress), idle_timeout);
     tokio::pin!(idle);
@@ -179,13 +237,17 @@ pub(crate) async fn run(
             biased;
             result = &mut client_to_origin, if !client_done => {
                 client_done = true;
-                if let Err(_error) = result {
+                if let Err(error) = result
+                    && !(origin_tls && error.is_tls_parent_shutdown())
+                {
                     return TunnelEnd::Io;
                 }
             }
             result = &mut origin_to_client, if !origin_done => {
                 origin_done = true;
-                if let Err(_error) = result {
+                if let Err(error) = result
+                    && !(origin_tls && error.is_tls_parent_eof(client_done))
+                {
                     return TunnelEnd::Io;
                 }
             }
@@ -204,21 +266,30 @@ async fn copy_direction<R, W>(
     mut writer: WriteHalf<W>,
     progress: Arc<TunnelProgress>,
     state: Arc<CopyState>,
-) -> io::Result<()>
+    direction: Direction,
+) -> Result<(), CopyError>
 where
     R: AsyncRead,
     W: AsyncWrite,
 {
     let mut buffer = [0_u8; RELAY_BUFFER_BYTES];
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|source| CopyError::new(direction, Operation::Read, source))?;
         if read == 0 {
             state.mark_eof();
-            writer.shutdown().await?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|source| CopyError::new(direction, Operation::Shutdown, source))?;
             return Ok(());
         }
         progress.add_bytes(read as u64);
-        write_all_progress(&mut writer, &buffer[..read], &progress).await?;
+        write_all_progress(&mut writer, &buffer[..read], &progress)
+            .await
+            .map_err(|source| CopyError::new(direction, Operation::Write, source))?;
     }
 }
 
