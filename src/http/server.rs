@@ -566,15 +566,15 @@ mod tests {
                 .is_err(),
             "drain gave up on a pending writer before the deadline"
         );
-        let (final_end, done) = finalize.await;
+        // The upper bound is enforced while waiting, so a drain that never ends
+        // fails here instead of hanging the test run.
+        let (final_end, done) = tokio::time::timeout_at(started + Duration::from_secs(5), finalize)
+            .await
+            .expect("drain overran the 5 s bound");
         let elapsed = started.elapsed();
         assert!(matches!(final_end, TunnelEnd::Io));
         assert!(!done);
         assert!(elapsed >= HALF_CLOSE, "drain ended early: {elapsed:?}");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "drain overran: {elapsed:?}"
-        );
     }
 
     #[tokio::test]
