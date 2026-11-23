@@ -32,6 +32,7 @@ pub struct OriginKey {
     port: u16,
     endpoint: std::net::SocketAddr,
     egress_id: String,
+    parent_id: Option<String>,
     generation: u64,
     listener_id: String,
     identity: Option<String>,
@@ -45,10 +46,18 @@ impl OriginKey {
             port: plan.target().port(),
             endpoint,
             egress_id: plan.egress_id().to_owned(),
+            parent_id: None,
             generation: plan.generation(),
             listener_id: plan.listener_id().to_owned(),
             identity: plan.identity().map(str::to_owned),
             auth_snapshot_id: plan.auth_snapshot_id(),
+        }
+    }
+
+    fn new_parent(plan: &OutboundPlan, endpoint: std::net::SocketAddr) -> Self {
+        Self {
+            parent_id: plan.parent_id().map(str::to_owned),
+            ..Self::new(plan, endpoint)
         }
     }
 }
@@ -174,6 +183,7 @@ impl OriginPool {
                     key,
                     sender,
                     Arc::clone(&self.telemetry),
+                    true,
                 ));
             }
         }
@@ -220,6 +230,24 @@ impl OriginPool {
             OriginKey::new(plan, endpoint),
             sender,
             Arc::clone(&self.telemetry),
+            true,
+        )
+    }
+
+    /// Creates a one-shot lease for a parent connection. The sender is closed
+    /// instead of being returned to the direct-origin pool.
+    pub(crate) fn new_parent_lease(
+        self: &Arc<Self>,
+        plan: &OutboundPlan,
+        endpoint: std::net::SocketAddr,
+        sender: PooledSender,
+    ) -> Lease {
+        Lease::new(
+            Arc::clone(self),
+            OriginKey::new_parent(plan, endpoint),
+            sender,
+            Arc::clone(&self.telemetry),
+            false,
         )
     }
 }
@@ -230,6 +258,7 @@ impl OriginPool {
 pub struct Lease {
     pool: Arc<OriginPool>,
     key: OriginKey,
+    reusable: bool,
     state: Arc<Mutex<LeaseState>>,
 }
 
@@ -260,11 +289,13 @@ impl Lease {
         key: OriginKey,
         sender: PooledSender,
         telemetry: Arc<Telemetry>,
+        reusable: bool,
     ) -> Self {
         telemetry.pool_leased.fetch_add(1, Ordering::AcqRel);
         Self {
             pool,
             key,
+            reusable,
             state: Arc::new(Mutex::new(LeaseState {
                 sender: Some(sender),
                 request_done: false,
@@ -335,7 +366,11 @@ impl Lease {
             }
         };
         if let Some(sender) = sender {
-            self.pool.put(self.key.clone(), sender);
+            if self.reusable {
+                self.pool.put(self.key.clone(), sender);
+            } else {
+                drop(sender);
+            }
         }
     }
 

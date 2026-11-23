@@ -32,19 +32,27 @@ const MAX_INTERIM_BYTES: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct InterimHub {
     sender: mpsc::Sender<Bytes>,
+    instance_id: String,
 }
 
 impl InterimHub {
     /// Creates the hub and the writer-loop receiver.
-    pub fn new() -> (Self, mpsc::Receiver<Bytes>) {
+    pub fn new(instance_id: String) -> (Self, mpsc::Receiver<Bytes>) {
         let (sender, receiver) = mpsc::channel(MAX_INTERIM_HEADS);
-        (Self { sender }, receiver)
+        (
+            Self {
+                sender,
+                instance_id,
+            },
+            receiver,
+        )
     }
 
     /// Creates the per-exchange sender and failure flag.
     pub fn begin(&self) -> InterimSender {
         InterimSender {
             sender: self.sender.clone(),
+            instance_id: self.instance_id.clone(),
             bytes: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -55,6 +63,7 @@ impl InterimHub {
 #[derive(Clone)]
 pub struct InterimSender {
     sender: mpsc::Sender<Bytes>,
+    instance_id: String,
     bytes: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
 }
@@ -74,7 +83,7 @@ impl InterimSender {
             self.failed.store(true, Ordering::Release);
             return false;
         }
-        headers::append_via(&mut headers);
+        headers::append_via(&mut headers, &self.instance_id);
         self.send_head(status, &headers)
     }
 

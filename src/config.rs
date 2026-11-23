@@ -1,9 +1,8 @@
 //! Strict TOML configuration for Angara.
 //!
 //! The schema is intentionally closed: unknown keys are rejected rather than
-//! ignored. Features that are not implemented in this milestone (TLS, auth,
-//! cache, admin API, parent proxy) therefore cannot be mistaken for supported
-//! settings.
+//! ignored. Features that are not implemented in this milestone (cache, admin
+//! API) therefore cannot be mistaken for supported settings.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -19,6 +18,10 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 
 use crate::auth::{self, AuthMode, UsersSnapshot};
+use crate::parent::{
+    ParentDefinition, ParentEndpoint, ParentTransport, PreparedParent, is_obvious_self_route,
+    prepare as prepare_parent,
+};
 use crate::target::{DomainName, parse_method};
 use crate::tls::{PreparedTls, prepare_listener};
 
@@ -139,6 +142,7 @@ pub struct Config {
     http: HttpConfig,
     connect: ConnectConfig,
     egress: Vec<EgressProfile>,
+    parents: Vec<Arc<PreparedParent>>,
     routing: RoutingConfig,
     auth: Option<AuthConfig>,
     tls: TlsConfig,
@@ -245,6 +249,9 @@ impl Config {
         if !same_egress(&self.egress, &other.egress) {
             return Some("egress");
         }
+        if !same_parents(&self.parents, &other.parents) {
+            return Some("parents");
+        }
         if self.operations != other.operations {
             return Some("operations");
         }
@@ -300,6 +307,11 @@ impl Config {
         &self.runtime
     }
 
+    /// Stable instance suffix used in `Via`.
+    pub fn instance_id(&self) -> &str {
+        self.runtime.instance_id()
+    }
+
     /// Resource limits shared by listeners.
     pub fn limits(&self) -> &Limits {
         &self.limits
@@ -343,6 +355,16 @@ impl Config {
     /// Egress routing rules.
     pub fn routing(&self) -> &RoutingConfig {
         &self.routing
+    }
+
+    /// Validated and prepared parent definitions in configuration order.
+    pub fn parents(&self) -> &[Arc<PreparedParent>] {
+        &self.parents
+    }
+
+    /// Finds a prepared parent by its stable identifier.
+    pub fn parent(&self, id: &str) -> Option<&Arc<PreparedParent>> {
+        self.parents.iter().find(|parent| parent.id() == id)
     }
 
     /// Prepared local users and verification limits, if `[auth]` is declared.
@@ -392,6 +414,16 @@ fn same_egress(left: &[EgressProfile], right: &[EgressProfile]) -> bool {
                 .iter()
                 .find(|candidate| candidate.id == item.id)
                 .is_some_and(|candidate| candidate == item)
+        })
+}
+
+fn same_parents(left: &[Arc<PreparedParent>], right: &[Arc<PreparedParent>]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|item| {
+            right
+                .iter()
+                .find(|candidate| candidate.id() == item.id())
+                .is_some_and(|candidate| candidate.definition() == item.definition())
         })
 }
 
@@ -516,12 +548,18 @@ impl fmt::Debug for AuthConfig {
 #[derive(Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     worker_threads: WorkerThreads,
+    instance_id: String,
 }
 
 impl RuntimeConfig {
     /// Configured worker-thread policy.
     pub fn worker_threads(&self) -> WorkerThreads {
         self.worker_threads
+    }
+
+    /// Stable instance suffix used in the `Via` pseudonym.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 }
 
@@ -800,6 +838,7 @@ pub enum EgressMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingConfig {
     default_egress: String,
+    default_parent: Option<String>,
     rules: Vec<RoutingRule>,
 }
 
@@ -807,6 +846,11 @@ impl RoutingConfig {
     /// Egress used when no rule matches.
     pub fn default_egress(&self) -> &str {
         &self.default_egress
+    }
+
+    /// Parent used when no rule matches and no explicit direct route is set.
+    pub fn default_parent(&self) -> Option<&str> {
+        self.default_parent.as_deref()
     }
 
     /// Ordered routing rules.
@@ -820,6 +864,7 @@ impl RoutingConfig {
 pub struct RoutingRule {
     id: String,
     egress_id: String,
+    next_hop: Option<String>,
     selectors: Selectors,
 }
 
@@ -832,6 +877,14 @@ impl RoutingRule {
     /// Selected egress identifier.
     pub fn egress_id(&self) -> &str {
         &self.egress_id
+    }
+
+    /// Explicit next hop, or `None` to inherit `default_parent`.
+    ///
+    /// `Some("direct")` means an explicit direct route. A parent ID selects
+    /// that configured parent.
+    pub fn next_hop(&self) -> Option<&str> {
+        self.next_hop.as_deref()
     }
 
     /// Rule selectors.
@@ -1404,6 +1457,13 @@ fn validate_with(
     let operations = validate_operations(raw.operations)?;
     let observability = validate_observability(raw.observability)?;
     let (listeners, prepared_tls) = validate_listeners(raw.listeners, base_dir, previous)?;
+    let instance_id = match &raw.runtime.instance_id {
+        Some(value) => {
+            validate_policy_id(value, "runtime.instance_id")?;
+            value.clone()
+        }
+        None => default_instance_id(&listeners),
+    };
     let listener_ids = listeners.iter().map(Listener::id).collect::<Vec<&str>>();
     let auth = validate_auth(raw.auth, base_dir)?;
     for (index, listener) in listeners.iter().enumerate() {
@@ -1430,12 +1490,19 @@ fn validate_with(
     let transport = validate_transport(raw.transport, &limits)?;
     let http = validate_http(raw.http, &limits)?;
     let connect = validate_connect(raw.connect)?;
-    let (egress, routing) = validate_egress_routing(raw.egress, raw.routing, &listener_ids)?;
+    let parents = validate_parents(raw.parents, base_dir, previous, &listeners)?;
+    let parent_ids = parents
+        .iter()
+        .map(|parent| parent.id())
+        .collect::<Vec<&str>>();
+    let (egress, routing) =
+        validate_egress_routing(raw.egress, raw.routing, &listener_ids, &parent_ids)?;
 
     Ok(Config {
         schema_version: SCHEMA_VERSION,
         runtime: RuntimeConfig {
             worker_threads: raw.runtime.worker_threads,
+            instance_id,
         },
         limits,
         listeners,
@@ -1445,6 +1512,7 @@ fn validate_with(
         http,
         connect,
         egress,
+        parents,
         routing,
         auth,
         tls,
@@ -2098,10 +2166,167 @@ fn validate_connect(raw: Option<RawConnect>) -> Result<ConnectConfig, ConfigErro
     })
 }
 
+fn default_instance_id(listeners: &[Listener]) -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok());
+    let host = host.as_deref().unwrap_or("local").trim();
+    let mut sanitized = String::new();
+    for character in host.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            sanitized.push(character);
+        }
+        if sanitized.len() >= 32 {
+            break;
+        }
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("local");
+    }
+    let port = listeners
+        .first()
+        .map(|listener| listener.bind().port())
+        .unwrap_or(0);
+    let mut id = format!("{sanitized}-{port}");
+    id.truncate(MAX_ID_BYTES);
+    id
+}
+
+fn validate_parents(
+    raw: Option<Vec<RawParent>>,
+    base_dir: Option<&Path>,
+    previous: Option<&Config>,
+    listeners: &[Listener],
+) -> Result<Vec<Arc<PreparedParent>>, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    if raw.is_empty() {
+        if previous.is_some_and(|config| !config.parents.is_empty()) {
+            return Err(ConfigError::RestartRequired {
+                path: "parents".to_owned(),
+                message: "parent definitions changed".to_owned(),
+            });
+        }
+        return Ok(Vec::new());
+    }
+    validate_list_len(&raw, "parents")?;
+
+    let mut definitions = Vec::with_capacity(raw.len());
+    for (index, raw) in raw.into_iter().enumerate() {
+        let path = format!("parents[{index}]");
+        validate_policy_id(&raw.id, &format!("{path}.id"))?;
+        if raw.id == "direct" {
+            return Err(validation(
+                format!("{path}.id"),
+                "`direct` is reserved for an explicit direct route",
+            ));
+        }
+        let endpoint = ParentEndpoint::parse(&raw.endpoint)
+            .map_err(|_| validation(format!("{path}.endpoint"), "must be host:port"))?;
+        let transport = ParentTransport::parse(&raw.transport)
+            .ok_or_else(|| validation(format!("{path}.transport"), "must be `http` or `https`"))?;
+        let credentials_file = match raw.credentials_file {
+            Some(value) => Some(resolve_parent_path(
+                &path,
+                "credentials_file",
+                &value,
+                base_dir,
+            )?),
+            None => None,
+        };
+        let ca_file = match raw.ca_file {
+            Some(value) => Some(resolve_parent_path(&path, "ca_file", &value, base_dir)?),
+            None => None,
+        };
+        if transport == ParentTransport::Http && ca_file.is_some() {
+            return Err(validation(
+                format!("{path}.ca_file"),
+                "ca_file is only valid for https parents",
+            ));
+        }
+        if is_obvious_self_route(&endpoint, listeners) {
+            return Err(validation(
+                format!("{path}.endpoint"),
+                "parent endpoint points to an own listener",
+            ));
+        }
+        definitions.push(ParentDefinition::new(
+            raw.id,
+            endpoint,
+            transport,
+            credentials_file,
+            ca_file,
+        ));
+    }
+    for first in 0..definitions.len() {
+        for second in (first + 1)..definitions.len() {
+            if definitions[first].id() == definitions[second].id() {
+                return Err(validation(
+                    format!("parents[{second}].id"),
+                    format!("parents[{second}].id duplicates parents[{first}].id"),
+                ));
+            }
+        }
+    }
+
+    if let Some(previous) = previous {
+        let unchanged = previous.parents.len() == definitions.len()
+            && definitions
+                .iter()
+                .zip(&previous.parents)
+                .all(|(definition, prepared)| definition == prepared.definition());
+        if !unchanged {
+            return Err(ConfigError::RestartRequired {
+                path: "parents".to_owned(),
+                message: "parent definitions changed".to_owned(),
+            });
+        }
+        return Ok(previous.parents.clone());
+    }
+
+    let mut parents = Vec::with_capacity(definitions.len());
+    for (index, definition) in definitions.into_iter().enumerate() {
+        let path = format!("parents[{index}]");
+        match prepare_parent(definition, &path) {
+            Ok(parent) => parents.push(parent),
+            Err(error) => {
+                return Err(validation(
+                    error.field().to_owned(),
+                    error.message().to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(parents)
+}
+
+fn resolve_parent_path(
+    path: &str,
+    field: &str,
+    value: &str,
+    base_dir: Option<&Path>,
+) -> Result<PathBuf, ConfigError> {
+    if value.is_empty() {
+        return Err(validation(format!("{path}.{field}"), "must not be empty"));
+    }
+    let declared = Path::new(value);
+    if declared.is_absolute() {
+        return Ok(declared.to_path_buf());
+    }
+    let base_dir = base_dir.ok_or_else(|| {
+        validation(
+            format!("{path}.{field}"),
+            "requires a configuration file context",
+        )
+    })?;
+    Ok(resolve_path(base_dir, value))
+}
+
 fn validate_egress_routing(
     raw_egress: Option<Vec<RawEgress>>,
     raw_routing: Option<RawRouting>,
     listener_ids: &[&str],
+    parent_ids: &[&str],
 ) -> Result<(Vec<EgressProfile>, RoutingConfig), ConfigError> {
     let egress = if let Some(raw_egress) = raw_egress {
         if raw_egress.is_empty() {
@@ -2176,6 +2401,21 @@ fn validate_egress_routing(
         return Err(validation("routing.default_egress", "unknown egress id"));
     }
 
+    let default_parent = match raw_routing.default_parent {
+        Some(value) => {
+            validate_policy_id(&value, "routing.default_parent")?;
+            if value == "direct" {
+                None
+            } else {
+                if !parent_ids.contains(&value.as_str()) {
+                    return Err(validation("routing.default_parent", "unknown parent id"));
+                }
+                Some(value)
+            }
+        }
+        None => None,
+    };
+
     validate_list_len(&raw_routing.rules, "routing.rules")?;
     let mut rules = Vec::with_capacity(raw_routing.rules.len());
     for (index, raw) in raw_routing.rules.into_iter().enumerate() {
@@ -2185,6 +2425,20 @@ fn validate_egress_routing(
         if !egress_ids.contains(&raw.egress_id.as_str()) {
             return Err(validation(format!("{path}.egress_id"), "unknown egress id"));
         }
+        let next_hop = match raw.next_hop {
+            Some(value) => {
+                validate_policy_id(&value, &format!("{path}.next_hop"))?;
+                if value == "direct" {
+                    Some(value)
+                } else {
+                    if !parent_ids.contains(&value.as_str()) {
+                        return Err(validation(format!("{path}.next_hop"), "unknown parent id"));
+                    }
+                    Some(value)
+                }
+            }
+            None => None,
+        };
         let selectors = validate_selectors(
             &path,
             raw.listeners,
@@ -2199,6 +2453,7 @@ fn validate_egress_routing(
         rules.push(RoutingRule {
             id: raw.id,
             egress_id: raw.egress_id,
+            next_hop,
             selectors,
         });
     }
@@ -2217,6 +2472,7 @@ fn validate_egress_routing(
         egress,
         RoutingConfig {
             default_egress,
+            default_parent,
             rules,
         },
     ))
@@ -2531,6 +2787,8 @@ struct RawConfig {
     #[serde(default)]
     egress: Option<Vec<RawEgress>>,
     #[serde(default)]
+    parents: Option<Vec<RawParent>>,
+    #[serde(default)]
     routing: Option<RawRouting>,
     #[serde(default)]
     auth: Option<RawAuth>,
@@ -2546,6 +2804,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawRuntime {
     worker_threads: WorkerThreads,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2721,11 +2981,25 @@ struct RawEgress {
     bind_ip: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawParent {
+    id: String,
+    endpoint: String,
+    transport: String,
+    #[serde(default)]
+    credentials_file: Option<String>,
+    #[serde(default)]
+    ca_file: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawRouting {
     #[serde(default)]
     default_egress: Option<String>,
+    #[serde(default)]
+    default_parent: Option<String>,
     #[serde(default)]
     rules: Vec<RawRoutingRule>,
 }
@@ -2735,6 +3009,8 @@ struct RawRouting {
 struct RawRoutingRule {
     id: String,
     egress_id: String,
+    #[serde(default)]
+    next_hop: Option<String>,
     #[serde(default)]
     listeners: Option<Vec<String>>,
     #[serde(default)]

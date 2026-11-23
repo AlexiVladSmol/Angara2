@@ -14,6 +14,7 @@ pub mod forward;
 pub mod headers;
 pub mod idle;
 pub mod interim;
+pub(crate) mod parent_client;
 pub mod pool;
 pub mod server;
 

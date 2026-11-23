@@ -14,6 +14,7 @@ pub mod http;
 pub mod limits;
 pub mod logging;
 pub mod outbound;
+pub mod parent;
 pub mod policy;
 pub mod resolver;
 pub mod routing;

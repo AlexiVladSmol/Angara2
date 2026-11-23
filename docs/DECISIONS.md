@@ -175,3 +175,9 @@ M06 [ACCEPTED Codex](https://github.com/AlexeiSmol/Angara/pull/19#issuecomment-6
 | --- | --- | --- |
 | D60 | С 22 ноября 2026 года архитектура, задания и стратегия тестирования — ChatGPT Astra 6.2; код-ревью — Claude Opus 5.5; реализация, тесты и CI — DeepSeek V4.1 Flash 1017. D54 сохраняется как история и заменён в части проектирования, заданий и ревью | Поручение владельца |
 | D61 | Один GitHub-аккаунт может использоваться с нескольких клиентов. На каждом клиенте отдельный SSH-ключ; новые коммиты — от `AlexiVladSmol <358176669+AlexiVladSmol@users.noreply.github.com>`; одна ветка на Issue активна только на одном клиенте; домашний клиент — разработка и локальные тесты, рабочий стенд — целевая приёмка Ubuntu 24.04, Squid, systemd и нагрузка; контекст — в Issue/PR | Поручение владельца |
+
+## M09 — parent proxy — 22 ноября 2026 года
+
+| ID | Решение | Основание |
+| --- | --- | --- |
+| D62 | Для M09 parent получает числовой IP, проверенный Angara (вариант 1): доменный HTTP и клиентский CONNECT используют внешний `CONNECT <verified-ip>:<port>`, HTTP к IP-литералу — absolute-form с проверенным IP. Ошибка parent не переключает запрос в direct или другой parent. Parent definitions, transport, CA и содержимое credentials применяются при restart; routing (default_parent/next_hop) входит в hot reload. Parent pool reuse в M09 не включён. `Via` использует `runtime.instance_id`, чтобы отличать экземпляры в цепочке | Выбор владельца от 19 ноября 2026 года, зафиксирован в Issue #42 |

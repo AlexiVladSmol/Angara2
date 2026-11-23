@@ -11,8 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::logging::{Event, LogRecord, Logger, Outcome, Reason};
-use crate::outbound::Connected;
+use crate::http::parent_client::BoxedIo;
+use crate::logging::{Event, LogRecord, Logger, Outcome, Reason, RouteKind};
 use crate::telemetry::Telemetry;
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
@@ -20,7 +20,7 @@ const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 /// CONNECT handoff state produced before the 200 response.
 pub(crate) struct TunnelSetup {
     pub(crate) on_upgrade: OnUpgrade,
-    pub(crate) origin: Connected,
+    pub(crate) origin: BoxedIo,
     pub(crate) deadline: Instant,
     pub(crate) idle_timeout: Duration,
     pub(crate) half_close_timeout: Duration,
@@ -34,6 +34,8 @@ pub(crate) struct TunnelGauge {
     logger: Logger,
     generation: u64,
     connection_id: u64,
+    parent_id: Option<String>,
+    route: RouteKind,
     progress: Option<Arc<TunnelProgress>>,
     finished: bool,
 }
@@ -44,6 +46,8 @@ impl TunnelGauge {
         logger: Logger,
         generation: u64,
         connection_id: u64,
+        parent_id: Option<String>,
+        route: RouteKind,
     ) -> Self {
         telemetry.connect_active.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -51,6 +55,8 @@ impl TunnelGauge {
             logger,
             generation,
             connection_id,
+            parent_id,
+            route,
             progress: None,
             finished: false,
         }
@@ -102,6 +108,8 @@ impl TunnelGauge {
         record.reason = Some(reason);
         record.generation = Some(self.generation);
         record.connection_id = Some(self.connection_id);
+        record.parent_id = self.parent_id.clone();
+        record.route = Some(self.route);
         record.tunnel_bytes = Some(
             self.progress
                 .as_ref()
@@ -138,7 +146,7 @@ pub(crate) enum TunnelEnd {
 
 pub(crate) async fn run(
     client: TokioIo<Upgraded>,
-    origin: Connected,
+    origin: BoxedIo,
     idle_timeout: Duration,
     half_close_timeout: Duration,
     progress: Arc<TunnelProgress>,

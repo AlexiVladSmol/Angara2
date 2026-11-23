@@ -90,6 +90,7 @@ jobs:
           cargo run --locked -- check --config examples/m02-egress-local.toml
           cargo run --locked -- check --config examples/m03-http-local.toml
           cargo run --locked -- check --config examples/m04-connect-local.toml
+          cargo run --locked -- check --config examples/m09-parent-local.toml
 
       - name: Validate M05 auth example with a generated users file
         run: |
@@ -654,6 +655,50 @@ jobs:
           echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
       - name: Run systemd checks
         run: sudo --preserve-env=M08_BIN bash tests/m08/systemd.sh
+      - name: Parent credentials recipe is readable by service user
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          trap 'sudo rm -rf "$TMP"' EXIT
+          chmod 0755 "$TMP"
+          cat >"$TMP/parent-credentials.toml" <<'EOF'
+          version = 1
+          username = "synthetic-parent"
+          password = "synthetic-secret"
+          EOF
+          sudo install -m 0640 -o root -g angara \
+            "$TMP/parent-credentials.toml" "$TMP/parent-credentials.installed.toml"
+          cat >"$TMP/proxy.toml" <<'EOF'
+          schema_version = 1
+          [runtime]
+          worker_threads = 2
+          [limits]
+          max_connections = 16
+          max_header_bytes = 32768
+          header_read_timeout_ms = 5000
+          idle_timeout_ms = 5000
+          shutdown_timeout_ms = 5000
+          [[listeners]]
+          id = "loopback"
+          bind = "127.0.0.1:3128"
+          transport = "http"
+          [access]
+          source_allow = ["127.0.0.0/8"]
+          [[access.rules]]
+          id = "allow"
+          action = "allow"
+          [[parents]]
+          id = "synthetic"
+          endpoint = "127.0.0.1:13128"
+          transport = "http"
+          credentials_file = "parent-credentials.installed.toml"
+          [routing]
+          default_egress = "system"
+          default_parent = "synthetic"
+          EOF
+          chmod 0644 "$TMP/proxy.toml"
+          sudo chown root:root "$TMP/proxy.toml"
+          sudo -u angara "$M08_BIN" check --config "$TMP/proxy.toml"
 
   functional:
     name: HTTP/HTTPS/Basic/ACL and layered TLS

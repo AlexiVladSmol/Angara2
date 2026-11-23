@@ -461,7 +461,15 @@ pub async fn spawn_origin<F>(handler: F) -> io::Result<TestOrigin>
 where
     F: Fn(&RecordedRequest, usize) -> Vec<u8> + Send + Sync + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    spawn_origin_at("127.0.0.1:0".parse().expect("loopback"), handler).await
+}
+
+/// Spawns a recording origin on the requested bind address.
+pub async fn spawn_origin_at<F>(bind: SocketAddr, handler: F) -> io::Result<TestOrigin>
+where
+    F: Fn(&RecordedRequest, usize) -> Vec<u8> + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(bind).await?;
     let address = listener.local_addr()?;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let accepts = Arc::new(AtomicUsize::new(0));

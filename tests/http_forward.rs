@@ -66,7 +66,10 @@ fn domain_request(port: u16, host: &str, path: &str) -> Vec<u8> {
 }
 
 fn proxy_config() -> String {
-    config("127.0.0.1:3128")
+    config("127.0.0.1:3128").replace(
+        "[runtime]\nworker_threads = 2",
+        "[runtime]\nworker_threads = 2\ninstance_id = \"test\"",
+    )
 }
 
 fn deny_all_config() -> String {
@@ -987,7 +990,7 @@ fn m03_http07_rejections_happen_without_origin_dial() {
                 505,
             ),
             (
-                b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nVia: 1.1 angara\r\n\r\n"
+                b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nVia: 1.1 angara-test\r\n\r\n"
                     .to_vec(),
                 508,
             ),
