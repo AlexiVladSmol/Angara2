@@ -71,14 +71,12 @@ fn receive_event(receiver: &std::sync::mpsc::Receiver<String>, event: &str) -> s
     panic!("event {event} not logged");
 }
 
-/// The parent sends the payload and drops TLS without close_notify before the
-/// client ends its side, so the relay ends as `Io`. The client starts reading
-/// only after the parent has queued the payload and its FIN, so the relay
-/// reaches the error while the client bridge still holds bytes. The client
-/// must still receive every relayed byte; the outcome stays failed/error.
-#[tokio::test]
-async fn m09_tunnel_drain01_tls_parent_error_delivers_relayed_bytes() {
-    const PAYLOAD: usize = 128 * 1024;
+/// The parent sends `payload` bytes and drops TLS without close_notify before
+/// the client ends its side, so the relay ends as `Io`. The client starts
+/// reading only after a pause, so the relay reaches the error while the client
+/// bridge still holds bytes. The client must still receive every relayed byte;
+/// the outcome stays failed/error.
+async fn assert_error_drain_delivers(payload: usize) {
     let dir = TempDir::new("m09-tls-error-drain");
     m06::generate_pki(dir.path());
     let acceptor = TlsAcceptor::from(m06::server_config(
@@ -87,7 +85,7 @@ async fn m09_tunnel_drain01_tls_parent_error_delivers_relayed_bytes() {
     ));
     let parent = m09::spawn_one_shot_tls_parent(
         acceptor,
-        TlsParentClose::SendThenDropWithoutCloseNotify(PAYLOAD),
+        TlsParentClose::SendThenDropWithoutCloseNotify(payload),
     )
     .await
     .expect("TLS parent");
@@ -109,12 +107,29 @@ async fn m09_tunnel_drain01_tls_parent_error_delivers_relayed_bytes() {
     let record = receive_event(&receiver, "tunnel_finished");
     assert_eq!(record["outcome"], "failed");
     assert_eq!(record["reason"], "error");
-    assert_eq!(record["tunnel_bytes"], PAYLOAD as u64);
-    assert_eq!(received.len(), PAYLOAD, "client lost relayed bytes");
+    assert_eq!(record["tunnel_bytes"], payload as u64);
+    assert_eq!(received.len(), payload, "client lost relayed bytes");
     assert!(
-        received == m09::tls_parent_payload(PAYLOAD),
+        received == m09::tls_parent_payload(payload),
         "relayed bytes differ from the parent payload"
     );
 
     server.shutdown().await;
+}
+
+/// 128 KiB fits in the loopback buffers, so the parent queues the payload and
+/// its FIN before the client reads; this case detects the original defect on
+/// every run.
+#[tokio::test]
+async fn m09_tunnel_drain01_tls_parent_error_delivers_relayed_bytes() {
+    assert_error_drain_delivers(128 * 1024).await;
+}
+
+/// The 256 KiB size from Issue #52. The parent may still be blocked on socket
+/// buffers when the client starts reading, so on the unfixed code this case
+/// fails only in most runs; it guards the larger transfer, while drain01 is
+/// the deterministic detector.
+#[tokio::test]
+async fn m09_tunnel_drain02_tls_parent_error_delivers_256k() {
+    assert_error_drain_delivers(256 * 1024).await;
 }
