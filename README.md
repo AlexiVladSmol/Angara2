@@ -1063,7 +1063,9 @@ gzip/identity/отсутствия заголовка. `only-if-cached` без �
 query, ключи, пользователи, заголовки и тела в журналы и метки не попадают.
 Полный пример — [examples/m10-cache-local.toml](examples/m10-cache-local.toml);
 эксплуатация — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#10-http-кеш-m10). Локальные
-проверки: `cargo test --locked --test config_m10` и `--test m10_cache`.
+проверки: `cargo test --locked --test config_m10`, `--test m10_cache`,
+`--test m10_limits`; Ubuntu CI дополнительно запускает
+`tests/m08/cache_load.sh` с 10 и 20 клиентами.
 
 ## Текущее состояние
 

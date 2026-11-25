@@ -54,6 +54,31 @@ async fn get(
     send_raw(proxy, request.as_bytes()).await
 }
 
+async fn get_from(
+    source: std::net::IpAddr,
+    proxy: SocketAddr,
+    uri: &str,
+    host: &str,
+    headers: &[(&str, &str)],
+) -> m03::RawResponse {
+    let socket = tokio::net::TcpSocket::new_v4().expect("client socket");
+    socket
+        .bind(SocketAddr::new(source, 0))
+        .expect("bind client source");
+    let stream = socket.connect(proxy).await.expect("connect proxy");
+    let mut client = RawClient::from_stream(stream);
+    let mut request = format!("GET {uri} HTTP/1.1\r\nHost: {host}\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    client.send(request.as_bytes()).await.expect("send request");
+    client.read_response().await.expect("read response")
+}
+
 fn not_modified(headers: &[(&str, &str)]) -> Vec<u8> {
     let mut response = b"HTTP/1.1 304 Not Modified\r\n".to_vec();
     for (name, value) in headers {
@@ -64,6 +89,53 @@ fn not_modified(headers: &[(&str, &str)]) -> Vec<u8> {
     }
     response.extend_from_slice(b"\r\n");
     response
+}
+
+async fn spawn_slow_get_origin(
+    length: usize,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let address = listener.local_addr().expect("origin address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let task_requests = Arc::clone(&requests);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let requests = Arc::clone(&task_requests);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                loop {
+                    let mut byte = [0_u8; 1];
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {length}\r\n\r\n"
+                );
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                let first = length.min(512);
+                if stream.write_all(&vec![b'x'; first]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = stream.write_all(&vec![b'x'; length - first]).await;
+            });
+        }
+    });
+    (address, requests, task)
 }
 
 #[tokio::test]
@@ -1320,4 +1392,429 @@ async fn m10_cache33_unsafe_location_invalidates_same_origin_target() {
     assert_eq!(get(proxy, &target, &host, &[]).await.body, b"new-target");
     assert_eq!(origin.requests.lock().expect("requests").len(), 3);
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache34_weak_etag_revalidation_is_a_match() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let origin = m03::spawn_origin({
+        let counter = Arc::clone(&counter);
+        move |_, _| match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => m03::response(
+                "200 OK",
+                &[("ETag", "\"v1\""), ("Cache-Control", "max-age=0")],
+                b"weak-body",
+            ),
+            1 => not_modified(&[("ETag", "W/\"v1\""), ("Cache-Control", "max-age=60")]),
+            _ => m03::response("500 Internal Server Error", &[], b"unexpected"),
+        }
+    })
+    .await
+    .expect("origin");
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{}/weak-etag", origin.address);
+    let host = origin.address.to_string();
+
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"weak-body");
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"weak-body");
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"weak-body");
+    {
+        let requests = origin.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].header("if-none-match"), Some("\"v1\""));
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache35_other_etag_revalidation_does_one_unconditional_get() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let origin = m03::spawn_origin({
+        let counter = Arc::clone(&counter);
+        move |_, _| match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => m03::response(
+                "200 OK",
+                &[("ETag", "\"v1\""), ("Cache-Control", "max-age=0")],
+                b"old-etag",
+            ),
+            1 => not_modified(&[("ETag", "\"v2\""), ("Cache-Control", "max-age=60")]),
+            _ => m03::response(
+                "200 OK",
+                &[("ETag", "\"v2\""), ("Cache-Control", "max-age=60")],
+                b"new-etag",
+            ),
+        }
+    })
+    .await
+    .expect("origin");
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{}/other-etag", origin.address);
+    let host = origin.address.to_string();
+
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"old-etag");
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"new-etag");
+    {
+        let requests = origin.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].header("if-none-match"), Some("\"v1\""));
+        assert_eq!(requests[2].header("if-none-match"), None);
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache36_multiline_cache_control_in_304_is_merged() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let origin = m03::spawn_origin({
+        let counter = Arc::clone(&counter);
+        move |_, _| match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => m03::response(
+                "200 OK",
+                &[("ETag", "\"v1\""), ("Cache-Control", "max-age=0")],
+                b"old-multiline",
+            ),
+            1 => not_modified(&[
+                ("ETag", "\"v1\""),
+                ("Cache-Control", "max-age=60"),
+                ("Cache-Control", "no-store"),
+            ]),
+            _ => m03::response(
+                "200 OK",
+                &[("ETag", "\"v2\""), ("Cache-Control", "max-age=60")],
+                b"new-multiline",
+            ),
+        }
+    })
+    .await
+    .expect("origin");
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{}/multiline", origin.address);
+    let host = origin.address.to_string();
+
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"old-multiline");
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"new-multiline");
+    assert_eq!(origin.requests.lock().expect("requests").len(), 3);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache37_only_if_cached_stale_returns_504() {
+    let origin = m03::spawn_origin(|_, _| {
+        m03::response("200 OK", &[("Cache-Control", "max-age=0")], b"stale")
+    })
+    .await
+    .expect("origin");
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{}/stale-only", origin.address);
+    let host = origin.address.to_string();
+
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"stale");
+    let response = get(proxy, &uri, &host, &[("Cache-Control", "only-if-cached")]).await;
+    assert_eq!(response.head.status, 504);
+    assert_eq!(origin.requests.lock().expect("requests").len(), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache38_egress_isolation() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let origin = m03::spawn_origin(|_, _| {
+        m03::response("200 OK", &[("Cache-Control", "max-age=60")], b"egress")
+    })
+    .await
+    .expect("origin");
+    let text = format!(
+        "{}\n[[egress]]\nid = \"a\"\nmode = \"system\"\n\n[[egress]]\nid = \"b\"\nmode = \"system\"\n\n[routing]\ndefault_egress = \"a\"\n\n[[routing.rules]]\nid = \"by-source\"\negress_id = \"b\"\nsources = [\"127.0.0.2/32\"]\n\n[cache]\n{DEFAULT_CACHE}\n",
+        m03::config("127.0.0.1:3128")
+    );
+    let (server, proxy) = start(&text).await;
+    let uri = format!("http://{}/egress", origin.address);
+    let host = origin.address.to_string();
+    let first = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let second = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+    assert_eq!(
+        get_from(first, proxy, &uri, &host, &[]).await.body,
+        b"egress"
+    );
+    assert_eq!(
+        get_from(second, proxy, &uri, &host, &[]).await.body,
+        b"egress"
+    );
+    assert_eq!(origin.requests.lock().expect("requests").len(), 2);
+    assert_eq!(
+        get_from(second, proxy, &uri, &host, &[]).await.body,
+        b"egress"
+    );
+    assert_eq!(origin.requests.lock().expect("requests").len(), 2);
+    assert_eq!(server.control().metrics().cache_hit, 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache39_revalidation_connection_failure_is_proxy_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let origin_address = listener.local_addr().expect("origin address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("origin accept");
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Length: 8\r\nConnection: close\r\n\r\nold-body",
+            )
+            .await;
+    });
+
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{origin_address}/revalidation-fail");
+    let host = origin_address.to_string();
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"old-body");
+    task.await.expect("origin task");
+
+    let second = get(proxy, &uri, &host, &[]).await;
+    assert!(
+        second.head.status == 502 || second.head.status == 504,
+        "unexpected status {}",
+        second.head.status
+    );
+    assert_ne!(second.body, b"old-body");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache40_parent_failure_after_success_is_not_cached() {
+    use common::m09::{self, ParentMode};
+
+    let origin = m03::spawn_origin(|_, _| {
+        m03::response("200 OK", &[("Cache-Control", "max-age=60")], b"parent-ok")
+    })
+    .await
+    .expect("origin");
+    let parent = m09::spawn_parent(ParentMode::Forward)
+        .await
+        .expect("parent");
+    let text = format!(
+        "{}\n[[parents]]\nid = \"parent\"\nendpoint = \"{}\"\ntransport = \"http\"\n\n[routing]\ndefault_egress = \"system\"\ndefault_parent = \"parent\"\n\n[cache]\n{DEFAULT_CACHE}\n",
+        m03::config("127.0.0.1:3128"),
+        parent.address
+    );
+    let (server, proxy) = start(&text).await;
+    let uri = format!("http://{}/parent-fail", origin.address);
+    let host = origin.address.to_string();
+
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"parent-ok");
+    parent.set_mode(ParentMode::Abort);
+    let second = get(proxy, &uri, &host, &[]).await;
+    assert_eq!(second.head.status, 502);
+    assert_eq!(origin.requests.lock().expect("requests").len(), 1);
+    assert_eq!(parent.request_count(), 2);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m10_cache43_twenty_clients_small_budget_stay_bounded() {
+    const BODY_LEN: usize = 12 * 1024;
+    let body = vec![b'b'; BODY_LEN];
+    let origin_body = body.clone();
+    let origin = m03::spawn_origin(move |_, _| {
+        m03::response("200 OK", &[("Cache-Control", "max-age=60")], &origin_body)
+    })
+    .await
+    .expect("origin");
+    let cache = "enabled = true\nmax_bytes = 65536\nmax_object_bytes = 16384\nmax_entries = 4\nmax_fills = 8";
+    let text = cache_config(cache, "")
+        .replace("max_client_connections = 16", "max_client_connections = 32")
+        .replace("max_connecting = 8", "max_connecting = 32");
+    let (server, proxy) = start(&text).await;
+    let host = origin.address.to_string();
+
+    for round in 0..2 {
+        let mut tasks = Vec::new();
+        for index in 0..20 {
+            let uri = format!("http://{}/item?{index}", origin.address);
+            let host = host.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = get(proxy, &uri, &host, &[]).await;
+                if response.head.status != 200 {
+                    eprintln!(
+                        "unexpected {} body {:?}",
+                        response.head.status, response.body
+                    );
+                }
+                (response.head.status, response.body.len())
+            }));
+        }
+        for task in tasks {
+            let (status, length) = task.await.expect("client task");
+            assert_eq!(status, 200);
+            assert_eq!(length, BODY_LEN, "round {round}");
+        }
+    }
+    let metrics = server.control().metrics();
+    assert!(metrics.cache_entries <= 4, "{metrics:?}");
+    assert!(metrics.cache_bytes <= 65536, "{metrics:?}");
+    assert!(metrics.cache_eviction > 0, "{metrics:?}");
+    assert!(origin.requests.lock().expect("requests").len() <= 40);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m10_cache44_invalidation_of_other_uri_keeps_slow_fill() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            if stream.read(&mut byte).await.ok()? == 0 {
+                return None;
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8(head).ok()?;
+        let mut parts = text.split_whitespace();
+        Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let origin_address = listener.local_addr().expect("origin address");
+    let slow_gets = Arc::new(AtomicUsize::new(0));
+    let task_gets = Arc::clone(&slow_gets);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let gets = Arc::clone(&task_gets);
+            tokio::spawn(async move {
+                let Some((method, target)) = read_head(&mut stream).await else {
+                    return;
+                };
+                if method == "POST" {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nposted")
+                        .await;
+                    return;
+                }
+                if !target.contains("/slow") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                gets.fetch_add(1, Ordering::SeqCst);
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4096\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if stream.write_all(&vec![b'x'; 512]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = stream.write_all(&vec![b'x'; 4096 - 512]).await;
+            });
+        }
+    });
+
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{origin_address}/slow");
+    let host = origin_address.to_string();
+    let slow_uri = uri.clone();
+    let slow_host = host.clone();
+    let slow = tokio::spawn(async move { get(proxy, &slow_uri, &slow_host, &[]).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let posted = send_raw(
+        proxy,
+        &m03::request("POST", origin_address, "/other", &[], b"x"),
+    )
+    .await;
+    assert_eq!(posted.body, b"posted");
+    let slow_response = slow.await.expect("slow request");
+    assert_eq!(slow_response.body.len(), 4096);
+
+    let again = get(proxy, &uri, &host, &[]).await;
+    assert_eq!(again.body.len(), 4096);
+    assert_eq!(slow_gets.load(Ordering::SeqCst), 1);
+    assert!(server.control().metrics().cache_hit >= 1);
+    task.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache45_reload_during_fill_discards_the_old_generation() {
+    use angara::control::ReloadOutcome;
+    use common::TempDir;
+
+    let (origin, requests, origin_task) = spawn_slow_get_origin(4096).await;
+    let dir = TempDir::new("m10-cache-fill-reload");
+    let text = cache_config(DEFAULT_CACHE, "");
+    let path = dir.write("proxy.toml", &text);
+    let config = Arc::new(Config::load(&path).expect("initial config"));
+    let server = HttpServer::bind_ephemeral_with_path(config, path.clone())
+        .await
+        .expect("bind proxy");
+    let proxy = server.addresses()[0].1;
+    let uri = format!("http://{origin}/slow-reload");
+    let host = origin.to_string();
+
+    let slow_uri = uri.clone();
+    let slow_host = host.clone();
+    let slow = tokio::spawn(async move { get(proxy, &slow_uri, &slow_host, &[]).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(matches!(
+        server.control().reload(1).await,
+        ReloadOutcome::Applied { generation: 2 }
+    ));
+    let slow_response = slow.await.expect("slow request");
+    assert_eq!(slow_response.body.len(), 4096);
+
+    let again = get(proxy, &uri, &host, &[]).await;
+    assert_eq!(again.body.len(), 4096);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    origin_task.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m10_cache46_shutdown_during_fill_releases_cache_budget() {
+    let (origin, _requests, origin_task) = spawn_slow_get_origin(4096).await;
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let telemetry = server.telemetry();
+    let uri = format!("http://{origin}/slow-shutdown");
+    let host = origin.to_string();
+
+    let slow_uri = uri.clone();
+    let slow = tokio::spawn(async move { get(proxy, &slow_uri, &host, &[]).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let shutdown = tokio::time::timeout(Duration::from_secs(5), server.shutdown()).await;
+    assert!(shutdown.is_ok(), "shutdown did not finish during a fill");
+    let _ = slow.await;
+
+    let metrics = telemetry.snapshot();
+    assert_eq!(metrics.cache_entries, 0);
+    assert_eq!(metrics.cache_bytes, 0);
+    origin_task.abort();
 }

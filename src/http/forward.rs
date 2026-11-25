@@ -1235,6 +1235,11 @@ impl Proxy {
                         return entry.response(config.instance_id());
                     }
                 }
+                Revalidation::Unusable => {
+                    if let Some(store) = self.cache.as_ref() {
+                        store.remove(&key);
+                    }
+                }
                 Revalidation::Response(response, lease) => {
                     let response = self.finalize_direct(
                         config,
@@ -1523,13 +1528,11 @@ impl Proxy {
                     if let (Some(expected), Some(actual)) = (
                         expected_etag.as_ref(),
                         response.headers().get(http::header::ETAG),
-                    ) && expected != actual
+                    ) && !weak_etag_eq(expected, actual)
                     {
-                        lease.abort();
-                        return Revalidation::Failed(headers::error_response(
-                            StatusCode::BAD_GATEWAY,
-                            true,
-                        ));
+                        drop(response);
+                        lease.response_complete();
+                        return Revalidation::Unusable;
                     }
                     let mut updated = response.headers().clone();
                     if crate::http::headers::filter_hop_by_hop(&mut updated, false).is_err() {
@@ -1868,8 +1871,19 @@ fn log_terminal_with_reason(
 
 enum Revalidation {
     NotModified(http::HeaderMap),
+    Unusable,
     Response(Response<Incoming>, Box<Lease>),
     Failed(Response<ResponseBody>),
+}
+
+fn weak_etag_eq(left: &http::HeaderValue, right: &http::HeaderValue) -> bool {
+    let Ok(left) = left.to_str() else {
+        return false;
+    };
+    let Ok(right) = right.to_str() else {
+        return false;
+    };
+    left.strip_prefix("W/").unwrap_or(left) == right.strip_prefix("W/").unwrap_or(right)
 }
 
 fn is_safe_method(method: &Method) -> bool {

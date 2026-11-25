@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::header::{
     ACCEPT_ENCODING, AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, COOKIE,
     DATE, ETAG, EXPIRES, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
@@ -31,6 +31,7 @@ use crate::telemetry::Telemetry;
 const ENTRY_OVERHEAD: usize = 256;
 const HEADER_OVERHEAD: usize = 32;
 const KEY_OVERHEAD: usize = 128;
+const MAX_URI_EPOCHS: usize = 8_192;
 
 /// Stored representation variant.
 ///
@@ -321,10 +322,12 @@ pub(crate) struct CacheStore {
     min_generation: AtomicU64,
     epoch: AtomicU64,
     tick: AtomicU64,
+    closed: AtomicBool,
 }
 
 struct StoreInner {
     entries: HashMap<CacheKey, Arc<CacheEntry>>,
+    uri_epochs: HashMap<String, u64>,
 }
 
 impl CacheStore {
@@ -333,6 +336,7 @@ impl CacheStore {
         Arc::new(Self {
             inner: Mutex::new(StoreInner {
                 entries: HashMap::new(),
+                uri_epochs: HashMap::new(),
             }),
             used: Arc::new(AtomicUsize::new(0)),
             max_bytes: config.max_bytes(),
@@ -343,6 +347,7 @@ impl CacheStore {
             min_generation: AtomicU64::new(1),
             epoch: AtomicU64::new(0),
             tick: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -372,7 +377,7 @@ impl CacheStore {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
             };
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.bump_uri_epoch(&mut inner, &key.uri);
             inner.entries.remove(key)
         };
         drop(removed);
@@ -395,7 +400,23 @@ impl CacheStore {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let mut headers = headers;
+        if self.closed.load(Ordering::Acquire) {
+            self.telemetry
+                .cache_fill_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let (epoch, uri_epoch) = self
+            .inner
+            .lock()
+            .map(|inner| {
+                (
+                    self.epoch.load(Ordering::Acquire),
+                    Self::uri_epoch_locked(&inner, &key.uri),
+                )
+            })
+            .unwrap_or((0, 0));
+        let mut headers = copy_headers(&headers);
         if crate::http::headers::filter_hop_by_hop(&mut headers, false).is_err() {
             self.telemetry
                 .cache_fill_refusals
@@ -408,16 +429,43 @@ impl CacheStore {
         {
             headers.insert(DATE, value);
         }
-        let base = key
+        let base_without_body = key
             .accounted_bytes()
             .saturating_add(headers_accounted_bytes(&headers))
             .saturating_add(ENTRY_OVERHEAD);
-        if base > self.max_object_bytes {
+        if base_without_body > self.max_object_bytes {
             self.telemetry
                 .cache_fill_refusals
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        let max_body_capacity = self.max_object_bytes.saturating_sub(base_without_body);
+        let initial_capacity = match expected_len {
+            Some(length) => {
+                let Ok(length) = usize::try_from(length) else {
+                    self.telemetry
+                        .cache_fill_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                if length > max_body_capacity {
+                    self.telemetry
+                        .cache_fill_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                length
+            }
+            None => 0,
+        };
+        let body = BytesMut::with_capacity(initial_capacity);
+        if body.capacity() > max_body_capacity {
+            self.telemetry
+                .cache_fill_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let base = base_without_body.saturating_add(body.capacity());
         let Some(account) = self.reserve(base) else {
             self.telemetry
                 .cache_fill_refusals
@@ -432,11 +480,12 @@ impl CacheStore {
             expected_len,
             request_time,
             response_time,
-            chunks: Vec::new(),
+            body,
             data_bytes: 0,
             account,
             _slot: slot,
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch,
+            uri_epoch,
             max_object_bytes: self.max_object_bytes,
             failed: false,
             finished: false,
@@ -455,6 +504,26 @@ impl CacheStore {
             self.remove(key);
             return false;
         };
+        let old_header_bytes = entry
+            .meta
+            .lock()
+            .map(|current| headers_accounted_bytes(&current.headers))
+            .unwrap_or(0);
+        let new_header_bytes = headers_accounted_bytes(&meta.headers);
+        if new_header_bytes > old_header_bytes {
+            let Ok(mut account) = entry._account.lock() else {
+                return false;
+            };
+            if !self.grow_account(&mut account, new_header_bytes - old_header_bytes) {
+                drop(account);
+                self.remove(key);
+                return false;
+            }
+        } else if old_header_bytes > new_header_bytes
+            && let Ok(mut account) = entry._account.lock()
+        {
+            account.shrink(old_header_bytes - new_header_bytes);
+        }
         let Ok(mut current) = entry.meta.lock() else {
             return false;
         };
@@ -468,7 +537,7 @@ impl CacheStore {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
             };
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.bump_uri_epoch(&mut inner, uri);
             let keys = inner
                 .entries
                 .keys()
@@ -514,11 +583,13 @@ impl CacheStore {
 
     /// Clears every published entry and invalidates in-flight fills.
     pub(crate) fn clear(&self) {
+        self.closed.store(true, Ordering::Release);
         let removed = {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
             };
             self.epoch.fetch_add(1, Ordering::AcqRel);
+            inner.uri_epochs.clear();
             inner
                 .entries
                 .drain()
@@ -539,6 +610,22 @@ impl CacheStore {
             u64::try_from(entries).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    fn uri_epoch_locked(inner: &StoreInner, uri: &str) -> u64 {
+        inner.uri_epochs.get(uri).copied().unwrap_or(0)
+    }
+
+    fn bump_uri_epoch(&self, inner: &mut StoreInner, uri: &str) {
+        if inner.uri_epochs.len() >= MAX_URI_EPOCHS && !inner.uri_epochs.contains_key(uri) {
+            // Keep the per-URI registry bounded. The global bump discards
+            // every in-flight fill, which is the conservative fallback when
+            // the registry cannot retain another URI.
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            inner.uri_epochs.clear();
+        }
+        let counter = inner.uri_epochs.entry(uri.to_owned()).or_insert(0);
+        *counter = counter.saturating_add(1);
     }
 
     fn reserve(&self, bytes: usize) -> Option<Account> {
@@ -623,12 +710,20 @@ impl CacheStore {
         }
     }
 
-    fn publish(&self, key: CacheKey, entry: Arc<CacheEntry>, expected_epoch: u64) -> bool {
+    fn publish(
+        &self,
+        key: CacheKey,
+        entry: Arc<CacheEntry>,
+        expected_epoch: u64,
+        expected_uri_epoch: u64,
+    ) -> bool {
         let (removed, evicted) = {
             let Ok(mut inner) = self.inner.lock() else {
                 return false;
             };
-            if self.epoch.load(Ordering::Acquire) != expected_epoch
+            if self.closed.load(Ordering::Acquire)
+                || self.epoch.load(Ordering::Acquire) != expected_epoch
+                || Self::uri_epoch_locked(&inner, &key.uri) != expected_uri_epoch
                 || key.generation < self.min_generation.load(Ordering::Acquire)
             {
                 return false;
@@ -655,9 +750,9 @@ impl CacheStore {
                 }
             }
             if evicted > 0 {
-                // A Vary-rule change makes other in-flight fills
+                // A Vary-rule change makes other in-flight fills for this URI
                 // incompatible with the newly stored variant.
-                self.epoch.fetch_add(1, Ordering::AcqRel);
+                self.bump_uri_epoch(&mut inner, &key.uri);
             }
             while inner.entries.len() >= self.max_entries && !inner.entries.contains_key(&key) {
                 let Some(victim) = inner
@@ -722,6 +817,19 @@ impl Account {
             }
         }
     }
+
+    fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        if bytes == 0 {
+            return;
+        }
+        self.bytes -= bytes;
+        let previous = self.used.fetch_sub(bytes, Ordering::AcqRel);
+        self.telemetry.cache_bytes.store(
+            u64::try_from(previous.saturating_sub(bytes)).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 impl Drop for Account {
@@ -743,11 +851,12 @@ pub(crate) struct CacheFill {
     expected_len: Option<u64>,
     request_time: SystemTime,
     response_time: SystemTime,
-    chunks: Vec<Bytes>,
+    body: BytesMut,
     data_bytes: usize,
     account: Account,
     _slot: OwnedSemaphorePermit,
     epoch: u64,
+    uri_epoch: u64,
     max_object_bytes: usize,
     failed: bool,
     finished: bool,
@@ -759,25 +868,53 @@ impl CacheFill {
         if self.failed || self.finished || data.is_empty() {
             return;
         }
-        let extra = data.len().saturating_add(std::mem::size_of::<Bytes>());
-        if self.account.bytes.saturating_add(extra) > self.max_object_bytes {
+        let Some(new_len) = self.data_bytes.checked_add(data.len()) else {
             self.failed = true;
-            self.store
-                .telemetry
-                .cache_fill_refusals
-                .fetch_add(1, Ordering::Relaxed);
             return;
+        };
+        if new_len > self.body.capacity() {
+            let base_bytes = self.account.bytes.saturating_sub(self.body.capacity());
+            let max_capacity = self.max_object_bytes.saturating_sub(base_bytes);
+            if new_len > max_capacity {
+                self.failed = true;
+                self.store
+                    .telemetry
+                    .cache_fill_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let mut target = self.body.capacity().max(4096);
+            while target < new_len {
+                target = target.saturating_mul(2);
+            }
+            target = target.min(max_capacity);
+            let delta = target.saturating_sub(self.body.capacity());
+            if delta > 0 && !self.store.grow_account(&mut self.account, delta) {
+                self.failed = true;
+                self.store
+                    .telemetry
+                    .cache_fill_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let old_capacity = self.body.capacity();
+            self.body.reserve(target.saturating_sub(self.body.len()));
+            let actual_delta = self.body.capacity().saturating_sub(old_capacity);
+            if actual_delta > delta
+                && !self
+                    .store
+                    .grow_account(&mut self.account, actual_delta - delta)
+            {
+                self.failed = true;
+                self.store
+                    .telemetry
+                    .cache_fill_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
-        if !self.store.grow_account(&mut self.account, extra) {
-            self.failed = true;
-            self.store
-                .telemetry
-                .cache_fill_refusals
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.data_bytes += data.len();
-        self.chunks.push(data.clone());
+        self.body.extend_from_slice(data);
+        self.data_bytes = new_len;
     }
 
     /// Publishes the entry only when the complete body was observed.
@@ -793,8 +930,9 @@ impl CacheFill {
         }
         let store = Arc::clone(&self.store);
         let account = self.account;
+        let body = std::mem::take(&mut self.body).freeze();
         let entry = Arc::new(CacheEntry {
-            body: Arc::new(std::mem::take(&mut self.chunks)),
+            body: Arc::new(vec![body]),
             data_bytes: self.data_bytes,
             meta: Mutex::new(EntryMeta {
                 headers: std::mem::take(&mut self.headers),
@@ -804,9 +942,9 @@ impl CacheFill {
                 request_time: self.request_time,
             }),
             last_access: AtomicU64::new(0),
-            _account: account,
+            _account: Mutex::new(account),
         });
-        store.publish(self.key.clone(), entry, self.epoch)
+        store.publish(self.key.clone(), entry, self.epoch, self.uri_epoch)
     }
 }
 
@@ -816,7 +954,7 @@ pub(crate) struct CacheEntry {
     data_bytes: usize,
     meta: Mutex<EntryMeta>,
     last_access: AtomicU64,
-    _account: Account,
+    _account: Mutex<Account>,
 }
 
 struct EntryMeta {
@@ -943,11 +1081,9 @@ impl CacheEntry {
         let age_header = single_header(headers, AGE).ok()?;
         let _ = single_header(headers, ETAG).ok()?;
         let _ = single_header(headers, LAST_MODIFIED).ok()?;
-        let mut merged = self.meta.lock().ok()?.headers.clone();
+        let mut merged = copy_headers(&self.meta.lock().ok()?.headers);
         for name in [CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, VARY] {
-            if let Some(value) = headers.get(&name) {
-                merged.insert(name, value.clone());
-            }
+            replace_header_values(&mut merged, name, headers);
         }
         merged.remove(AGE);
         merged.remove(CONTENT_LENGTH);
@@ -981,7 +1117,7 @@ impl CacheEntry {
     }
 }
 
-/// Response body that yields stored chunks without copying. Holding the
+/// Response body that yields the stored buffer without copying. Holding the
 /// `Arc<CacheEntry>` keeps the account alive while a slow reader drains a body
 /// that was already evicted from the index.
 pub(crate) struct CachedBody {
@@ -1118,13 +1254,45 @@ impl Drop for CacheFillBody {
     }
 }
 
+fn copy_header_value(value: &HeaderValue) -> HeaderValue {
+    HeaderValue::from_bytes(value.as_bytes()).expect("validated header value")
+}
+
+fn copy_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut copied = HeaderMap::with_capacity(headers.len());
+    for name in headers.keys() {
+        for value in headers.get_all(name) {
+            copied.append(name.clone(), copy_header_value(value));
+        }
+    }
+    copied
+}
+
+fn replace_header_values(target: &mut HeaderMap, name: HeaderName, source: &HeaderMap) {
+    let mut values = Vec::new();
+    for value in source.get_all(&name) {
+        values.push(copy_header_value(value));
+    }
+    if values.is_empty() {
+        return;
+    }
+    target.remove(&name);
+    for value in values {
+        target.append(name.clone(), value);
+    }
+}
+
 fn headers_accounted_bytes(headers: &HeaderMap) -> usize {
-    headers.iter().fold(0_usize, |total, (name, value)| {
-        total
-            .saturating_add(name.as_str().len())
-            .saturating_add(value.len())
-            .saturating_add(HEADER_OVERHEAD)
-    })
+    let mut total = 0_usize;
+    for name in headers.keys() {
+        for value in headers.get_all(name) {
+            total = total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.len())
+                .saturating_add(HEADER_OVERHEAD);
+        }
+    }
+    total
 }
 
 fn single_header(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>, ()> {
@@ -1534,7 +1702,7 @@ mod tests {
 
     #[test]
     fn incomplete_or_oversized_fill_is_not_published() {
-        let store = store(64 * 1024, 1024, 4, 1);
+        let store = store(64 * 1024, 2048, 4, 1);
         let mut fill = store
             .begin_fill(
                 key("http://example.test/short"),
@@ -1562,7 +1730,7 @@ mod tests {
                 SystemTime::now(),
             )
             .expect("fill");
-        fill.push(&Bytes::from(vec![1_u8; 2048]));
+        fill.push(&Bytes::from(vec![1_u8; 4096]));
         assert!(!fill.finish());
     }
 
@@ -1570,6 +1738,62 @@ mod tests {
         let mut key = key(uri);
         key.variant = variant;
         key
+    }
+
+    #[test]
+    fn invalidation_of_another_uri_keeps_the_inflight_fill() {
+        let store = store(64 * 1024, 16 * 1024, 4, 1);
+        let first = "http://example.test/first";
+        let mut fill = store
+            .begin_fill(
+                key(first),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("fill");
+        fill.push(&Bytes::from_static(b"first"));
+        store.invalidate("http://example.test/other");
+        assert!(fill.finish());
+        assert!(matches!(
+            store.lookup(&key(first), SystemTime::now()),
+            Lookup::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn revalidation_updates_header_accounting() {
+        let store = store(64 * 1024, 16 * 1024, 4, 1);
+        let uri = "http://example.test/revalidate-account";
+        let mut fill = store
+            .begin_fill(
+                key(uri),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("fill");
+        fill.push(&Bytes::from_static(b"body"));
+        assert!(fill.finish());
+        let entry = match store.lookup(&key(uri), SystemTime::now()) {
+            Lookup::Fresh(entry) => entry,
+            _ => panic!("entry missing"),
+        };
+        let before = store.telemetry.cache_bytes.load(Ordering::Relaxed);
+        let updated = headers(&[
+            ("Cache-Control", "max-age=60"),
+            ("ETag", "\"a-very-long-validator-value-for-accounting\""),
+        ]);
+        assert!(store.revalidate(&key(uri), &entry, &updated, SystemTime::now()));
+        let after = store.telemetry.cache_bytes.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "header accounting did not grow: {before} -> {after}"
+        );
     }
 
     #[test]

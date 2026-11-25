@@ -172,25 +172,27 @@ Claude Opus 5.5 оценивает соответствие сценария т�
 ### Контракт приёмки M10 (CACHE-01)
 
 Локальные проверки: `cargo test --locked --test config_m10` (6 тестов),
-`cargo test --locked --test m10_cache` (33 теста) и unit-тесты `cache::tests`
-(12 тестов). Полный прогон на ветке реализации: `cargo test --locked` —
-519 passed, 0 failed, 3 ignored; `cargo test --locked --test m10_cache`
-повторяется для проверки стабильности.
+`cargo test --locked --test m10_cache` (44 теста), `m10_limits` (2 Linux-теста
+RSS/медленного читателя) и unit-тесты `cache::tests` (14 тестов). Полный прогон
+на ветке реализации: `cargo test --locked` — 534 passed, 0 failed, 3 ignored;
+`cargo test --locked --test m10_cache` повторяется для проверки стабильности.
 
 | Строка CACHE-01 | Тесты |
 | --- | --- |
-| Выключен / холодный / прогретый | `m10_cache01` (два GET → один origin), `m10_cache02` (старый конфиг и `enabled=false` → два origin), `m10_cache03` (path/query/порт) |
-| Свежесть и варианты | `m10_cache04` (`Age` и граница), `m10_cache05` (`s-maxage` приоритет), `m10_cache06` (`Expires`/`Date` и приоритет `max-age`), `m10_cache07` (gzip/identity/отсутствие `Accept-Encoding`), `m10_cache08` (`Vary: *` и неподдержанные поля); unit `vary_change_removes_incompatible_variant` |
-| Ревалидация | `m10_cache09` (ETag → 304 → полное тело), `m10_cache10` (Last-Modified), `m10_cache11` (200 заменяет объект), `m10_cache12` (ошибка upstream не заменяется старым телом), `m10_cache13` (непригодный 304 → один безусловный GET), `m10_cache14` (клиентские `If-*`/Range) |
-| Приватность и ACL | `m10_cache15` (`Authorization`/`Cookie`/`Set-Cookie`), `m10_cache16` (пользователи), `m10_cache17` (listeners), `m10_cache18` (поколение после reload), `m10_cache19` (ACL deny на прогретом кеше), `m10_cache30` (журналы/метрики без URL и тел) |
-| Маршрутизация | `m10_cache20` (parent: каждый запрос до parent), `m10_cache21` (CONNECT не кешируется), `m10_cache28` (смена проверенного endpoint) |
-| Инвалидирование | `m10_cache27` (POST инвалидирует URI), `m10_cache33` (Location на тот же origin); unit `invalidation_discards_an_inflight_fill` (начатое наполнение не публикуется после invalidation) |
-| Память и потоковая передача | `m10_cache22` (малый бюджет, LRU и верхние пределы), `m10_cache23` (слишком большой объект не публикуется), `m10_cache24` (trailers), `m10_cache31` (оборванное тело не публикуется), `m10_cache32` (20 одновременных клиентов на прогретой записи); unit `store_evicts_and_accounts_bodies`, `incomplete_or_oversized_fill_is_not_published`, `slow_reader_keeps_evicted_object_accounted` |
-| Директивы клиента | `m10_cache25` (`only-if-cached` → 504/тёплый ответ), `m10_cache26` (`no-cache`/`min-fresh` → upstream) |
+| Выключен / холодный / прогретый | `m10_cache01`–`m10_cache03`: два GET → один origin; старый конфиг/`enabled=false` → два origin; path/query/порт |
+| Свежесть и варианты | `m10_cache04`–`m10_cache08`: `Age`/граница, `s-maxage`, `Expires`/`Date`, gzip/identity/отсутствие `Accept-Encoding`, `Vary: *`; unit `vary_change_removes_incompatible_variant` |
+| Ревалидация | `m10_cache09`–`m10_cache14`, `m10_cache34`–`m10_cache36`, `m10_cache39`: ETag/Last-Modified → 304 → полное тело; 200 заменяет; ошибка/таймаут/отказ соединения — штатная ошибка прокси; непригодный 304 и другой/слабый ETag → один безусловный GET; многострочный `Cache-Control` в 304; клиентские `If-*`/Range |
+| Приватность и ACL | `m10_cache15`–`m10_cache19`, `m10_cache30`, `m10_cache38`: Authorization/Cookie/Set-Cookie, пользователи, listeners, egress, поколение, ACL deny на прогретом кеше, журналы/метрики без URL и тел |
+| Маршрутизация | `m10_cache20`, `m10_cache21`, `m10_cache28`, `m10_cache40`: parent bypass, CONNECT, смена endpoint, отказ parent после предыдущего успеха |
+| Инвалидирование | `m10_cache27`, `m10_cache33`, `m10_cache44`: POST инвалидирует URI, same-origin `Location`, наполнение другого URI не отменяется; unit `invalidation_discards_an_inflight_fill`, `invalidation_of_another_uri_keeps_the_inflight_fill` |
+| Память и потоковая передача | `m10_cache22`–`m10_cache24`, `m10_cache31`, `m10_cache32`, `m10_cache43`, `m10_cache45`, `m10_cache46`, `m10_limits01`, `m10_limits02`: малый бюджет/LRU, 20 клиентов на прогретой записи и при малом бюджете, слишком большой/оборванный ответ, trailers, reload/shutdown во время наполнения, RSS после крупных `no-store` ответов, медленный читатель; unit `store_evicts_and_accounts_bodies`, `incomplete_or_oversized_fill_is_not_published`, `slow_reader_keeps_evicted_object_accounted`, `revalidation_updates_header_accounting` |
+| Директивы клиента | `m10_cache25`–`m10_cache26`, `m10_cache37`: `only-if-cached` холодный/тёплый/просроченный → 504 или ответ; `no-cache`/`min-fresh` → upstream |
 | Конфигурация | `m10_cfg01`–`m10_cfg06`: отсутствие/выключение, defaults, диапазоны, cross-field предел, restart-required, `angara check` |
 | TLS-вход | `m10_cache29` (HTTPS listener использует тот же кеш) |
 
 Кеш по умолчанию выключен. Полный `workflow_dispatch` с часовым soak по D57
-обязателен для изменения `src/`; отдельный нагрузочный сценарий с включённым
-кешем проверяет 10 и 20 клиентов, eviction, медленного читателя и возврат
-ресурсов. Штатный soak с выключенным кешем сам по себе не подтверждает CACHE-01.
+обязателен для изменения `src/`. Отдельный сценарий `tests/m08/cache_load.sh`
+запускается в Ubuntu CI job `10/20 clients, workers and streaming`, использует
+10 и 20 клиентов, проверяет `cache_hit`/`cache_miss`/`cache_entries`/`cache_bytes`
+и RSS-прирост. Штатный soak с выключенным кешем сам по себе не подтверждает
+CACHE-01.
