@@ -73,8 +73,9 @@ measured result. Do not describe a single build as reproducible by itself.
 `packaging/generate-notices.py` reads `cargo metadata --locked
 --filter-platform x86_64-unknown-linux-gnu`, copies LICENSE/NOTICE/COPYING
 files shipped by each crate, writes a generated note when a crate ships no
-separate file, and includes the local hyper patch description. Angara's own
-license remains undecided and no `LICENSE` file is added by this stage.
+separate file, and includes the local hyper patch description. Angara itself
+is MIT-licensed (`LICENSE` in the repository root); the generator still skips
+the `angara` package, so the archive does not ship that file yet.
 
 ## A and B builds for upgrade testing
 

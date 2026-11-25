@@ -205,8 +205,8 @@ M07 добавляет `arc-swap` 1.9.5 и `serde_json` 1. Hyper 1.12.0
 Политика
 зависимостей проверяется
 [`deny.toml`](deny.toml): RustSec advisories, allow-list MIT/Apache-2.0/
-BSD-3-Clause/ISC/Unicode-3.0, только crates.io, запрет wildcard-версий. Лицензия самого Angara
-не выбрана и `LICENSE` не создаётся; `[licenses.private]` исключает только
+BSD-3-Clause/ISC/Unicode-3.0, только crates.io, запрет wildcard-версий. Сам Angara
+распространяется по лицензии MIT ([`LICENSE`](LICENSE)); `[licenses.private]` исключает только
 непубликуемый crate Angara, внешние зависимости проверяются полностью.
 
 ### CI

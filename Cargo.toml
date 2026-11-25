@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.97"
 publish = false
 description = "Angara proxy — HTTP/1.1 forward proxy, strict config, ACL, DNS and egress transport"
-repository = "https://github.com/AlexeiSmol/Angara"
+license = "MIT"
+repository = "https://github.com/AlexiVladSmol/Angara2"
 
 [dependencies]
 arc-swap = "~1.9.5"
