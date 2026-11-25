@@ -143,7 +143,7 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 
 ### Контракт приёмки M09 (PARENT-01)
 
-Локальные проверки: `cargo test --locked --test config_m09` (11 тестов) и `cargo test --locked --test m09_parent` (34 теста).
+Локальные проверки: `cargo test --locked --test config_m09` (11 тестов) и `cargo test --locked --test m09_parent` (35 тестов).
 
 | Строка PARENT-01 | Тесты |
 | --- | --- |
@@ -153,7 +153,7 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 | Клиентские отказы и DNS | `m09_parent20` (IP deny, нулевые счётчики), `m09_parent21` (ACL deny, нулевые счётчики), `m09_parent02` (parent получает числовой IP) |
 | HTTP к имени через туннель | `m09_parent02`, `m09_parent05`, `m09_parent11` |
 | TLS и отказы parent | `m09_parent05`, `m09_parent06`, `m09_parent08`, `m09_parent10`, `m09_parent11`, `m09_parent19`, `m09_parent25` (обрыв без replay POST) |
-| TLS-parent без `close_notify` и parent ID в отказе CONNECT | `m09_parent28` (client EOF → success/completed), `m09_parent29` (обрыв до client EOF → failed/error), `m09_parent30` (407/503 CONNECT → `parent_id`,`route=parent`,`reason=error`) |
+| TLS-parent без `close_notify` и parent ID в отказе CONNECT | `m09_parent28` (client EOF → success/completed), `m09_parent29` (обрыв до client EOF → failed/error), `m09_parent30` (407/503 CONNECT → `parent_id`,`route=parent`,`reason=error`), `m09_parent31` (`close_notify` + немедленный TCP close → success/completed) |
 | Сетевой интерфейс и поколения | `m09_parent13`, `m09_parent23` (два parent/credentials), `m09_parent24` (bind_ip source + IPv6 target) |
 | Петли и ресурсы | `m09_parent16a` (A→B без петли, оба Via в HTTP), `m09_parent16b` (HTTP к IP: петля, счётчик на вернувшемся A), `m09_parent16c` (клиентский CONNECT: петля), `m09_parent16d` (HTTP к имени: петля), `m09_parent16e`/`16f` (цепочка A→B без петли для CONNECT/HTTP, оба Via во внешнем CONNECT), `m09_parent17` (10 HTTP + 10 CONNECT), `m09_parent18` (tunnel log) |
 | Angara как parent: HTTP-порт только для адреса A | `m09_parent27` |

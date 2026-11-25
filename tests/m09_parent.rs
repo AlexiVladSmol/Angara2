@@ -1065,6 +1065,7 @@ default_parent = "parent"
 
 [connect]
 allowed_ports = [{}]
+half_close_timeout_ms = 1000
 "#,
         parent.port(),
         ca.display(),
@@ -1177,6 +1178,51 @@ async fn m09_parent30_parent_reject_connect_logs_parent_route() {
         assert_eq!(record["route"], "parent");
         assert_eq!(record["reason"], "error");
     }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn m09_parent31_tls_parent_close_notify_then_drop_is_completed() {
+    let dir = TempDir::new("m09-tls-close-notify-drop");
+    m06::generate_pki(dir.path());
+    let acceptor = TlsAcceptor::from(m06::server_config(
+        &dir.path().join("proxy_ip_chain.pem"),
+        &dir.path().join("proxy_ip_key.pem"),
+    ));
+    let len = 16 * 1024;
+    let payload = m09::tls_parent_payload(len);
+    let parent =
+        m09::spawn_one_shot_tls_parent(acceptor, TlsParentClose::SendThenCloseNotifyAndDrop(len))
+            .await
+            .expect("TLS parent");
+    let target = m04::spawn_echo_origin(None).await.expect("echo");
+    let text = tls_parent_config(&dir, parent.address, target.address.port());
+    let (server, proxy, _resolver) = start_with_resolver(&text, Vec::new()).await;
+    let telemetry = server.telemetry();
+    let (logger, receiver) = Logger::channel(128, LogLevel::Info, telemetry);
+    server.set_logger(logger);
+
+    let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+    let authority = target.address.to_string();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.send(request.as_bytes()).await.expect("send CONNECT");
+    assert_eq!(client.read_head().await.expect("head").status, 200);
+    let received = client.read_until_eof().await.expect("parent payload");
+    assert_eq!(received, payload, "client payload mismatch");
+
+    // The parent sent close_notify and closed its socket. Writing into the
+    // closed parent produces the RST/EPIPE path; the following half-close is
+    // the shutdown error that must be treated as a normal TLS half-close.
+    let _ = client.send(b"after-eof").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = client.shutdown_write().await;
+    // The TLS close path can take the configured half-close budget.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let record = receive_event(&receiver, "tunnel_finished");
+    assert_eq!(record["outcome"], "success");
+    assert_eq!(record["reason"], "completed");
 
     server.shutdown().await;
 }

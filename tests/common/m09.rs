@@ -206,6 +206,9 @@ pub enum TlsParentClose {
     /// Send `tls_parent_payload(len)` right after the 200 response, then drop
     /// the TLS stream without close_notify before the client ends its side.
     SendThenDropWithoutCloseNotify(usize),
+    /// Send payload, send close_notify, then close the TCP socket immediately
+    /// without waiting for the client.
+    SendThenCloseNotifyAndDrop(usize),
 }
 
 /// Deterministic payload sent by `TlsParentClose::SendThenDropWithoutCloseNotify`.
@@ -273,6 +276,14 @@ pub async fn spawn_one_shot_tls_parent(
                 if tls.write_all(&payload).await.is_ok() {
                     let _ = tls.flush().await;
                 }
+                drop(tls);
+            }
+            TlsParentClose::SendThenCloseNotifyAndDrop(len) => {
+                let payload = tls_parent_payload(len);
+                if tls.write_all(&payload).await.is_ok() {
+                    let _ = tls.flush().await;
+                }
+                let _ = tls.shutdown().await;
                 drop(tls);
             }
         }
