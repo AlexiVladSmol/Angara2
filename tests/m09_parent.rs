@@ -1065,7 +1065,6 @@ default_parent = "parent"
 
 [connect]
 allowed_ports = [{}]
-half_close_timeout_ms = 1000
 "#,
         parent.port(),
         ca.display(),
@@ -1217,8 +1216,10 @@ async fn m09_parent31_tls_parent_close_notify_then_drop_is_completed() {
     let _ = client.send(b"after-eof").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = client.shutdown_write().await;
-    // The TLS close path can take the configured half-close budget.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // 200–300 ms is enough for the RST + half-close path; the default
+    // half-close budget is not consumed when the shutdown error is classified
+    // as a normal TLS parent half-close.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let record = receive_event(&receiver, "tunnel_finished");
     assert_eq!(record["outcome"], "success");
