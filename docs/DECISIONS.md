@@ -144,7 +144,7 @@ M06 [ACCEPTED Codex](https://github.com/AlexeiSmol/Angara/pull/19#issuecomment-6
 
 ## Приёмка M07 и постановка M08 — 16 ноября 2026 года
 
-Этапы M00–M07 приняты и слиты. База M08 — `main` на `911266e20f07494226f6d67a7c93f00e22a0958d`. M07 принят на `41342696afbe1dacd0dd4b8937c617776a17bbf0`, PR #22 слит, Issue #20 закрыто. Обе проверки на коммите слияния прошли. Исходная регрессия включает 412 основных Linux-тестов и три отдельные ресурсные проверки. [Заключение M07](https://github.com/AlexeiSmol/Angara/pull/22#issuecomment-6913889015) · [CI на коммите слияния](https://github.com/AlexeiSmol/Angara/actions/runs/43849853953)
+Этапы M00–M07 приняты и слиты. База M08 — `main` на `4656430caf034e28fc6dba9ff340d7ddde9a4711`. M07 принят на `fdf8046cd3d6ba285cadff3d8c529bc25fa337a0`, PR #22 слит, Issue #20 закрыто. Обе проверки на коммите слияния прошли. Исходная регрессия включает 412 основных Linux-тестов и три отдельные ресурсные проверки. [Заключение M07](https://github.com/AlexeiSmol/Angara/pull/22#issuecomment-6913889015) · [CI на коммите слияния](https://github.com/AlexeiSmol/Angara/actions/runs/43849853953)
 
 | ID | Решение | Основание |
 | --- | --- | --- |

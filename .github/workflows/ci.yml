@@ -559,7 +559,7 @@ jobs:
         run: |
           set -euo pipefail
           HEAD_SHA=$(git rev-parse HEAD)
-          BASE=911266e20f07494226f6d67a7c93f00e22a0958d
+          BASE=4656430caf034e28fc6dba9ff340d7ddde9a4711
           git worktree add --detach ../angara-a-base "$BASE"
           packaging/build-release.sh \
             --source-dir ../angara-a-base \
