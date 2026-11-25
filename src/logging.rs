@@ -199,6 +199,22 @@ pub struct MetricsSummary {
     pub live_generations: u64,
     /// Dropped log records.
     pub log_dropped: u64,
+    /// Cache hits served from a stored representation.
+    pub cache_hit: u64,
+    /// Cache lookups without a usable stored representation.
+    pub cache_miss: u64,
+    /// Requests or responses excluded from cache participation.
+    pub cache_bypass: u64,
+    /// Conditional revalidation attempts.
+    pub cache_revalidation: u64,
+    /// Capacity evictions.
+    pub cache_eviction: u64,
+    /// Fills refused because of limits.
+    pub cache_fill_refusals: u64,
+    /// Published cache entries.
+    pub cache_entries: u64,
+    /// Accounted cache bytes, including retained readers.
+    pub cache_bytes: u64,
 }
 
 impl LogRecord {

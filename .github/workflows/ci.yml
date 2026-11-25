@@ -91,6 +91,7 @@ jobs:
           cargo run --locked -- check --config examples/m03-http-local.toml
           cargo run --locked -- check --config examples/m04-connect-local.toml
           cargo run --locked -- check --config examples/m09-parent-local.toml
+          cargo run --locked -- check --config examples/m10-cache-local.toml
 
       - name: Validate M05 auth example with a generated users file
         run: |
