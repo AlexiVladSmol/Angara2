@@ -218,7 +218,7 @@ Workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускае
 | Job | Проверки |
 | --- | --- |
 | `rust` | install pinned toolchain, `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked`, `cargo test --locked`, M06 resource/load/CPU/TLS evidence, M07 reload/control/logging/metrics + resource/load/CPU evidence, `config_m07`/`cli_m07`/`m07_reload`/`m07_limits`, 20 повторов M04 forced-shutdown, проверка всех примеров через `angara check`, HTTPS-proxy curl smoke с двумя CA и отказом TLS1.0 |
-| `release` | release-сборка B из head и A из `911266e...`, `manifest.json`, внешний `SHA256SUMS`, notices, artifact upload |
+| `release` | release-сборка B из head и A из `4656430...`, `manifest.json`, внешний `SHA256SUMS`, notices, artifact upload |
 | `installer` | `tests/m08/install.sh`: манифест, SHA-256, private copy против TOCTOU, path traversal/symlink rejection, foreign unit/user/group conflicts, DESTDIR, повторная установка |
 | `systemd` | реальный systemd: identity/capabilities/sandbox/limits, initial 403, reload accepted/rejected, restart-required, SIGHUP storm, завершаемый graceful-обмен, force stop без SIGKILL, crash restart, start limit, occupied port |
 | `functional` | HTTP/HTTPS/Basic/ACL, 407/403, обе TLS-цепочки, TLS-in-TLS CONNECT, secret markers, stop under load; streaming 64 MiB/1 GiB; shipped `m08-operations-https-basic.toml` и backup/restore из ADMIN_GUIDE |

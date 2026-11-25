@@ -82,10 +82,10 @@ the `angara` package, so the archive does not ship that file yet.
 For A→B→A, build A from the accepted M07 merge and B from the M08 head:
 
 ```sh
-git worktree add ../angara-a 911266e20f07494226f6d67a7c93f00e22a0958d
+git worktree add ../angara-a 4656430caf034e28fc6dba9ff340d7ddde9a4711
 packaging/build-release.sh \
   --source-dir ../angara-a \
-  --source-sha 911266e20f07494226f6d67a7c93f00e22a0958d \
+  --source-sha 4656430caf034e28fc6dba9ff340d7ddde9a4711 \
   --packager-sha "$(git rev-parse HEAD)" \
   --output-dir target/release-artifacts/a
 packaging/build-release.sh \
