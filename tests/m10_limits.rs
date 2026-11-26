@@ -2,6 +2,11 @@
 
 mod common;
 
+// These tests measure process-wide RSS, so they must not overlap each other
+// even when the default test harness runs tests in parallel.
+#[cfg(target_os = "linux")]
+static RESOURCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "linux")]
 mod linux {
     use angara::config::Config;
@@ -31,6 +36,7 @@ mod linux {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn m10_limits03_uri_epoch_registry_stays_bounded() {
+        let _resource_guard = crate::RESOURCE_LOCK.lock().expect("resource test lock");
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -117,6 +123,7 @@ mod linux {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn m10_limits01_small_entries_after_large_no_store_stay_bounded() {
+        let _resource_guard = crate::RESOURCE_LOCK.lock().expect("resource test lock");
         const LARGE_LEN: usize = 1024 * 1024;
         const SMALL_LEN: usize = 200;
         let large = vec![b'L'; LARGE_LEN];
@@ -211,6 +218,7 @@ mod slow_reader {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn m10_limits02_slow_reader_stays_within_budget() {
+        let _resource_guard = crate::RESOURCE_LOCK.lock().expect("resource test lock");
         const BODY_LEN: usize = 200 * 1024;
         let body = vec![b'r'; BODY_LEN];
         let origin_body = body.clone();
