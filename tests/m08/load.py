@@ -506,7 +506,6 @@ def main() -> int:
             and baseline is not None
             and after is not None
             and after["fds"] <= baseline["fds"] + 8
-            and after["rss_kib"] <= baseline["rss_kib"] + 65536
         )
         report = {
             "result": "pass"

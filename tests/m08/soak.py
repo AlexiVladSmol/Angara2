@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from soak_rss import evaluate_rss
+
 
 def run(command: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(command, check=check, capture_output=True, text=True)
@@ -258,14 +260,14 @@ def main() -> int:
             "fds": max((item["fds"] for item in samples), default=0),
             "threads": max((item["threads"] for item in samples), default=0),
         }
+        rss_check = evaluate_rss(samples)
         threshold_ok = (
             bool(samples)
-            and peak["rss_kib"] <= 524288
+            and rss_check["ok"]
             and after is not None
             and baseline is not None
             and peak["fds"] <= baseline["fds"] + 512
             and after["fds"] <= baseline["fds"] + 8
-            and after["rss_kib"] <= baseline["rss_kib"] + 65536
         )
         warmup_ok = warmup.returncode == 0
         report = {
@@ -291,6 +293,7 @@ def main() -> int:
             "baseline": baseline,
             "peak": peak,
             "after": after,
+            "rss_check": rss_check,
             "samples": samples,
             "reloads": reloads,
             "batches": batch_results,
@@ -308,6 +311,7 @@ def main() -> int:
                     "baseline": baseline,
                     "peak": peak,
                     "after": after,
+                    "rss_check": rss_check,
                     "reloads": reloads,
                 },
                 indent=2,
