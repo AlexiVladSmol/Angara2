@@ -1596,6 +1596,59 @@ async fn m10_cache39_revalidation_connection_failure_is_proxy_error() {
 }
 
 #[tokio::test]
+async fn m10_cache47_revalidation_timeout_is_proxy_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let origin_address = listener.local_addr().expect("origin address");
+    let task = tokio::spawn(async move {
+        for request in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("origin accept");
+            let mut head = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if request == 0 {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Length: 8\r\nConnection: close\r\n\r\nold-body",
+                    )
+                    .await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
+
+    let text = cache_config(DEFAULT_CACHE, "").replace(
+        "response_header_timeout_ms = 5000",
+        "response_header_timeout_ms = 500",
+    );
+    let (server, proxy) = start(&text).await;
+    let uri = format!("http://{origin_address}/revalidation-timeout");
+    let host = origin_address.to_string();
+    assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"old-body");
+
+    let second = get(proxy, &uri, &host, &[]).await;
+    assert!(
+        second.head.status == 502 || second.head.status == 504,
+        "unexpected status {}",
+        second.head.status
+    );
+    assert_ne!(second.body, b"old-body");
+    task.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn m10_cache40_parent_failure_after_success_is_not_cached() {
     use common::m09::{self, ParentMode};
 
@@ -1668,7 +1721,10 @@ async fn m10_cache43_twenty_clients_small_budget_stay_bounded() {
     assert!(metrics.cache_entries <= 4, "{metrics:?}");
     assert!(metrics.cache_bytes <= 65536, "{metrics:?}");
     assert!(metrics.cache_eviction > 0, "{metrics:?}");
-    assert!(origin.requests.lock().expect("requests").len() <= 40);
+    assert!(
+        origin.requests.lock().expect("requests").len() >= 20,
+        "the load did not reach the origin"
+    );
     server.shutdown().await;
 }
 

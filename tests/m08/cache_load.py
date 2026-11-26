@@ -20,6 +20,7 @@ from pathlib import Path
 
 BODY = b"x" * (64 * 1024)
 ORIGIN_PATH = "/cache"
+EVICTION_REQUESTS = 128
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -93,6 +94,32 @@ def run_client(proxy_port: int, origin_port: int, count: int, errors: list[str])
     except Exception as error:  # noqa: BLE001 - report the client failure
         errors.append(str(error))
         return 0
+
+
+def run_unique_cohort(
+    proxy_port: int, origin_port: int, count: int
+) -> tuple[int, float]:
+    host = f"127.0.0.1:{origin_port}"
+    started = time.monotonic()
+    completed = 0
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=10) as sock:
+            reader = sock.makefile("rb")
+            for index in range(count):
+                request = (
+                    f"GET http://{host}/evict?{index} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n\r\n"
+                ).encode()
+                sock.sendall(request)
+                status, body = read_response(reader)
+                if status != 200 or body != BODY:
+                    raise RuntimeError(
+                        f"eviction request {index}: status={status} body={len(body)}"
+                    )
+                completed += 1
+    except Exception as error:  # noqa: BLE001 - report the client failure
+        raise SystemExit(f"eviction cohort failed: {error}") from error
+    return completed, time.monotonic() - started
 
 
 def run_cohort(proxy_port: int, origin_port: int, clients: int, count: int) -> tuple[int, float]:
@@ -250,15 +277,31 @@ max_fills = 8
             metrics = last_metrics(log)
             after = rss_kib(proxy.pid)
             growth = after - baseline
+
+            eviction_completed, eviction_elapsed = run_unique_cohort(
+                args.proxy_port, args.origin_port, EVICTION_REQUESTS
+            )
+            time.sleep(2)
+            eviction_metrics = last_metrics(log)
+            eviction_after = rss_kib(proxy.pid)
+            eviction_growth = eviction_after - baseline
             report = {
                 "result": "pass",
                 "requests_per_client": args.requests,
                 "cohorts": cohorts,
                 "resources": {
                     "baseline_rss_kib": baseline,
-                    "peak_rss_kib": peak,
-                    "after_rss_kib": after,
-                    "growth_kib": growth,
+                    "peak_rss_kib": max(peak, eviction_after),
+                    "after_rss_kib": eviction_after,
+                    "growth_kib": eviction_growth,
+                },
+                "eviction": {
+                    "requests": eviction_completed,
+                    "elapsed_s": round(eviction_elapsed, 3),
+                    "cache_eviction": eviction_metrics.get("cache_eviction", 0),
+                    "cache_entries": eviction_metrics.get("cache_entries", 0),
+                    "after_rss_kib": eviction_after,
+                    "growth_kib": eviction_growth,
                 },
                 "cache": {
                     key: metrics.get(key, 0)
@@ -285,6 +328,16 @@ max_fills = 8
             if growth > args.max_rss_growth_kib:
                 failures.append(
                     f"RSS growth {growth} KiB exceeds {args.max_rss_growth_kib} KiB"
+                )
+            if eviction_metrics.get("cache_eviction", 0) <= 0:
+                failures.append("eviction cohort did not evict a cache entry")
+            if eviction_metrics.get("cache_entries", 0) > 64:
+                failures.append(
+                    f"eviction cache_entries={eviction_metrics.get('cache_entries')} expected<=64"
+                )
+            if eviction_growth > args.max_rss_growth_kib:
+                failures.append(
+                    f"eviction RSS growth {eviction_growth} KiB exceeds {args.max_rss_growth_kib} KiB"
                 )
             if failures:
                 report["result"] = "fail"
