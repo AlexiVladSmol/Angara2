@@ -7,7 +7,9 @@
 //! additional process overhead and are described in the documentation.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -327,7 +329,9 @@ pub(crate) struct CacheStore {
 
 struct StoreInner {
     entries: HashMap<CacheKey, Arc<CacheEntry>>,
-    uri_epochs: HashMap<String, u64>,
+    // Hashes rather than full URIs keep the bounded registry cheap. A hash
+    // collision only cancels an unrelated in-flight fill, which is safe.
+    uri_epochs: HashMap<u64, u64>,
 }
 
 impl CacheStore {
@@ -612,19 +616,30 @@ impl CacheStore {
         );
     }
 
+    fn uri_epoch_key(uri: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        uri.hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn uri_epoch_locked(inner: &StoreInner, uri: &str) -> u64 {
-        inner.uri_epochs.get(uri).copied().unwrap_or(0)
+        inner
+            .uri_epochs
+            .get(&Self::uri_epoch_key(uri))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn bump_uri_epoch(&self, inner: &mut StoreInner, uri: &str) {
-        if inner.uri_epochs.len() >= MAX_URI_EPOCHS && !inner.uri_epochs.contains_key(uri) {
+        let key = Self::uri_epoch_key(uri);
+        if inner.uri_epochs.len() >= MAX_URI_EPOCHS && !inner.uri_epochs.contains_key(&key) {
             // Keep the per-URI registry bounded. The global bump discards
             // every in-flight fill, which is the conservative fallback when
             // the registry cannot retain another URI.
             self.epoch.fetch_add(1, Ordering::AcqRel);
             inner.uri_epochs.clear();
         }
-        let counter = inner.uri_epochs.entry(uri.to_owned()).or_insert(0);
+        let counter = inner.uri_epochs.entry(key).or_insert(0);
         *counter = counter.saturating_add(1);
     }
 

@@ -30,6 +30,92 @@ mod linux {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn m10_limits03_uri_epoch_registry_stays_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A raw origin avoids recording the long request targets in test
+        // harness memory; only the proxy's cache registry should grow.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_address = listener.local_addr().expect("origin address");
+        let origin_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        let mut head = Vec::new();
+                        loop {
+                            let read = stream.read(&mut buffer).await.unwrap_or(0);
+                            if read == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buffer[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let text = format!(
+            "{}\n[cache]\nenabled = true\nmax_bytes = 65536\nmax_object_bytes = 16384\nmax_entries = 4\nmax_fills = 8\n",
+            m03::config("127.0.0.1:3128")
+        );
+        let config = Arc::new(Config::parse(&text).expect("cache config"));
+        let server = HttpServer::bind_ephemeral(config)
+            .await
+            .expect("bind proxy");
+        let proxy = server.addresses()[0].1;
+        let mut client = RawClient::connect(proxy).await.expect("connect proxy");
+
+        for index in 0..2 {
+            let path = format!("/telemetry?warm-{index}");
+            let response = exchange(
+                &mut client,
+                &m03::request("POST", origin_address, &path, &[], b""),
+            )
+            .await;
+            assert_eq!(response.head.status, 200);
+        }
+        let baseline = rss_kib();
+
+        let long = "x".repeat(7000);
+        for index in 0..2000 {
+            let path = format!("/telemetry?{index}-{long}");
+            let response = exchange(
+                &mut client,
+                &m03::request("POST", origin_address, &path, &[], b""),
+            )
+            .await;
+            assert_eq!(response.head.status, 200);
+        }
+
+        let after = rss_kib();
+        let growth = after.saturating_sub(baseline);
+        println!("M10-RES-03 uri_epochs rss_kib {baseline}->{after} growth={growth}");
+        assert!(
+            growth <= 4 * 1024,
+            "URI epoch registry retained {growth} KiB RSS"
+        );
+
+        drop(client);
+        origin_task.abort();
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn m10_limits01_small_entries_after_large_no_store_stay_bounded() {
         const LARGE_LEN: usize = 1024 * 1024;
         const SMALL_LEN: usize = 200;
