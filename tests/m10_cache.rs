@@ -1623,7 +1623,10 @@ async fn m10_cache47_revalidation_timeout_is_proxy_error() {
                     )
                     .await;
             } else {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Keep the connection open beyond the test deadline. A
+                // regression that removes the revalidation timeout would
+                // wait here and then see an EOF only when the test aborts.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
     });
@@ -1637,11 +1640,17 @@ async fn m10_cache47_revalidation_timeout_is_proxy_error() {
     let host = origin_address.to_string();
     assert_eq!(get(proxy, &uri, &host, &[]).await.body, b"old-body");
 
+    let started = tokio::time::Instant::now();
     let second = get(proxy, &uri, &host, &[]).await;
-    assert!(
-        second.head.status == 502 || second.head.status == 504,
-        "unexpected status {}",
+    let elapsed = started.elapsed();
+    assert_eq!(
+        second.head.status, 504,
+        "revalidation timeout must map to 504, got {} after {elapsed:?}",
         second.head.status
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_500),
+        "revalidation waited for the origin instead of the 500 ms timeout: {elapsed:?}"
     );
     assert_ne!(second.body, b"old-body");
     task.abort();
@@ -1869,4 +1878,103 @@ async fn m10_cache46_shutdown_during_fill_releases_cache_budget() {
     assert_eq!(metrics.cache_entries, 0);
     assert_eq!(metrics.cache_bytes, 0);
     origin_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            if stream.read(&mut byte).await.ok()? == 0 {
+                return None;
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(head).ok()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let origin_address = listener.local_addr().expect("origin address");
+    let slow_gets = Arc::new(AtomicUsize::new(0));
+    let task_gets = Arc::clone(&slow_gets);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let gets = Arc::clone(&task_gets);
+            tokio::spawn(async move {
+                while let Some(head) = read_head(&mut stream).await {
+                    if head.starts_with("GET ") && head.contains("/slow") {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        if stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4096\r\n\r\n",
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if stream.write_all(&vec![b'x'; 512]).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(3_000)).await;
+                        if stream.write_all(&vec![b'x'; 4096 - 512]).await.is_err() {
+                            return;
+                        }
+                    } else if stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nposted")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let uri = format!("http://{origin_address}/slow");
+    let host = origin_address.to_string();
+    let slow_uri = uri.clone();
+    let slow_host = host.clone();
+    let slow = tokio::spawn(async move { get(proxy, &slow_uri, &slow_host, &[]).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut posts = RawClient::connect(proxy).await.expect("post client");
+    for index in 0..8_300 {
+        let request = m03::request("POST", origin_address, &format!("/other/{index}"), &[], b"");
+        posts.send(&request).await.expect("send POST");
+        assert_eq!(
+            posts
+                .read_response()
+                .await
+                .expect("POST response")
+                .head
+                .status,
+            200
+        );
+    }
+
+    let slow_response = slow.await.expect("slow request");
+    assert_eq!(slow_response.body.len(), 4096);
+    let again = get(proxy, &uri, &host, &[]).await;
+    assert_eq!(again.body.len(), 4096);
+    assert_eq!(
+        slow_gets.load(Ordering::SeqCst),
+        1,
+        "idle URI invalidations canceled the slow fill"
+    );
+    assert!(server.control().metrics().cache_hit >= 1);
+    task.abort();
+    server.shutdown().await;
 }

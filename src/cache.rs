@@ -33,7 +33,6 @@ use crate::telemetry::Telemetry;
 const ENTRY_OVERHEAD: usize = 256;
 const HEADER_OVERHEAD: usize = 32;
 const KEY_OVERHEAD: usize = 128;
-const MAX_URI_EPOCHS: usize = 8_192;
 
 /// Stored representation variant.
 ///
@@ -329,9 +328,26 @@ pub(crate) struct CacheStore {
 
 struct StoreInner {
     entries: HashMap<CacheKey, Arc<CacheEntry>>,
-    // Hashes rather than full URIs keep the bounded registry cheap. A hash
-    // collision only cancels an unrelated in-flight fill, which is safe.
-    uri_epochs: HashMap<u64, u64>,
+    // Only URIs with an active fill are registered. Every fill takes the
+    // `fills` reference count; the registry is therefore bounded by
+    // `max_fills`, and invalidations for idle URIs do not consume records.
+    active_uris: HashMap<u64, ActiveUri>,
+}
+
+struct ActiveUri {
+    epoch: u64,
+    fills: usize,
+}
+
+struct FillGuard {
+    store: Arc<CacheStore>,
+    uri_key: u64,
+}
+
+impl Drop for FillGuard {
+    fn drop(&mut self) {
+        self.store.unregister_fill(self.uri_key);
+    }
 }
 
 impl CacheStore {
@@ -340,7 +356,7 @@ impl CacheStore {
         Arc::new(Self {
             inner: Mutex::new(StoreInner {
                 entries: HashMap::new(),
-                uri_epochs: HashMap::new(),
+                active_uris: HashMap::new(),
             }),
             used: Arc::new(AtomicUsize::new(0)),
             max_bytes: config.max_bytes(),
@@ -381,7 +397,7 @@ impl CacheStore {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
             };
-            self.bump_uri_epoch(&mut inner, &key.uri);
+            self.bump_active_epoch(&mut inner, &key.uri);
             inner.entries.remove(key)
         };
         drop(removed);
@@ -410,16 +426,7 @@ impl CacheStore {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let (epoch, uri_epoch) = self
-            .inner
-            .lock()
-            .map(|inner| {
-                (
-                    self.epoch.load(Ordering::Acquire),
-                    Self::uri_epoch_locked(&inner, &key.uri),
-                )
-            })
-            .unwrap_or((0, 0));
+        let (epoch, uri_epoch, fill_guard) = self.register_fill(&key.uri);
         let mut headers = copy_headers(&headers);
         if crate::http::headers::filter_hop_by_hop(&mut headers, false).is_err() {
             self.telemetry
@@ -488,6 +495,7 @@ impl CacheStore {
             data_bytes: 0,
             account,
             _slot: slot,
+            _fill_guard: fill_guard,
             epoch,
             uri_epoch,
             max_object_bytes: self.max_object_bytes,
@@ -541,7 +549,7 @@ impl CacheStore {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
             };
-            self.bump_uri_epoch(&mut inner, uri);
+            self.bump_active_epoch(&mut inner, uri);
             let keys = inner
                 .entries
                 .keys()
@@ -593,7 +601,7 @@ impl CacheStore {
                 return;
             };
             self.epoch.fetch_add(1, Ordering::AcqRel);
-            inner.uri_epochs.clear();
+            inner.active_uris.clear();
             inner
                 .entries
                 .drain()
@@ -622,25 +630,55 @@ impl CacheStore {
         hasher.finish()
     }
 
-    fn uri_epoch_locked(inner: &StoreInner, uri: &str) -> u64 {
-        inner
-            .uri_epochs
-            .get(&Self::uri_epoch_key(uri))
-            .copied()
-            .unwrap_or(0)
+    fn register_fill(self: &Arc<Self>, uri: &str) -> (u64, u64, FillGuard) {
+        let uri_key = Self::uri_epoch_key(uri);
+        let (epoch, uri_epoch) = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return (
+                    0,
+                    0,
+                    FillGuard {
+                        store: Arc::clone(self),
+                        uri_key,
+                    },
+                );
+            };
+            let active = inner
+                .active_uris
+                .entry(uri_key)
+                .or_insert(ActiveUri { epoch: 0, fills: 0 });
+            active.fills = active.fills.saturating_add(1);
+            (self.epoch.load(Ordering::Acquire), active.epoch)
+        };
+        (
+            epoch,
+            uri_epoch,
+            FillGuard {
+                store: Arc::clone(self),
+                uri_key,
+            },
+        )
     }
 
-    fn bump_uri_epoch(&self, inner: &mut StoreInner, uri: &str) {
-        let key = Self::uri_epoch_key(uri);
-        if inner.uri_epochs.len() >= MAX_URI_EPOCHS && !inner.uri_epochs.contains_key(&key) {
-            // Keep the per-URI registry bounded. The global bump discards
-            // every in-flight fill, which is the conservative fallback when
-            // the registry cannot retain another URI.
-            self.epoch.fetch_add(1, Ordering::AcqRel);
-            inner.uri_epochs.clear();
+    fn unregister_fill(&self, uri_key: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(active) = inner.active_uris.get_mut(&uri_key) else {
+            return;
+        };
+        if active.fills <= 1 {
+            inner.active_uris.remove(&uri_key);
+        } else {
+            active.fills -= 1;
         }
-        let counter = inner.uri_epochs.entry(key).or_insert(0);
-        *counter = counter.saturating_add(1);
+    }
+
+    fn bump_active_epoch(&self, inner: &mut StoreInner, uri: &str) {
+        let key = Self::uri_epoch_key(uri);
+        if let Some(active) = inner.active_uris.get_mut(&key) {
+            active.epoch = active.epoch.saturating_add(1);
+        }
     }
 
     fn reserve(&self, bytes: usize) -> Option<Account> {
@@ -738,7 +776,12 @@ impl CacheStore {
             };
             if self.closed.load(Ordering::Acquire)
                 || self.epoch.load(Ordering::Acquire) != expected_epoch
-                || Self::uri_epoch_locked(&inner, &key.uri) != expected_uri_epoch
+                || inner
+                    .active_uris
+                    .get(&Self::uri_epoch_key(&key.uri))
+                    .map(|active| active.epoch)
+                    .unwrap_or(u64::MAX)
+                    != expected_uri_epoch
                 || key.generation < self.min_generation.load(Ordering::Acquire)
             {
                 return false;
@@ -767,7 +810,7 @@ impl CacheStore {
             if evicted > 0 {
                 // A Vary-rule change makes other in-flight fills for this URI
                 // incompatible with the newly stored variant.
-                self.bump_uri_epoch(&mut inner, &key.uri);
+                self.bump_active_epoch(&mut inner, &key.uri);
             }
             while inner.entries.len() >= self.max_entries && !inner.entries.contains_key(&key) {
                 let Some(victim) = inner
@@ -870,6 +913,7 @@ pub(crate) struct CacheFill {
     data_bytes: usize,
     account: Account,
     _slot: OwnedSemaphorePermit,
+    _fill_guard: FillGuard,
     epoch: u64,
     uri_epoch: u64,
     max_object_bytes: usize,
