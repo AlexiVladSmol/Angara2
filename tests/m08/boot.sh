@@ -140,30 +140,84 @@ SOURCE_SHA=$(python3 "$TOP/verify_manifest.py" --root "$TOP" | sed -n 's/^source
 
 log "ubuntu mirror: $UBUNTU_MIRROR"
 log "wget read timeout: ${WGET_READ_TIMEOUT}s"
+DEBOOTSTRAP_ATTEMPTS=${M08_DEBOOTSTRAP_ATTEMPTS:-3}
+DEBOOTSTRAP_RETRY_DELAY=${M08_DEBOOTSTRAP_RETRY_DELAY:-3}
+# CI seam: stop after a successful debootstrap to exercise retry paths
+# without installing and booting the rootfs.
+DEBOOTSTRAP_ONLY=${M08_DEBOOTSTRAP_ONLY:-0}
+case "$DEBOOTSTRAP_ATTEMPTS" in
+    ''|*[!0-9]*) fail "M08_DEBOOTSTRAP_ATTEMPTS must be an integer from 1 to 5" ;;
+esac
+[ "$DEBOOTSTRAP_ATTEMPTS" -ge 1 ] && [ "$DEBOOTSTRAP_ATTEMPTS" -le 5 ] \
+    || fail "M08_DEBOOTSTRAP_ATTEMPTS must be an integer from 1 to 5"
+case "$DEBOOTSTRAP_RETRY_DELAY" in
+    ''|*[!0-9]*) fail "M08_DEBOOTSTRAP_RETRY_DELAY must be a non-negative integer" ;;
+esac
+case "$DEBOOTSTRAP_ONLY" in
+    0|1) ;;
+    *) fail "M08_DEBOOTSTRAP_ONLY must be 0 or 1" ;;
+esac
+
+unmount_root_paths() {
+    [ -d "$ROOT" ] && command -v findmnt >/dev/null 2>&1 || return 0
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        umount "$target" 2>/dev/null \
+            || umount -l "$target" 2>/dev/null \
+            || true
+    done < <(findmnt -rn -o TARGET | awk -v root="$ROOT/" \
+        'index($0, root) == 1 { print length($0), $0 }' \
+        | sort -rn | cut -d' ' -f2-)
+}
+
 DEBOOTSTRAP_START=$(date +%s)
-set +e
-WGETRC="$TMP/wgetrc" timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap --variant=minbase \
-    --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
-    noble "$ROOT" "$UBUNTU_MIRROR" \
-    >"$TMP/debootstrap.log" 2>&1 &
-DEBOOTSTRAP_PID=$!
-log "debootstrap noble rootfs (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
-wait "$DEBOOTSTRAP_PID"
-DEBOOTSTRAP_CODE=$?
-DEBOOTSTRAP_PID=
-set -e
+DEBOOTSTRAP_CODE=1
+DEBOOTSTRAP_ATTEMPT=0
+DEBOOTSTRAP_LAST_LOG="$TMP/debootstrap.log"
+for attempt in $(seq 1 "$DEBOOTSTRAP_ATTEMPTS"); do
+    DEBOOTSTRAP_ATTEMPT=$attempt
+    unmount_root_paths
+    rm -rf --one-file-system "$ROOT" 2>/dev/null || true
+    DEBOOTSTRAP_LAST_LOG="$TMP/debootstrap-${attempt}.log"
+    set +e
+    WGETRC="$TMP/wgetrc" timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap \
+        --variant=minbase \
+        --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
+        noble "$ROOT" "$UBUNTU_MIRROR" \
+        >"$DEBOOTSTRAP_LAST_LOG" 2>&1 &
+    DEBOOTSTRAP_PID=$!
+    log "debootstrap noble rootfs attempt ${attempt}/${DEBOOTSTRAP_ATTEMPTS} (timeout ${DEBOOTSTRAP_TIMEOUT}s)"
+    wait "$DEBOOTSTRAP_PID"
+    DEBOOTSTRAP_CODE=$?
+    DEBOOTSTRAP_PID=
+    set -e
+    if [ "$DEBOOTSTRAP_CODE" -eq 0 ]; then
+        break
+    fi
+    if [ "$DEBOOTSTRAP_CODE" -eq 124 ] || [ "$DEBOOTSTRAP_CODE" -eq 137 ]; then
+        break
+    fi
+    if [ "$attempt" -lt "$DEBOOTSTRAP_ATTEMPTS" ]; then
+        log "debootstrap attempt ${attempt}/${DEBOOTSTRAP_ATTEMPTS} failed with exit code ${DEBOOTSTRAP_CODE}; retrying in ${DEBOOTSTRAP_RETRY_DELAY}s"
+        sleep "$DEBOOTSTRAP_RETRY_DELAY"
+    fi
+done
 DEBOOTSTRAP_ELAPSED=$(($(date +%s) - DEBOOTSTRAP_START))
 if [ "$DEBOOTSTRAP_CODE" -ne 0 ]; then
-    tail -n 100 "$TMP/debootstrap.log" >&2 || true
+    tail -n 100 "$DEBOOTSTRAP_LAST_LOG" >&2 || true
     if [ "$DEBOOTSTRAP_CODE" -eq 124 ]; then
         fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s (SIGTERM)"
     fi
     if [ "$DEBOOTSTRAP_CODE" -eq 137 ]; then
         fail "debootstrap timed out after ${DEBOOTSTRAP_TIMEOUT}s (SIGKILL)"
     fi
-    fail "debootstrap failed with exit code ${DEBOOTSTRAP_CODE}"
+    fail "debootstrap failed with exit code ${DEBOOTSTRAP_CODE} after ${DEBOOTSTRAP_ATTEMPT} attempt(s)"
 fi
-log "debootstrap completed in ${DEBOOTSTRAP_ELAPSED}s"
+log "debootstrap completed in ${DEBOOTSTRAP_ELAPSED}s on attempt ${DEBOOTSTRAP_ATTEMPT}"
+if [ "$DEBOOTSTRAP_ONLY" -eq 1 ]; then
+    log "debootstrap-only mode; skipping archive install and boot"
+    exit 0
+fi
 
 install -d -m 0755 "$ROOT/tmp/release"
 cp -a "$TOP/." "$ROOT/tmp/release/"
@@ -181,18 +235,25 @@ systemd-nspawn -D "$ROOT" --machine="$MACHINE" --boot --network-veth \
     >"$TMP/nspawn.log" 2>&1 &
 NSPAWN_PID=$!
 
+SYSTEM_STATE=
 for _ in $(seq 1 180); do
-    if systemctl -M "$MACHINE" is-system-running >/dev/null 2>&1; then
-        break
-    fi
+    SYSTEM_STATE=$(timeout 5 systemctl -M "$MACHINE" is-system-running 2>/dev/null || true)
+    case "$SYSTEM_STATE" in
+        running|degraded) break ;;
+    esac
     if ! kill -0 "$NSPAWN_PID" 2>/dev/null; then
         cat "$TMP/nspawn.log" >&2
         fail "systemd-nspawn exited before boot"
     fi
     sleep 1
 done
-systemctl -M "$MACHINE" is-system-running >/dev/null 2>&1 \
-    || { cat "$TMP/nspawn.log" >&2; fail "container systemd did not become ready"; }
+case "$SYSTEM_STATE" in
+    running|degraded) ;;
+    *)
+        cat "$TMP/nspawn.log" >&2
+        fail "container systemd did not become ready (state=${SYSTEM_STATE:-unknown})"
+        ;;
+esac
 
 for _ in $(seq 1 120); do
     systemctl -M "$MACHINE" is-active --quiet angara.service && break
