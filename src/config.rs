@@ -1,8 +1,8 @@
 //! Strict TOML configuration for Angara.
 //!
 //! The schema is intentionally closed: unknown keys are rejected rather than
-//! ignored. Features that are not implemented in this milestone (cache, admin
-//! API) therefore cannot be mistaken for supported settings.
+//! ignored. Features that are not implemented in this milestone (admin API)
+//! therefore cannot be mistaken for supported settings.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -119,6 +119,17 @@ const DEFAULT_LOG_QUEUE_CAPACITY: i64 = 1_024;
 const MIN_METRICS_INTERVAL_MS: i64 = 1_000;
 const MAX_METRICS_INTERVAL_MS: i64 = 600_000;
 const DEFAULT_METRICS_INTERVAL_MS: i64 = 30_000;
+const MIN_CACHE_BYTES: i64 = 64 * 1024;
+const MAX_CACHE_BYTES: i64 = 1_073_741_824;
+const DEFAULT_CACHE_BYTES: i64 = 32 * 1024 * 1024;
+const MIN_CACHE_OBJECT_BYTES: i64 = 1_024;
+const DEFAULT_CACHE_OBJECT_BYTES: i64 = 1024 * 1024;
+const MIN_CACHE_ENTRIES: i64 = 1;
+const MAX_CACHE_ENTRIES: i64 = 65_536;
+const DEFAULT_CACHE_ENTRIES: i64 = 512;
+const MIN_CACHE_FILLS: i64 = 1;
+const MAX_CACHE_FILLS: i64 = 64;
+const DEFAULT_CACHE_FILLS: i64 = 8;
 /// Maximum size of the main TOML document.
 pub const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 160;
@@ -141,6 +152,7 @@ pub struct Config {
     transport: TransportConfig,
     http: HttpConfig,
     connect: ConnectConfig,
+    cache: CacheConfig,
     egress: Vec<EgressProfile>,
     parents: Vec<Arc<PreparedParent>>,
     routing: RoutingConfig,
@@ -273,6 +285,9 @@ impl Config {
         if self.transport.max_connecting() != other.transport.max_connecting() {
             return Some("transport.max_connecting");
         }
+        if self.cache != other.cache {
+            return Some("cache");
+        }
         if self.limits.max_header_bytes() != other.limits.max_header_bytes() {
             return Some("limits.max_header_bytes");
         }
@@ -345,6 +360,11 @@ impl Config {
     /// CONNECT tunnel policy and half-close drain.
     pub fn connect(&self) -> &ConnectConfig {
         &self.connect
+    }
+
+    /// Bounded in-memory HTTP cache settings.
+    pub fn cache(&self) -> &CacheConfig {
+        &self.cache
     }
 
     /// Validated egress profiles.
@@ -1010,6 +1030,47 @@ impl ConnectConfig {
     }
 }
 
+/// Bounded in-memory HTTP cache settings.
+///
+/// Cache parameters are restart-required. A missing `[cache]` table and
+/// `enabled = false` both leave the feature off; the values are still
+/// validated so a disabled section cannot hide an invalid schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    enabled: bool,
+    max_bytes: usize,
+    max_object_bytes: usize,
+    max_entries: usize,
+    max_fills: usize,
+}
+
+impl CacheConfig {
+    /// Whether the cache participates in request handling.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Total accounted budget for data, keys, headers and fixed entry state.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Maximum accounted size of one object.
+    pub fn max_object_bytes(&self) -> usize {
+        self.max_object_bytes
+    }
+
+    /// Maximum number of published entries.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Maximum simultaneous fills.
+    pub fn max_fills(&self) -> usize {
+        self.max_fills
+    }
+}
+
 /// Resolved certificate and key paths for one HTTPS listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsListenerConfig {
@@ -1315,7 +1376,6 @@ fn is_future_feature_field(field: &str) -> bool {
         field,
         "acl"
             | "admin"
-            | "cache"
             | "control"
             | "logging"
             | "logs"
@@ -1490,6 +1550,7 @@ fn validate_with(
     let transport = validate_transport(raw.transport, &limits)?;
     let http = validate_http(raw.http, &limits)?;
     let connect = validate_connect(raw.connect)?;
+    let cache = validate_cache(raw.cache)?;
     let parents = validate_parents(raw.parents, base_dir, previous, &listeners)?;
     let parent_ids = parents
         .iter()
@@ -1511,6 +1572,7 @@ fn validate_with(
         transport,
         http,
         connect,
+        cache,
         egress,
         parents,
         routing,
@@ -2166,6 +2228,53 @@ fn validate_connect(raw: Option<RawConnect>) -> Result<ConnectConfig, ConfigErro
     })
 }
 
+fn validate_cache(raw: Option<RawCache>) -> Result<CacheConfig, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let max_bytes = bounded_optional(
+        "cache.max_bytes",
+        raw.max_bytes,
+        MIN_CACHE_BYTES,
+        MAX_CACHE_BYTES,
+        DEFAULT_CACHE_BYTES,
+    )?;
+    let default_object = DEFAULT_CACHE_OBJECT_BYTES.min(max_bytes);
+    let max_object_bytes = bounded_optional(
+        "cache.max_object_bytes",
+        raw.max_object_bytes,
+        MIN_CACHE_OBJECT_BYTES,
+        max_bytes,
+        default_object,
+    )?;
+    if max_object_bytes > max_bytes {
+        return Err(validation(
+            "cache.max_object_bytes",
+            "must not exceed cache.max_bytes",
+        ));
+    }
+    let max_entries = bounded_optional(
+        "cache.max_entries",
+        raw.max_entries,
+        MIN_CACHE_ENTRIES,
+        MAX_CACHE_ENTRIES,
+        DEFAULT_CACHE_ENTRIES,
+    )?;
+    let max_fills = bounded_optional(
+        "cache.max_fills",
+        raw.max_fills,
+        MIN_CACHE_FILLS,
+        MAX_CACHE_FILLS,
+        DEFAULT_CACHE_FILLS,
+    )?;
+
+    Ok(CacheConfig {
+        enabled: raw.enabled,
+        max_bytes: max_bytes as usize,
+        max_object_bytes: max_object_bytes as usize,
+        max_entries: max_entries as usize,
+        max_fills: max_fills as usize,
+    })
+}
+
 fn default_instance_id(listeners: &[Listener]) -> String {
     let host = std::env::var("HOSTNAME")
         .ok()
@@ -2785,6 +2894,8 @@ struct RawConfig {
     #[serde(default)]
     connect: Option<RawConnect>,
     #[serde(default)]
+    cache: Option<RawCache>,
+    #[serde(default)]
     egress: Option<Vec<RawEgress>>,
     #[serde(default)]
     parents: Option<Vec<RawParent>>,
@@ -2970,6 +3081,21 @@ struct RawConnect {
     allowed_ports: Option<Vec<i64>>,
     #[serde(default)]
     half_close_timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawCache {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    max_bytes: Option<i64>,
+    #[serde(default)]
+    max_object_bytes: Option<i64>,
+    #[serde(default)]
+    max_entries: Option<i64>,
+    #[serde(default)]
+    max_fills: Option<i64>,
 }
 
 #[derive(Deserialize)]

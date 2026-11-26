@@ -23,7 +23,7 @@
 | proxy/connect | Установка CONNECT и двусторонняя передача байтов | Расшифровка TLS сайта |
 | telemetry | Структурированные события, счётчики и длительности | Сбор содержимого трафика |
 
-Parent реализован в M09; cache обязателен в M10. Универсальная система плагинов не проектируется заранее: контракт parent использует существующие config, routing, resolver, transport и HTTP forwarding.
+Parent реализован в M09; ограниченный RAM-кеш — в M10. Универсальная система плагинов не проектируется заранее: контракт parent использует существующие config, routing, resolver, transport и HTTP forwarding.
 
 ## 2. Поток обработки
 
@@ -190,7 +190,46 @@ Connection pool не объединяет разные egress, parent credential
 
 Parent definitions, transport, CA и содержимое credentials применяются при restart; `routing` (default_parent/next_hop) входит в hot reload. `runtime.instance_id` задаёт стабильный суффикс `Via` (`1.1 angara-<id>`); по умолчанию используется `<hostname>-<port>`. Цепочка продолжается (append) в HTTP-запросах и во внешнем CONNECT, а запрос отклоняется только при возврате собственного идентификатора. Прокси, вырезающие `Via`, ослабляют эту защиту. Очевидный self-route проверяется в `check` и повторно перед dial с учётом loopback/wildcard/локальных адресов. Parent pool reuse в M09 не включён; разные parent/credentials/TLS-контексты не смешиваются.
 
-HTTP cache подключается между разрешением запроса и HTTP forward. Доступ проверяется до чтения из кэша. Политика обязана учитывать Cache-Control, Vary, freshness, validators и разделение пользователей. Первая ограниченная версия может обходить Authorization, Cookie, Range, Set-Cookie и неподдержанные Vary; это консервативное ограничение Angara, не утверждение, что RFC запрещает кэшировать их во всех случаях. CONNECT и TLS содержимого сайтов в кэш не входят. Дисковый cache, crash recovery и eviction планируются после корректного ограниченного cache.
+### HTTP cache (M10)
+
+Кеш включается секцией `[cache]` и по умолчанию выключен. `src/cache.rs`
+содержит ограниченное хранилище и политику; `src/http/forward.rs` вызывает его
+после source/auth/ACL, DNS/IP-проверок и выбора direct-маршрута. Запросы через
+parent и CONNECT не читают и не пишут кеш: parent должен применять своё текущее
+решение о доступе.
+
+Хранятся только полные `200` на обычный `GET` с HTTP-схемой назначения. Ответ
+проходит hop-by-hop фильтрацию до сохранения; локальный `Via` добавляется один
+раз при выдаче. Свежесть задаётся только явно: `s-maxage` → `max-age` →
+`Expires` относительно `Date`; возраст учитывает `Date`, входной `Age`, задержку
+ответа и время хранения. Эвристический TTL не используется. `Vary` поддержан
+только в форме `Accept-Encoding`, с отдельными вариантами для отсутствующего
+заголовка, identity и gzip.
+
+Ключ изоляции: канонический URI с портом и точным path/query, вариант, listener,
+внутренний пользователь или anonymous, egress, отсортированные проверенные
+endpoints и поколение политики. Сырые credentials не входят. После reload
+записи старого поколения не читаются; `retire_before` освобождает их. Ошибка
+upstream не заменяется устаревшим телом. После неошибочного небезопасного метода
+URI инвалидируется во всех вариантах и scopes; epoch URI (64-битный хеш в
+ограниченном реестре, с глобальным fallback при переполнении) отменяет
+публикацию уже начатого наполнения этого URI.
+
+Бюджет хранилища атомарно учитывает тела, ключи, заголовки и фиксированную
+запись, покрывающую элемент индекса. `max_entries` и `max_fills` ограничивают
+индекс и одновременные наполнения. Вытеснение — LRU; объект, удерживаемый
+медленным читателем после вытеснения, остаётся учтённым до освобождения. Ответ
+отдаётся клиенту по мере получения, наполнение не ждёт полного тела. Обрыв,
+отмена, превышение размера, несовпадение длины и trailers не публикуют частичный
+объект. Сетевой I/O не выполняется под lock индекса. Накладные расходы
+аллокатора могут быть выше учтённой оценки; это описано в администраторском
+руководстве.
+
+Метрики кеша фиксированные и не содержат URL, query, ключей, пользователей,
+заголовков или тел: `cache_hit`, `cache_miss`, `cache_bypass`,
+`cache_revalidation`, `cache_eviction`, `cache_fill_refusals`, `cache_entries`,
+`cache_bytes`. Дисковый кеш, crash recovery, диапазоны и выдача просроченных
+ответов в M10 не входят.
 
 ## 13. Граница установки и процесса в M08
 
@@ -200,6 +239,6 @@ Systemd передаёт SIGHUP и SIGTERM существующему проце
 
 ## 14. Основания и ограничения
 
-Протокол: [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html), будущий cache — [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html). Реализация HTTP — [hyper](https://hyper.rs/guides/1/server/hello-world/), ограничения async очередей — [Tokio](https://tokio.rs/tokio/tutorial/channels), TLS — [rustls](https://rustls.dev/docs/rustls/index.html).
+Протокол: [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html), кеш M10 — [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html). Реализация HTTP — [hyper](https://hyper.rs/guides/1/server/hello-world/), ограничения async очередей — [Tokio](https://tokio.rs/tokio/tutorial/channels), TLS — [rustls](https://rustls.dev/docs/rustls/index.html).
 
 Выбор библиотек не доказывает корректность прокси: нормализация целей, ACL, заголовки, лимиты и жизненный цикл требуют отдельных реализаций и проверок. Точные версии и дополнительные зависимости закрепляются в ближайшем задании. Источники многопоточности и socket bind: [Tokio runtime](https://docs.rs/tokio/latest/tokio/runtime/), [TcpSocket](https://docs.rs/tokio/latest/tokio/net/struct.TcpSocket.html); взаимодействие устройства с маршрутами — [Linux VRF](https://www.kernel.org/doc/html/latest/networking/vrf.html).

@@ -57,6 +57,9 @@ jobs:
             m04_res02 \
             -- --ignored --test-threads=1 --nocapture
 
+      - name: M10 cache resource evidence
+        run: cargo test --locked --test m10_limits -- --nocapture --test-threads=1
+
       - name: CPU evidence (multi-worker HTTP path)
         run: |
           cargo test --locked --test http_forward \
@@ -91,6 +94,7 @@ jobs:
           cargo run --locked -- check --config examples/m03-http-local.toml
           cargo run --locked -- check --config examples/m04-connect-local.toml
           cargo run --locked -- check --config examples/m09-parent-local.toml
+          cargo run --locked -- check --config examples/m10-cache-local.toml
 
       - name: Validate M05 auth example with a generated users file
         run: |
@@ -834,6 +838,8 @@ jobs:
           echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
       - name: Run 10/20 client cohorts
         run: sudo --preserve-env=M08_BIN bash tests/m08/load_stand.sh
+      - name: Run cache load evidence
+        run: sudo --preserve-env=M08_BIN bash tests/m08/cache_load.sh
       - name: Run worker comparison
         run: sudo --preserve-env=M08_BIN bash tests/m08/workers.sh
       - name: Run overload checks

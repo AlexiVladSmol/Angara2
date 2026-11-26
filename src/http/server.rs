@@ -823,6 +823,14 @@ async fn metrics_loop(
                     generation: root.generation(),
                     live_generations,
                     log_dropped: snapshot.log_dropped,
+                    cache_hit: snapshot.cache_hit,
+                    cache_miss: snapshot.cache_miss,
+                    cache_bypass: snapshot.cache_bypass,
+                    cache_revalidation: snapshot.cache_revalidation,
+                    cache_eviction: snapshot.cache_eviction,
+                    cache_fill_refusals: snapshot.cache_fill_refusals,
+                    cache_entries: snapshot.cache_entries,
+                    cache_bytes: snapshot.cache_bytes,
                 });
                 proxy.logger().log(record);
             }

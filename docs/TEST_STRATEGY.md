@@ -1,6 +1,6 @@
 # Angara — стратегия тестирования
 
-**Редакция 1.1 от 22 ноября 2026 года.** Приняты M00–M08. Уточнены роли: тесты принимает Claude Opus 5.5, задания и стратегию готовит ChatGPT Astra 6.2. Исходный набор M08 включал 412 основных Linux-тестов и три отдельно запускаемые ресурсные проверки. M08 добавил в CI сборку архивов A и B и стендовые jobs: установщик, systemd, функциональные и сетевые проверки, нагрузку, A→B→A, загрузку в nspawn и в одноразовой VM, а также часовой soak по `workflow_dispatch`.
+**Редакция 1.2 от 25 ноября 2026 года.** Приняты M00–M08; M09 принят и слит. Уточнены роли: тесты принимает Claude Opus 5.5, задания и стратегию готовит ChatGPT Astra 6.2. Исходный набор M08 включал 412 основных Linux-тестов и три отдельно запускаемые ресурсные проверки. M08 добавил в CI сборку архивов A и B и стендовые jobs: установщик, systemd, функциональные и сетевые проверки, нагрузку, A→B→A, загрузку в nspawn и в одноразовой VM, а также часовой soak по `workflow_dispatch`. M10 добавляет матрицу CACHE-01 и отдельные проверки конфигурации кеша.
 
 ## 1. Принципы
 
@@ -168,3 +168,32 @@ NET-05 выполняется в отдельном Linux-стенде с дву
 Claude Opus 5.5 оценивает соответствие сценария требованию, проверяет отрицательные случаи и качество assertions. Независимо запускает доступные существенные проверки либо читает реальные CI logs для точного SHA; недоступный локальный runtime указывает как ограничение. Самоотчёт DeepSeek без воспроизводимых команд и результатов недостаточен.
 
 Итоговое заключение различает: подтверждённые проверки, вывод по прочитанному коду, неисполненные сценарии и открытые риски. Процент coverage может помогать искать пробелы, но не заменяет матрицу протокольных, ACL и ресурсных инвариантов.
+
+### Контракт приёмки M10 (CACHE-01)
+
+Локальные проверки: `cargo test --locked --test config_m10` (6 тестов),
+`cargo test --locked --test m10_cache` (45 тестов), `m10_limits` (3 Linux-теста
+RSS/медленного читателя/реестра epoch) и unit-тесты `cache::tests` (14 тестов).
+Полный прогон на ветке реализации: `cargo test --locked` — 536 passed, 0 failed, 3 ignored;
+`cargo test --locked --test m10_cache` повторяется для проверки стабильности.
+
+| Строка CACHE-01 | Тесты |
+| --- | --- |
+| Выключен / холодный / прогретый | `m10_cache01`–`m10_cache03`: два GET → один origin; старый конфиг/`enabled=false` → два origin; path/query/порт |
+| Свежесть и варианты | `m10_cache04`–`m10_cache08`: `Age`/граница, `s-maxage`, `Expires`/`Date`, gzip/identity/отсутствие `Accept-Encoding`, `Vary: *`; unit `vary_change_removes_incompatible_variant` |
+| Ревалидация | `m10_cache09`–`m10_cache14`, `m10_cache34`–`m10_cache36`, `m10_cache39`, `m10_cache47`: ETag/Last-Modified → 304 → полное тело; 200 заменяет; ошибка/таймаут/отказ соединения — штатная ошибка прокси; непригодный 304 и другой/слабый ETag → один безусловный GET; многострочный `Cache-Control` в 304; клиентские `If-*`/Range |
+| Приватность и ACL | `m10_cache15`–`m10_cache19`, `m10_cache30`, `m10_cache38`: Authorization/Cookie/Set-Cookie, пользователи, listeners, egress, поколение, ACL deny на прогретом кеше, журналы/метрики без URL и тел |
+| Маршрутизация | `m10_cache20`, `m10_cache21`, `m10_cache28`, `m10_cache40`: parent bypass, CONNECT, смена endpoint, отказ parent после предыдущего успеха |
+| Инвалидирование | `m10_cache27`, `m10_cache33`, `m10_cache44`: POST инвалидирует URI, same-origin `Location`, наполнение другого URI не отменяется; unit `invalidation_discards_an_inflight_fill`, `invalidation_of_another_uri_keeps_the_inflight_fill` |
+| Память и потоковая передача | `m10_cache22`–`m10_cache24`, `m10_cache31`, `m10_cache32`, `m10_cache43`, `m10_cache45`, `m10_cache46`, `m10_limits01`, `m10_limits02`, `m10_limits03`: малый бюджет/LRU, 20 клиентов на прогретой записи и при малом бюджете, слишком большой/оборванный ответ, trailers, reload/shutdown во время наполнения, RSS после крупных `no-store` ответов, медленный читатель, ограниченный реестр epoch URI; unit `store_evicts_and_accounts_bodies`, `incomplete_or_oversized_fill_is_not_published`, `slow_reader_keeps_evicted_object_accounted`, `revalidation_updates_header_accounting` |
+| Директивы клиента | `m10_cache25`–`m10_cache26`, `m10_cache37`: `only-if-cached` холодный/тёплый/просроченный → 504 или ответ; `no-cache`/`min-fresh` → upstream |
+| Конфигурация | `m10_cfg01`–`m10_cfg06`: отсутствие/выключение, defaults, диапазоны, cross-field предел, restart-required, `angara check` |
+| TLS-вход | `m10_cache29` (HTTPS listener использует тот же кеш) |
+
+Кеш по умолчанию выключен. Полный `workflow_dispatch` с часовым soak по D57
+обязателен для изменения `src/`. Отдельный сценарий `tests/m08/cache_load.sh`
+запускается в Ubuntu CI job `10/20 clients, workers and streaming`, использует
+10 и 20 клиентов, проверяет `cache_hit`/`cache_miss`/`cache_entries`/`cache_bytes`
+и RSS-прирост, затем когорту из 128 уникальных URI при `max_entries = 64` и
+проверяет `cache_eviction > 0`. Штатный soak с выключенным кешем сам по себе не
+подтверждает CACHE-01.

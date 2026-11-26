@@ -2,7 +2,7 @@
 
 Прямой прокси-сервер для Linux с возможностями, которые будут развиваться поэтапно: HTTP, HTTPS через CONNECT, авторизация, правила доступа, управление ресурсами и кэширование HTTP.
 
-**M00–M09 приняты и слиты.** Angara поддерживает родительский прокси по HTTP или TLS. Следующий этап — M10, ограниченный HTTP-кеш в оперативной памяти. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. [Итог M09](https://github.com/AlexiVladSmol/Angara/pull/45#issuecomment-7096752472) · [Дорожная карта](docs/ROADMAP.md)
+**M00–M09 приняты и слиты.** M10 реализован и передан на ревью: ограниченный HTTP-кеш в оперативной памяти. Первый стенд — Ubuntu Server 24.04 x86_64, 10–20 устройств. [Итог M09](https://github.com/AlexiVladSmol/Angara/pull/45#issuecomment-7096752472) · [Дорожная карта](docs/ROADMAP.md)
 
 ## Участники и работа
 
@@ -120,8 +120,8 @@ bind = "127.0.0.1:3128"
 transport = "http"
 ```
 
-- Неизвестные ключи и будущие активные разделы (ACL вне `[access]`, cache,
-  admin, parent и т. п.) отклоняются, а не игнорируются.
+- Неизвестные ключи и будущие активные разделы (ACL вне `[access]`, admin,
+  parent и т. п.) отклоняются, а не игнорируются. `[cache]` поддерживается с M10.
 - `schema_version` поддерживается только `1`.
 - `listeners`: от 1 до 64 определений; `id` уникален, состоит из 1–64 ASCII
   букв, цифр, `-`, `_`, `.`; `bind` — только числовой `IP:port` с портом
@@ -198,7 +198,9 @@ M03 добавляет `hyper` 1.12 (`client`, `http1`, `server`), `hyper-util`
 (`TokioIo`, таймер), `http-body`, `http-body-util`, `bytes`, `socket2` и
 Tokio `macros`/`signal`. M06 добавляет `rustls` 0.23 (ring, `tls12`),
 `tokio-rustls` 0.26, `rustls-pki-types` 1 (PEM parsing) и `x509-parser` 0.18.
-M07 добавляет `arc-swap` 1.9.5 и `serde_json` 1. Hyper 1.12.0
+M07 добавляет `arc-swap` 1.9.5 и `serde_json` 1. M10 использует `httpdate` 1
+для разбора `Date`/`Expires`/`Last-Modified` (крейт уже был транзитивной
+зависимостью hyper). Hyper 1.12.0
 закреплён с минимальным локальным patch для `OriginalRequestTarget`; см.
 раздел M03 и
 [`vendor/hyper-1.12.0/ANGARA_PATCH.md`](vendor/hyper-1.12.0/ANGARA_PATCH.md).
@@ -1012,7 +1014,63 @@ Angara проверяет target ACL/DNS/IP до подключения к paren
 
 `runtime.instance_id` задаёт стабильный суффикс `Via`: HTTP-запрос и внешний CONNECT содержат полученную цепочку и `1.1 angara-<id>` последним, а отклоняется только возврат *собственного* идентификатора. По умолчанию используется `<hostname>-<port>`; для цепочки Angara задайте разные `instance_id` явно. Прокси, которые вырезают `Via`, ограничивают эту защиту. Полный пример — [examples/m09-parent-local.toml](examples/m09-parent-local.toml); эксплуатация и Squid — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#9-parent-proxy-m09). Локальные проверки: `cargo test --locked --test config_m09` и `--test m09_parent`.
 
+## M10: ограниченный HTTP-кеш (v0.3)
+
+M10 добавляет общий RAM-кеш для успешных HTTP-ответов. Без секции или при
+`enabled = false` поведение прежнее: каждый запрос идёт к origin.
+
+```toml
+[cache]
+enabled = true
+max_bytes = 33554432       # 32 MiB общего учтённого бюджета
+max_object_bytes = 1048576 # 1 MiB на объект
+max_entries = 512
+max_fills = 8
+```
+
+Кешируются только полностью полученные `200` на обычный `GET` с HTTP-схемой
+назначения и direct-маршрутом. Запросы через parent и CONNECT по-прежнему идут
+по M09 и в кеш не попадают. Хранение разрешается только при явной свежести:
+`s-maxage`, затем `max-age`, затем `Expires` относительно `Date`. Возраст
+учитывает `Date`, входной `Age`, задержку ответа и время хранения; на попадании
+клиент получает актуальный `Age`.
+
+Не читаются и/или не сохраняются запросы с `Authorization`, `Cookie`, `Range`,
+`If-Range`, клиентскими `If-*`, телом, `no-store`; ответы с `Set-Cookie`,
+`private`, `no-store`, ответным `no-cache`, `206`, trailers и `Vary` кроме
+`Accept-Encoding`. `Vary: Accept-Encoding` хранит отдельные варианты для
+gzip/identity/отсутствия заголовка. `only-if-cached` без допустимой записи даёт
+504 без обращения к origin; `no-cache`, `max-age=0`, `Pragma: no-cache` и
+`min-fresh` не выдают неприемлемую запись.
+
+Просроченная запись ревалидируется через `If-None-Match` (ETag) или
+`If-Modified-Since` (Last-Modified). Внутренний 304 обновляет запись, клиенту
+обычного GET возвращается полное тело; 200 заменяет объект. Ошибка upstream
+остаётся штатной ошибкой прокси, устаревшее тело не подставляется. После
+неошибочного небезопасного метода URI инвалидируется во всех вариантах; уже
+начатое наполнение старого тела не публикуется. Смена поколения конфигурации
+делает записи прежнего поколения недоступными.
+
+Ключ изоляции: канонический URI с портом и точным path/query, вариант, listener,
+внутренний пользователь или anonymous, egress, проверенные endpoints и поколение
+политики. Сырые credentials в ключ не входят. Бюджет включает данные, ключи,
+заголовки и фиксированную запись; объекты, удерживаемые медленными читателями
+после вытеснения, остаются учтёнными до освобождения. Параметры `[cache]`
+применяются при запуске (restart-required).
+
+Метрики: `cache_hit`, `cache_miss`, `cache_bypass`, `cache_revalidation`,
+`cache_eviction`, `cache_fill_refusals`, `cache_entries`, `cache_bytes`. URL,
+query, ключи, пользователи, заголовки и тела в журналы и метки не попадают.
+Полный пример — [examples/m10-cache-local.toml](examples/m10-cache-local.toml);
+эксплуатация — [ADMIN_GUIDE](docs/ADMIN_GUIDE.md#10-http-кеш-m10). Локальные
+проверки: `cargo test --locked --test config_m10`, `--test m10_cache`,
+`--test m10_limits`; Ubuntu CI дополнительно запускает
+`tests/m08/cache_load.sh` с 10 и 20 клиентами.
+
 ## Текущее состояние
+
+M10 реализован в ветке `feat/1-http-cache`; локальные тесты и CI проверяются до
+передачи на ревью. Решение о слиянии и выпуске принимает владелец.
 
 M09 принят Claude и слит 23 ноября 2026 года через [PR #45](https://github.com/AlexiVladSmol/Angara/pull/45) (`83a468c`). На финальной ветке PR (`b9e0cb4`) прошли все 12 проверок, включая часовой тест с 20 клиентами. Перед пилотом запланирована отдельная [проверка Squid с TLS и Basic](https://github.com/AlexiVladSmol/Angara/issues/46). Решение о публикации v0.2 принимает владелец. [Результаты CI](https://github.com/AlexiVladSmol/Angara/actions/runs/45135038640)
 

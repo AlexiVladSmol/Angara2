@@ -3,7 +3,9 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
+use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
@@ -15,6 +17,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 
 use crate::auth::{AuthError, AuthMode, AuthService, PasswordVerifier, VerifiedIdentity};
+use crate::cache::{self, CacheEntry, CacheFillBody, CacheKey, CacheStore, CacheVariant, Lookup};
 use crate::config::Config;
 use crate::http::ResponseBody;
 use crate::http::connect::TunnelSetup;
@@ -29,7 +32,7 @@ use crate::logging::{Event, LogRecord, Logger, Outcome, Reason, RouteKind};
 use crate::outbound::{OutboundError, OutboundPlan, OutboundService, RequestContext};
 use crate::policy::{self, RequestMeta};
 use crate::snapshot::SnapshotStore;
-use crate::target::{self, CanonicalTarget, TargetError};
+use crate::target::{self, CanonicalTarget, Host, TargetError};
 use crate::telemetry::Telemetry;
 
 const MIN_CONNECTION_BUFFER: usize = 64 * 1024;
@@ -317,6 +320,7 @@ pub struct Proxy {
     outbound: OutboundService,
     pool: Arc<OriginPool>,
     origin_tasks: Arc<crate::http::OriginTasks>,
+    cache: Option<Arc<CacheStore>>,
     draining: Arc<AtomicBool>,
     auth: Option<AuthService>,
     telemetry: Arc<Telemetry>,
@@ -369,11 +373,16 @@ impl Proxy {
         let snapshots = SnapshotStore::new(Arc::clone(&config));
         let client_caps = CapController::new(config.limits().max_client_connections() as usize);
         let logger = Mutex::new(Logger::disabled(Arc::clone(&telemetry)));
+        let cache = config
+            .cache()
+            .enabled()
+            .then(|| CacheStore::new(config.cache(), Arc::clone(&telemetry)));
         Arc::new(Self {
             snapshots,
             outbound,
             pool,
             origin_tasks: crate::http::OriginTasks::new(),
+            cache,
             draining: Arc::new(AtomicBool::new(false)),
             auth,
             telemetry,
@@ -525,6 +534,9 @@ impl Proxy {
     pub fn begin_shutdown(&self) {
         self.draining.store(true, Ordering::Release);
         self.pool.clear();
+        if let Some(cache) = &self.cache {
+            cache.clear();
+        }
     }
 
     /// Removes expired idle origin sockets.
@@ -535,6 +547,9 @@ impl Proxy {
     /// Retires idle origins from older generations after a successful publish.
     pub fn retire_before(&self, generation: u64) {
         self.pool.retire_before(generation);
+        if let Some(cache) = &self.cache {
+            cache.retire_before(generation);
+        }
     }
 
     /// Closes every idle origin socket at the start of draining.
@@ -1034,8 +1049,25 @@ impl Proxy {
         };
         set_route(&route, &plan);
 
+        let has_request_body = request_chunked
+            || request
+                .headers()
+                .get_all(CONTENT_LENGTH)
+                .iter()
+                .any(|value| {
+                    value
+                        .to_str()
+                        .is_ok_and(|value| value.parse::<u64>().is_ok_and(|length| length > 0))
+                });
+        let mut cache_write = self.cache.is_some() && method == Method::GET && !has_request_body;
+        let mut cache_request_time = SystemTime::now();
+        let mut revalidation = None;
+
         if plan.parent().is_some() {
-            return self
+            if self.cache.is_some() {
+                self.telemetry.cache_bypass.fetch_add(1, Ordering::Relaxed);
+            }
+            let response = self
                 .forward_parent(
                     config,
                     &plan,
@@ -1055,23 +1087,226 @@ impl Proxy {
                     &route,
                 )
                 .await;
+            self.invalidate_unsafe(&method, &target, &response);
+            return response;
         }
 
-        let lease = match self.pool.checkout(&plan) {
-            Some(lease) => lease,
-            None => match self.open_new_connection(&plan, config).await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    let (status, close) = outbound_status(error);
-                    return headers::error_response(status, close);
+        if cache_write {
+            let Some(store) = self.cache.as_ref() else {
+                return headers::error_response(StatusCode::INTERNAL_SERVER_ERROR, true);
+            };
+            let Some(policy) = cache::analyze_request(&original_request_headers) else {
+                cache_write = false;
+                self.telemetry.cache_bypass.fetch_add(1, Ordering::Relaxed);
+                return self
+                    .forward_direct(
+                        config,
+                        &plan,
+                        request,
+                        &method,
+                        &target,
+                        &target_text,
+                        request_headers,
+                        request_nominations,
+                        request_chunked,
+                        request_had_content_length,
+                        interim,
+                        request_body_bytes,
+                        cache_write,
+                        cache_request_time,
+                    )
+                    .await;
+            };
+            let Some(accept_encoding) = cache::request_accept_encoding(&original_request_headers)
+            else {
+                cache_write = false;
+                self.telemetry.cache_bypass.fetch_add(1, Ordering::Relaxed);
+                return self
+                    .forward_direct(
+                        config,
+                        &plan,
+                        request,
+                        &method,
+                        &target,
+                        &target_text,
+                        request_headers,
+                        request_nominations,
+                        request_chunked,
+                        request_had_content_length,
+                        interim,
+                        request_body_bytes,
+                        cache_write,
+                        cache_request_time,
+                    )
+                    .await;
+            };
+            cache_write = policy.write;
+            if policy.only_if_cached && (!policy.read || !policy.write) {
+                return headers::error_response(StatusCode::GATEWAY_TIMEOUT, true);
+            }
+            if !policy.read {
+                self.telemetry.cache_bypass.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let now = SystemTime::now();
+                let mut found: Option<(CacheKey, Arc<CacheEntry>, bool)> = None;
+                {
+                    let key = make_cache_key(
+                        &plan,
+                        &target,
+                        CacheVariant::AcceptEncoding(accept_encoding.clone()),
+                    );
+                    match store.lookup(&key, now) {
+                        Lookup::Fresh(entry) => {
+                            let acceptable = policy.accepts_age(entry.current_age(now))
+                                && policy.min_fresh.is_none_or(|min_fresh| {
+                                    entry.freshness_remaining(now) >= min_fresh
+                                });
+                            if acceptable {
+                                self.telemetry.cache_hit.fetch_add(1, Ordering::Relaxed);
+                                return entry.response(config.instance_id());
+                            }
+                            found = Some((key, entry, false));
+                        }
+                        Lookup::Stale(entry) => found = Some((key, entry, false)),
+                        Lookup::Miss => {}
+                    }
                 }
-            },
-        };
-        if plan.is_expired() {
-            lease.abort();
-            return headers::error_response(StatusCode::GATEWAY_TIMEOUT, true);
+                if found.is_none() {
+                    let key = make_cache_key(&plan, &target, CacheVariant::None);
+                    match store.lookup(&key, now) {
+                        Lookup::Fresh(entry) => {
+                            let acceptable = policy.accepts_age(entry.current_age(now))
+                                && policy.min_fresh.is_none_or(|min_fresh| {
+                                    entry.freshness_remaining(now) >= min_fresh
+                                });
+                            if acceptable {
+                                self.telemetry.cache_hit.fetch_add(1, Ordering::Relaxed);
+                                return entry.response(config.instance_id());
+                            }
+                            found = Some((key, entry, false));
+                        }
+                        Lookup::Stale(entry) => found = Some((key, entry, false)),
+                        Lookup::Miss => {}
+                    }
+                }
+                match found {
+                    Some((key, entry, _fresh)) => {
+                        self.telemetry.cache_miss.fetch_add(1, Ordering::Relaxed);
+                        if policy.only_if_cached {
+                            return headers::error_response(StatusCode::GATEWAY_TIMEOUT, true);
+                        }
+                        if let Some((name, value)) = cache_validators(&entry) {
+                            revalidation = Some((key, entry, name, value));
+                        }
+                    }
+                    None => {
+                        self.telemetry.cache_miss.fetch_add(1, Ordering::Relaxed);
+                        if policy.only_if_cached {
+                            return headers::error_response(StatusCode::GATEWAY_TIMEOUT, true);
+                        }
+                    }
+                }
+            }
         }
 
+        if let Some((key, entry, name, value)) = revalidation {
+            self.telemetry
+                .cache_revalidation
+                .fetch_add(1, Ordering::Relaxed);
+            cache_request_time = SystemTime::now();
+            let mut conditional_headers = request_headers.clone();
+            conditional_headers.insert(name, value);
+            match self
+                .send_revalidation(
+                    config,
+                    &plan,
+                    &method,
+                    &target,
+                    conditional_headers,
+                    &interim,
+                )
+                .await
+            {
+                Revalidation::NotModified(headers) => {
+                    if let Some(store) = self.cache.as_ref()
+                        && store.revalidate(&key, &entry, &headers, SystemTime::now())
+                    {
+                        self.telemetry.cache_hit.fetch_add(1, Ordering::Relaxed);
+                        return entry.response(config.instance_id());
+                    }
+                }
+                Revalidation::Unusable => {
+                    if let Some(store) = self.cache.as_ref() {
+                        store.remove(&key);
+                    }
+                }
+                Revalidation::Response(response, lease) => {
+                    let response = self.finalize_direct(
+                        config,
+                        &method,
+                        request_chunked,
+                        &target,
+                        &plan,
+                        &original_request_headers,
+                        cache_write,
+                        cache_request_time,
+                        response,
+                        *lease,
+                    );
+                    self.invalidate_unsafe(&method, &target, &response);
+                    return response;
+                }
+                Revalidation::Failed(response) => return response,
+            }
+        }
+
+        cache_request_time = SystemTime::now();
+        let response = self
+            .forward_direct(
+                config,
+                &plan,
+                request,
+                &method,
+                &target,
+                &target_text,
+                request_headers,
+                request_nominations,
+                request_chunked,
+                request_had_content_length,
+                interim,
+                request_body_bytes,
+                cache_write,
+                cache_request_time,
+            )
+            .await;
+        self.invalidate_unsafe(&method, &target, &response);
+        response
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_direct(
+        &self,
+        config: &Config,
+        plan: &OutboundPlan,
+        request: Request<Incoming>,
+        method: &Method,
+        target: &CanonicalTarget,
+        target_text: &str,
+        request_headers: http::HeaderMap,
+        request_nominations: Vec<http::header::HeaderName>,
+        request_chunked: bool,
+        request_had_content_length: bool,
+        interim: InterimSender,
+        request_body_bytes: Arc<AtomicU64>,
+        cache_write: bool,
+        cache_request_time: SystemTime,
+    ) -> Response<ResponseBody> {
+        let lease = match self.direct_lease(plan, config).await {
+            Ok(lease) => lease,
+            Err(response) => return response,
+        };
+
+        let mut request_headers = request_headers;
         let body = request.into_body();
         let body_length = body.size_hint().exact();
         if request_had_content_length && let Some(length) = body_length {
@@ -1080,10 +1315,10 @@ impl Proxy {
         let request_body =
             LeaseRequestBody::new(body, lease.clone(), request_nominations, request_body_bytes)
                 .boxed();
-        let origin_form = if method == Method::OPTIONS && options_without_path(&target_text) {
+        let origin_form = if method == Method::OPTIONS && options_without_path(target_text) {
             "*"
         } else {
-            headers::origin_form(&target)
+            headers::origin_form(target)
         };
         let mut upstream_request = Request::new(request_body);
         *upstream_request.method_mut() = method.clone();
@@ -1091,7 +1326,7 @@ impl Proxy {
             .parse()
             .unwrap_or_else(|_| "/".parse().expect("static origin-form"));
         *upstream_request.version_mut() = Version::HTTP_11;
-        *upstream_request.headers_mut() = request_headers;
+        *upstream_request.headers_mut() = request_headers.clone();
 
         let interim_callback = interim.clone();
         hyper::ext::on_informational(&mut upstream_request, move |response| {
@@ -1115,16 +1350,18 @@ impl Proxy {
                     lease.abort();
                     return headers::error_response(StatusCode::BAD_GATEWAY, true);
                 }
-                match finalize_upstream_response(
+                self.finalize_direct(
+                    config,
+                    method,
+                    request_chunked,
+                    target,
+                    plan,
+                    &request_headers,
+                    cache_write,
+                    cache_request_time,
                     response,
                     lease,
-                    &method,
-                    request_chunked,
-                    config.instance_id(),
-                ) {
-                    Ok(response) => response,
-                    Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),
-                }
+                )
             }
             Ok(Err(_)) => {
                 lease.abort();
@@ -1134,6 +1371,210 @@ impl Proxy {
                 lease.abort();
                 headers::error_response(StatusCode::GATEWAY_TIMEOUT, true)
             }
+        }
+    }
+
+    async fn direct_lease(
+        &self,
+        plan: &OutboundPlan,
+        config: &Config,
+    ) -> Result<Lease, Response<ResponseBody>> {
+        let lease = match self.pool.checkout(plan) {
+            Some(lease) => lease,
+            None => match self.open_new_connection(plan, config).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let (status, close) = outbound_status(error);
+                    return Err(headers::error_response(status, close));
+                }
+            },
+        };
+        if plan.is_expired() {
+            lease.abort();
+            return Err(headers::error_response(StatusCode::GATEWAY_TIMEOUT, true));
+        }
+        Ok(lease)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_direct(
+        &self,
+        config: &Config,
+        method: &Method,
+        request_chunked: bool,
+        target: &CanonicalTarget,
+        plan: &OutboundPlan,
+        request_headers: &http::HeaderMap,
+        cache_write: bool,
+        cache_request_time: SystemTime,
+        response: Response<Incoming>,
+        lease: Lease,
+    ) -> Response<ResponseBody> {
+        let response_time = SystemTime::now();
+        let expected_len = response.body().size_hint().exact();
+        let mut fill = None;
+        if cache_write && let Some(store) = self.cache.as_ref() {
+            let mut cache_headers = response.headers().clone();
+            let filtered =
+                crate::http::headers::filter_hop_by_hop(&mut cache_headers, false).is_ok();
+            if filtered
+                && let Some(policy) = cache::analyze_response(
+                    request_headers,
+                    &cache_headers,
+                    method,
+                    response.status(),
+                    cache_request_time,
+                    response_time,
+                    false,
+                )
+                && let Some(variant) = cache::request_variant_for(request_headers, &cache_headers)
+            {
+                let key = make_cache_key(plan, target, variant);
+                fill = store.begin_fill(
+                    key,
+                    cache_headers,
+                    policy,
+                    expected_len,
+                    cache_request_time,
+                    response_time,
+                );
+            }
+        }
+        if fill.is_none() && cache_write {
+            self.telemetry.cache_bypass.fetch_add(1, Ordering::Relaxed);
+        }
+        match finalize_upstream_response(
+            response,
+            lease,
+            method,
+            request_chunked,
+            config.instance_id(),
+        ) {
+            Ok(local) => {
+                if let Some(fill) = fill {
+                    let (parts, body) = local.into_parts();
+                    let body: ResponseBody = CacheFillBody::new(body, fill).boxed();
+                    Response::from_parts(parts, body)
+                } else {
+                    local
+                }
+            }
+            Err(()) => headers::error_response(StatusCode::BAD_GATEWAY, true),
+        }
+    }
+
+    async fn send_revalidation(
+        &self,
+        config: &Config,
+        plan: &OutboundPlan,
+        method: &Method,
+        target: &CanonicalTarget,
+        headers: http::HeaderMap,
+        interim: &InterimSender,
+    ) -> Revalidation {
+        let lease = match self.direct_lease(plan, config).await {
+            Ok(lease) => lease,
+            Err(response) => return Revalidation::Failed(response),
+        };
+        let body = http_body_util::Full::new(Bytes::new())
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed();
+        lease.request_complete();
+        let expected_etag = headers.get(http::header::IF_NONE_MATCH).cloned();
+        let mut upstream_request = Request::new(body);
+        *upstream_request.method_mut() = method.clone();
+        *upstream_request.uri_mut() = headers::origin_form(target)
+            .parse()
+            .unwrap_or_else(|_| "/".parse().expect("static origin-form"));
+        *upstream_request.version_mut() = Version::HTTP_11;
+        *upstream_request.headers_mut() = headers;
+        let interim_callback = interim.clone();
+        hyper::ext::on_informational(&mut upstream_request, move |response| {
+            let _ = interim_callback.send_interim(response.status(), response.headers());
+        });
+        let mut sender = match lease.take_sender() {
+            Some(sender) => sender,
+            None => {
+                lease.abort();
+                return Revalidation::Failed(headers::error_response(
+                    StatusCode::BAD_GATEWAY,
+                    true,
+                ));
+            }
+        };
+        let result = tokio::time::timeout(
+            config.http().response_header_timeout(),
+            sender.send_request(upstream_request),
+        )
+        .await;
+        match result {
+            Ok(Ok(response)) => {
+                lease.put_sender(sender);
+                if interim.failed() {
+                    lease.abort();
+                    return Revalidation::Failed(headers::error_response(
+                        StatusCode::BAD_GATEWAY,
+                        true,
+                    ));
+                }
+                if response.status() == StatusCode::NOT_MODIFIED {
+                    if headers::validate_framing(response.headers()).is_err() {
+                        lease.abort();
+                        return Revalidation::Failed(headers::error_response(
+                            StatusCode::BAD_GATEWAY,
+                            true,
+                        ));
+                    }
+                    if let (Some(expected), Some(actual)) = (
+                        expected_etag.as_ref(),
+                        response.headers().get(http::header::ETAG),
+                    ) && !weak_etag_eq(expected, actual)
+                    {
+                        drop(response);
+                        lease.response_complete();
+                        return Revalidation::Unusable;
+                    }
+                    let mut updated = response.headers().clone();
+                    if crate::http::headers::filter_hop_by_hop(&mut updated, false).is_err() {
+                        lease.abort();
+                        return Revalidation::Failed(headers::error_response(
+                            StatusCode::BAD_GATEWAY,
+                            true,
+                        ));
+                    }
+                    drop(response);
+                    lease.response_complete();
+                    Revalidation::NotModified(updated)
+                } else {
+                    Revalidation::Response(response, Box::new(lease))
+                }
+            }
+            Ok(Err(_)) => {
+                lease.abort();
+                Revalidation::Failed(headers::error_response(StatusCode::BAD_GATEWAY, true))
+            }
+            Err(_) => {
+                lease.abort();
+                Revalidation::Failed(headers::error_response(StatusCode::GATEWAY_TIMEOUT, true))
+            }
+        }
+    }
+
+    fn invalidate_unsafe(
+        &self,
+        method: &Method,
+        target: &CanonicalTarget,
+        response: &Response<ResponseBody>,
+    ) {
+        if is_safe_method(method) || response.status().as_u16() >= 400 {
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        cache.invalidate(&cache_uri(target));
+        for uri in invalidation_uris(target, response.headers()) {
+            cache.invalidate(&uri);
         }
     }
 
@@ -1426,6 +1867,96 @@ fn log_terminal_with_reason(
         record.route = route.kind;
     }
     logger.log(record);
+}
+
+enum Revalidation {
+    NotModified(http::HeaderMap),
+    Unusable,
+    Response(Response<Incoming>, Box<Lease>),
+    Failed(Response<ResponseBody>),
+}
+
+fn weak_etag_eq(left: &http::HeaderValue, right: &http::HeaderValue) -> bool {
+    let Ok(left) = left.to_str() else {
+        return false;
+    };
+    let Ok(right) = right.to_str() else {
+        return false;
+    };
+    left.strip_prefix("W/").unwrap_or(left) == right.strip_prefix("W/").unwrap_or(right)
+}
+
+fn is_safe_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
+}
+
+fn cache_authority(target: &CanonicalTarget) -> String {
+    let host = match target.host() {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ip(std::net::IpAddr::V4(ip)) => ip.to_string(),
+        Host::Ip(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+    };
+    format!("{host}:{}", target.port())
+}
+
+fn cache_uri(target: &CanonicalTarget) -> String {
+    let path = target
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    format!("http://{}{path}", cache_authority(target))
+}
+
+/// Same-origin Location/Content-Location targets whose cached bodies could be
+/// affected by an unsafe method.
+fn invalidation_uris(target: &CanonicalTarget, headers: &http::HeaderMap) -> Vec<String> {
+    let mut uris = Vec::new();
+    for name in [http::header::LOCATION, http::header::CONTENT_LOCATION] {
+        for value in headers.get_all(name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if let Ok(parsed) = CanonicalTarget::parse(&Method::GET, value) {
+                if parsed.host() == target.host() && parsed.port() == target.port() {
+                    uris.push(cache_uri(&parsed));
+                }
+            } else if value.starts_with('/') {
+                uris.push(format!("http://{}{value}", cache_authority(target)));
+            }
+        }
+    }
+    uris
+}
+
+fn make_cache_key(
+    plan: &OutboundPlan,
+    target: &CanonicalTarget,
+    variant: CacheVariant,
+) -> CacheKey {
+    let mut endpoints = plan.target_endpoints().to_vec();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    CacheKey::new(
+        cache_uri(target),
+        variant,
+        plan.listener_id().to_owned(),
+        plan.identity().map(str::to_owned),
+        plan.egress_id().to_owned(),
+        endpoints,
+        plan.generation(),
+    )
+}
+
+fn cache_validators(entry: &CacheEntry) -> Option<(http::header::HeaderName, http::HeaderValue)> {
+    if let Some(etag) = entry.etag() {
+        return Some((http::header::IF_NONE_MATCH, etag));
+    }
+    entry
+        .last_modified()
+        .map(|value| (http::header::IF_MODIFIED_SINCE, value))
 }
 
 fn options_without_path(target: &str) -> bool {

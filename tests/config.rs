@@ -124,7 +124,7 @@ fn cfg01_rejects_corrupted_toml_with_position() {
 
 #[test]
 fn cfg01_rejects_unknown_and_future_root_fields() {
-    for field in ["acl", "cache", "admin", "users", "parent"] {
+    for field in ["acl", "admin", "users", "parent"] {
         let text = config("\"auto\"").replace(
             "[runtime]",
             &format!("[{field}]\nenabled = true\n\n[runtime]"),
