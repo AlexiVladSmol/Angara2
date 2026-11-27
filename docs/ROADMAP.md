@@ -1,6 +1,6 @@
 # Angara — этапы разработки
 
-**M00–M09 завершены.** M10, HTTP-кеш в оперативной памяти, реализован и передан на ревью. Лицензия, первое рабочее развёртывание и публичный выпуск остаются отдельными решениями владельца.
+**M00–M10 завершены.** Следующий обязательный этап — M11, терминальный интерфейс управления (TUI). Первое рабочее развёртывание и публичный выпуск остаются отдельными решениями владельца.
 
 ## Первый выпуск v0.1
 
@@ -29,11 +29,11 @@ M06 даёт настоящий защищённый ingress, но release/эк�
 | Этап | Содержание | Статус и условия |
 | --- | --- | --- |
 | M09 — parent proxy / v0.2 | HTTP/TLS до родителя, отдельные credentials, egress, CONNECT к проверенному IP и защита от петель | DONE. [PR #45](https://github.com/AlexiVladSmol/Angara/pull/45) слит в `83a468c`, [Issue #42](https://github.com/AlexiVladSmol/Angara/issues/42) закрыта. На `b9e0cb4` прошёл [полный CI с часовым soak](https://github.com/AlexiVladSmol/Angara/actions/runs/45135038640) |
-| M10 — HTTP cache / v0.3, ОБЯЗАТЕЛЬНО | Ограниченный RAM cache; диск — следующий отдельно уточняемый объём | Реализация в ветке `feat/1-http-cache`; контракт кеширования по RFC 9111, изоляция и тесты; решение о слиянии — после ревью |
-| M11 — TUI, ОБЯЗАТЕЛЬНО | Локальный API, статус, соединения, users/ACL, конфигурация, ресурсы и egress | Стабильный control service; единая валидация с CLI, работа ядра без UI |
+| M10 — HTTP cache / v0.3, ОБЯЗАТЕЛЬНО | Ограниченный HTTP-кеш в RAM для прямых маршрутов. Дисковый кеш требует отдельного решения | DONE. [PR #5](https://github.com/AlexiVladSmol/Angara2/pull/5) слит в `a53d3e6`, задача [#1](https://github.com/AlexiVladSmol/Angara2/issues/1) закрыта. В [приёмочном прогоне](https://github.com/AlexiVladSmol/Angara2/actions/runs/45827741649) прошли 12 проверок, включая часовой soak. Доработки по задачам [#6](https://github.com/AlexiVladSmol/Angara2/issues/6), [#7](https://github.com/AlexiVladSmol/Angara2/issues/7) и [#8](https://github.com/AlexiVladSmol/Angara2/issues/8) слиты через [PR #9](https://github.com/AlexiVladSmol/Angara2/pull/9), [PR #10](https://github.com/AlexiVladSmol/Angara2/pull/10) и [PR #11](https://github.com/AlexiVladSmol/Angara2/pull/11). Итоговый [CI на `69d7093`](https://github.com/AlexiVladSmol/Angara2/actions/runs/45997965127) прошёл |
+| M11 — TUI, ОБЯЗАТЕЛЬНО | Локальный API, статус, соединения, users/ACL, конфигурация, ресурсы и egress | Следующий этап. На `69d7093` отдельная задача с контрактами M11 ещё не создана. Условия — стабильный control service, единая валидация с CLI и работа ядра без UI |
 | M12 — локальная web-панель, ВОЗМОЖНО | Тот же API, ориентир 127.0.0.1:7029 | Отдельное решение о реализации, admin auth, Host/Origin/CSRF и тесты |
 
-Перед первым рабочим развёртыванием запланирована [проверка Squid с TLS и Basic](https://github.com/AlexiVladSmol/Angara/issues/46) на реальном родителе. Проверку можно провести параллельно с M10. После v0.1 планируются испытания других Linux-дистрибутивов; конкретная матрица уточняется отдельно. Дополнительные задачи: bandwidth limits, квоты трафика, auth backend, ARM64 и пакеты. Они получают собственные решения и задания; не добавляются в реализацию случайно.
+Стендовая [проверка Squid с TLS и Basic](https://github.com/AlexiVladSmol/Angara/issues/46) на реальном родителе выполнена до первого рабочего развёртывания. После v0.1 планируются испытания других Linux-дистрибутивов; конкретная матрица уточняется отдельно. Дополнительные задачи: bandwidth limits, квоты трафика, auth backend, ARM64 и пакеты. Они получают собственные решения и задания; не добавляются в реализацию случайно.
 
 ## Порядок выдачи заданий
 
