@@ -27,7 +27,12 @@ const UPDATE_QUEUE: usize = 64;
 
 /// One operator command.
 pub enum Command {
-    RefreshAll,
+    RefreshAll {
+        connections_offset: usize,
+        users_offset: usize,
+        blocks_offset: usize,
+        access_section: String,
+    },
     RefreshStatus,
     RefreshConnections {
         offset: usize,
@@ -181,34 +186,39 @@ fn request_loop(
 
 fn execute(socket: &std::path::Path, command: Command) -> Update {
     match command {
-        Command::RefreshAll => {
+        Command::RefreshAll {
+            connections_offset,
+            users_offset,
+            blocks_offset,
+            access_section,
+        } => {
             let mut last = Update::Connected;
             for (op, args) in [
                 ("snapshot", Map::new()),
                 (
                     "connections",
-                    json!({"limit": 100})
+                    json!({"limit": 100, "offset": connections_offset})
                         .as_object()
                         .cloned()
                         .unwrap_or_default(),
                 ),
                 (
                     "users",
-                    json!({"limit": 100})
+                    json!({"limit": 100, "offset": users_offset})
                         .as_object()
                         .cloned()
                         .unwrap_or_default(),
                 ),
                 (
                     "blocks",
-                    json!({"limit": 100})
+                    json!({"limit": 100, "offset": blocks_offset})
                         .as_object()
                         .cloned()
                         .unwrap_or_default(),
                 ),
                 (
                     "access",
-                    json!({"section": "rules", "limit": 100})
+                    json!({"section": access_section, "limit": 100})
                         .as_object()
                         .cloned()
                         .unwrap_or_default(),

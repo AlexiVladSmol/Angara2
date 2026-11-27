@@ -39,7 +39,7 @@ fn run_terminal(terminal: &mut DefaultTerminal, socket: &std::path::Path) -> io:
     let client = Client::start(socket.to_path_buf());
     let mut model = ViewModel::new();
     model.set_connected(false);
-    client.send(Command::RefreshAll);
+    client.send(model.refresh_all_command());
     loop {
         while let Some(update) = client.try_update() {
             apply_update(&mut model, update, &client);
@@ -66,7 +66,7 @@ fn apply_update(model: &mut ViewModel, update: Update, client: &Client) {
         Update::Disconnected(message) => model.set_connected_error(message),
         Update::Snapshot(snapshot) => {
             model.apply_snapshot(snapshot);
-            client.send(Command::RefreshAll);
+            client.send(model.refresh_all_command());
         }
         Update::Status(status) => model.apply_status(status),
         Update::Connections(page) => model.apply_connections(page),
@@ -93,28 +93,24 @@ fn apply_update(model: &mut ViewModel, update: Update, client: &Client) {
                 crate::control_protocol::EventKind::ConfigSaved
                 | crate::control_protocol::EventKind::ConfigApplied
                 | crate::control_protocol::EventKind::ConfigRejected => {
-                    model.reset_pages();
-                    client.send(Command::RefreshAll);
+                    client.send(model.refresh_all_command());
                 }
                 crate::control_protocol::EventKind::Resync => {
-                    model.reset_pages();
-                    client.send(Command::RefreshAll);
+                    client.send(model.refresh_all_command());
                 }
             }
         }
         Update::Resync => {
             model.status_message = "пропущены события · обновляю снимок".to_owned();
-            client.send(Command::RefreshAll);
+            client.send(model.refresh_all_command());
         }
         Update::Write(outcome) => {
             model.apply_write(outcome);
-            model.reset_pages();
-            client.send(Command::RefreshAll);
+            client.send(model.refresh_all_command());
         }
         Update::Reload(outcome) => {
             model.apply_reload(outcome);
-            model.reset_pages();
-            client.send(Command::RefreshAll);
+            client.send(model.refresh_all_command());
         }
         Update::Preview(preview) => model.apply_preview(preview),
         Update::Error(error) => {
@@ -129,16 +125,16 @@ fn handle_key(model: &mut ViewModel, key: KeyEvent, client: &Client) {
         model.should_quit = true;
         return;
     }
-    if model.form.is_some() {
-        handle_form_key(model, key, client);
-        return;
-    }
     if model.confirm.is_some() {
         match key.code {
             KeyCode::Enter => confirm(model, client),
             KeyCode::Esc | KeyCode::Char('n') => model.confirm = None,
             _ => {}
         }
+        return;
+    }
+    if model.form.is_some() {
+        handle_form_key(model, key, client);
         return;
     }
     if model.preview.is_some() {
@@ -375,8 +371,27 @@ fn handle_form_key(model: &mut ViewModel, key: KeyEvent, client: &Client) {
     };
     match key.code {
         KeyCode::Esc => {
-            model.form = None;
-            model.status_message = "изменения отменены".to_owned();
+            if model.form_is_dirty() {
+                let subject = model
+                    .form
+                    .as_ref()
+                    .and_then(|form| {
+                        form.subject.clone().or_else(|| {
+                            form.fields
+                                .first()
+                                .map(|field| field.value.as_str().to_owned())
+                                .filter(|value| !value.is_empty())
+                        })
+                    })
+                    .unwrap_or_else(|| "форма".to_owned());
+                model.confirm = Some(viewmodel::Confirm {
+                    title: "Отменить изменения?".to_owned(),
+                    detail: format!("Несохранённые данные формы «{subject}» будут потеряны."),
+                    pending: Pending::DiscardForm,
+                });
+            } else {
+                model.discard_form();
+            }
         }
         KeyCode::Tab => form.focus_next(false),
         KeyCode::BackTab => form.focus_next(true),
@@ -533,6 +548,7 @@ fn confirm(model: &mut ViewModel, client: &Client) {
             model.pending = true;
             client.send(Command::ConfigApply { expected_version });
         }
+        Pending::DiscardForm => model.discard_form(),
     }
 }
 

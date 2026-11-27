@@ -70,6 +70,7 @@ pub enum Pending {
     ConfigApply {
         expected_version: String,
     },
+    DiscardForm,
 }
 
 /// One explicit confirmation.
@@ -388,12 +389,17 @@ impl ViewModel {
             Screen::Connections => Command::RefreshConnections { offset },
             Screen::Events => Command::RefreshEvents,
             Screen::Config => Command::RefreshConfig,
-            Screen::Overview | Screen::Routes => Command::RefreshAll,
+            Screen::Overview | Screen::Routes => self.refresh_all_command(),
         }
     }
 
-    pub fn reset_pages(&mut self) {
-        self.page = [0; 8];
+    pub fn refresh_all_command(&self) -> crate::tui::client::Command {
+        crate::tui::client::Command::RefreshAll {
+            connections_offset: self.offset_for(Screen::Connections),
+            users_offset: self.offset_for(Screen::Users),
+            blocks_offset: self.offset_for(Screen::Blocks),
+            access_section: self.access_section.to_owned(),
+        }
     }
 
     pub fn page_offset(&self) -> usize {
@@ -949,6 +955,17 @@ impl ViewModel {
         });
     }
 
+    pub fn form_is_dirty(&self) -> bool {
+        self.form
+            .as_ref()
+            .is_some_and(|form| form.fields.iter().any(|field| !field.value.is_empty()))
+    }
+
+    pub fn discard_form(&mut self) {
+        self.form = None;
+        self.status_message = "изменения формы отменены".to_owned();
+    }
+
     pub fn take_submission(&mut self) -> Option<(FormKind, Option<String>)> {
         let form = self.form.as_ref()?;
         let username = match form.kind {
@@ -1162,6 +1179,17 @@ mod tests {
         assert_eq!(model.selected_index(), 1);
         model.select_previous();
         assert_eq!(model.selected_index(), 0);
+    }
+
+    #[test]
+    fn dirty_forms_are_never_discarded_without_an_explicit_action() {
+        let mut model = ViewModel::new();
+        model.start_add_user();
+        assert!(!model.form_is_dirty());
+        model.form.as_mut().unwrap().fields[0].value = Zeroizing::new("alice".to_owned());
+        assert!(model.form_is_dirty());
+        model.discard_form();
+        assert!(model.form.is_none());
     }
 
     #[test]
