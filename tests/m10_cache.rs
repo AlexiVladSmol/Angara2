@@ -1903,13 +1903,16 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
     let origin_address = listener.local_addr().expect("origin address");
     let slow_gets = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
     let task_gets = Arc::clone(&slow_gets);
+    let task_release = Arc::clone(&release);
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let gets = Arc::clone(&task_gets);
+            let release = Arc::clone(&task_release);
             tokio::spawn(async move {
                 while let Some(head) = read_head(&mut stream).await {
                     if head.starts_with("GET ") && head.contains("/slow") {
@@ -1926,7 +1929,10 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
                         if stream.write_all(&vec![b'x'; 512]).await.is_err() {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_millis(3_000)).await;
+                        // Keep the fill active until the test has flooded the
+                        // idle URIs.  A plain sleep makes the test depend on
+                        // how fast 8300 POSTs happen to be.
+                        release.notified().await;
                         if stream.write_all(&vec![b'x'; 4096 - 512]).await.is_err() {
                             return;
                         }
@@ -1965,6 +1971,11 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
         );
     }
 
+    assert!(
+        !slow.is_finished(),
+        "slow fill finished before the idle POST flood; the test cannot prove the registry overflow"
+    );
+    release.notify_one();
     let slow_response = slow.await.expect("slow request");
     assert_eq!(slow_response.body.len(), 4096);
     let again = get(proxy, &uri, &host, &[]).await;

@@ -1977,6 +1977,77 @@ mod tests {
     }
 
     #[test]
+    fn active_uri_registry_is_empty_after_finish_and_drop() {
+        let store = store(64 * 1024, 16 * 1024, 4, 1);
+        let uri = "http://example.test/registry-finish";
+        let mut fill = store
+            .begin_fill(
+                key(uri),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("fill");
+        fill.push(&Bytes::from_static(b"body"));
+        assert!(fill.finish());
+        assert!(store.inner.lock().expect("inner").active_uris.is_empty());
+
+        let uri = "http://example.test/registry-drop";
+        let mut fill = store
+            .begin_fill(
+                key(uri),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("fill");
+        fill.push(&Bytes::from_static(b"body"));
+        drop(fill);
+        assert!(store.inner.lock().expect("inner").active_uris.is_empty());
+    }
+
+    #[test]
+    fn invalidation_between_two_fills_cancels_the_second() {
+        let store = store(64 * 1024, 16 * 1024, 4, 1);
+        let uri = "http://example.test/registry-two-fills";
+        let mut first = store
+            .begin_fill(
+                key(uri),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("first fill");
+        first.push(&Bytes::from_static(b"first"));
+        assert!(first.finish());
+
+        let mut second = store
+            .begin_fill(
+                key(uri),
+                HeaderMap::new(),
+                policy(60),
+                None,
+                SystemTime::now(),
+                SystemTime::now(),
+            )
+            .expect("second fill");
+        second.push(&Bytes::from_static(b"second"));
+        store.invalidate(uri);
+        assert!(!second.finish());
+        assert!(store.inner.lock().expect("inner").active_uris.is_empty());
+        assert!(matches!(
+            store.lookup(&key(uri), SystemTime::now()),
+            Lookup::Miss
+        ));
+    }
+
+    #[test]
     fn request_directives_are_conservative() {
         let no_store = headers(&[("cache-control", "no-store")]);
         let policy = analyze_request(&no_store).expect("request");

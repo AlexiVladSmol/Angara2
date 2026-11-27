@@ -173,8 +173,8 @@ Claude Opus 5.5 оценивает соответствие сценария т�
 
 Локальные проверки: `cargo test --locked --test config_m10` (6 тестов),
 `cargo test --locked --test m10_cache` (46 тестов), `m10_limits` (3 Linux-теста
-RSS/медленного читателя/реестра epoch) и unit-тесты `cache::tests` (14 тестов).
-Полный прогон на ветке реализации: `cargo test --locked` — 537 passed, 0 failed, 3 ignored;
+RSS/медленного читателя/реестра epoch) и unit-тесты `cache::tests` (16 тестов).
+Полный прогон на ветке реализации: `cargo test --locked` — 539 passed, 0 failed, 3 ignored;
 `cargo test --locked --test m10_cache` повторяется для проверки стабильности.
 
 | Строка CACHE-01 | Тесты |
@@ -184,7 +184,7 @@ RSS/медленного читателя/реестра epoch) и unit-тест
 | Ревалидация | `m10_cache09`–`m10_cache14`, `m10_cache34`–`m10_cache36`, `m10_cache39`, `m10_cache47`: ETag/Last-Modified → 304 → полное тело; 200 заменяет; ошибка/таймаут/отказ соединения — штатная ошибка прокси; непригодный 304 и другой/слабый ETag → один безусловный GET; многострочный `Cache-Control` в 304; клиентские `If-*`/Range |
 | Приватность и ACL | `m10_cache15`–`m10_cache19`, `m10_cache30`, `m10_cache38`: Authorization/Cookie/Set-Cookie, пользователи, listeners, egress, поколение, ACL deny на прогретом кеше, журналы/метрики без URL и тел |
 | Маршрутизация | `m10_cache20`, `m10_cache21`, `m10_cache28`, `m10_cache40`: parent bypass, CONNECT, смена endpoint, отказ parent после предыдущего успеха |
-| Инвалидирование | `m10_cache27`, `m10_cache33`, `m10_cache44`, `m10_cache48`: POST инвалидирует URI, same-origin `Location`, наполнение другого URI не отменяется, 8300 idle POST не отменяют медленное наполнение A; unit `invalidation_discards_an_inflight_fill`, `invalidation_of_another_uri_keeps_the_inflight_fill` |
+| Инвалидирование | `m10_cache27`, `m10_cache33`, `m10_cache44`, `m10_cache48`: POST инвалидирует URI, same-origin `Location`, наполнение другого URI не отменяется, 8300 idle POST при удерживаемом медленном наполнении A не отменяют его; unit `invalidation_discards_an_inflight_fill`, `invalidation_of_another_uri_keeps_the_inflight_fill`, `active_uri_registry_is_empty_after_finish_and_drop`, `invalidation_between_two_fills_cancels_the_second` |
 | Память и потоковая передача | `m10_cache22`–`m10_cache24`, `m10_cache31`, `m10_cache32`, `m10_cache43`, `m10_cache45`, `m10_cache46`, `m10_limits01`, `m10_limits02`, `m10_limits03`: малый бюджет/LRU, 20 клиентов на прогретой записи и при малом бюджете, слишком большой/оборванный ответ, trailers, reload/shutdown во время наполнения, RSS после крупных `no-store` ответов, медленный читатель, ограниченный реестр epoch URI и 8300 idle invalidations; unit `store_evicts_and_accounts_bodies`, `incomplete_or_oversized_fill_is_not_published`, `slow_reader_keeps_evicted_object_accounted`, `revalidation_updates_header_accounting` |
 | Директивы клиента | `m10_cache25`–`m10_cache26`, `m10_cache37`: `only-if-cached` холодный/тёплый/просроченный → 504 или ответ; `no-cache`/`min-fresh` → upstream |
 | Конфигурация | `m10_cfg01`–`m10_cfg06`: отсутствие/выключение, defaults, диапазоны, cross-field предел, restart-required, `angara check` |
