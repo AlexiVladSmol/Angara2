@@ -17,6 +17,7 @@ NEW_PASSWORD='M11-synthetic-password-71'
 ORIGIN_PORT=18080
 PROXY_PORT=3128
 TMP=$(mktemp -d)
+CLIENT_TMP=$(mktemp /tmp/m11-control-client.XXXXXX.py)
 ORIGIN_PID=
 START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -31,6 +32,7 @@ cleanup() {
     systemctl stop "$CONTROL_SERVICE" angara.service 2>/dev/null || true
     userdel "$READER" >/dev/null 2>&1 || true
     userdel "$ADMIN" >/dev/null 2>&1 || true
+    rm -f "$CLIENT_TMP"
     rm -rf "$TMP"
 }
 trap 'rc=$?; if [ "$rc" -ne 0 ]; then journal_dump; fi; cleanup' EXIT HUP INT TERM
@@ -113,6 +115,8 @@ write_config() {
 
 [ -x "$BIN" ] || fail_control "installed binary is missing: $BIN"
 [ -f "$CLIENT" ] || fail_control "control client is missing: $CLIENT"
+install -m 0755 "$CLIENT" "$CLIENT_TMP"
+CLIENT=$CLIENT_TMP
 
 # Fresh synthetic accounts.  The reader has only the proxy group; the admin
 # has angara-admin as primary group and angara as a supplementary group.
