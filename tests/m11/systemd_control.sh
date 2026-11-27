@@ -120,7 +120,7 @@ userdel "$READER" >/dev/null 2>&1 || true
 userdel "$ADMIN" >/dev/null 2>&1 || true
 useradd --system --gid angara --home-dir /nonexistent \
     --shell /usr/sbin/nologin --no-create-home "$READER"
-useradd --system --gid angara-admin --groups angara --home-dir /nonexistent \
+useradd --system --gid angara --groups angara-admin --home-dir /nonexistent \
     --shell /usr/sbin/nologin --no-create-home "$ADMIN"
 
 cat >"$TMP/angara.toml" <<'EOF'
