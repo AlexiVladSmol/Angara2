@@ -122,6 +122,9 @@ useradd --system --gid angara --home-dir /nonexistent \
     --shell /usr/sbin/nologin --no-create-home "$READER"
 useradd --system --gid angara --groups angara-admin --home-dir /nonexistent \
     --shell /usr/sbin/nologin --no-create-home "$ADMIN"
+id -nG "$READER" | grep -qw angara || fail_control "reader lacks the angara group"
+id -nG "$ADMIN" | grep -qw angara-admin || fail_control "administrator lacks angara-admin"
+id -nG "$ADMIN" | grep -qw angara || fail_control "administrator lacks the angara socket group"
 
 cat >"$TMP/angara.toml" <<'EOF'
 schema_version = 1
