@@ -62,6 +62,8 @@ detect_ubuntu_mirror() {
 UBUNTU_MIRROR=$(detect_ubuntu_mirror)
 DEBOOTSTRAP_TIMEOUT=${M08_DEBOOTSTRAP_TIMEOUT:-900}
 WGET_READ_TIMEOUT=${M08_WGET_READ_TIMEOUT:-60}
+BOOT_TIMEOUT=${M08_BOOT_TIMEOUT:-180}
+SERVICE_TIMEOUT=${M08_SERVICE_TIMEOUT:-60}
 case "$DEBOOTSTRAP_TIMEOUT" in
     ''|*[!0-9]*) fail "M08_DEBOOTSTRAP_TIMEOUT must be a positive integer" ;;
 esac
@@ -72,6 +74,18 @@ case "$WGET_READ_TIMEOUT" in
 esac
 [ "$WGET_READ_TIMEOUT" -gt 0 ] \
     || fail "M08_WGET_READ_TIMEOUT must be a positive integer"
+case "$BOOT_TIMEOUT" in
+    ''|*[!0-9]*) fail "M08_BOOT_TIMEOUT must be a positive integer" ;;
+esac
+[ "$BOOT_TIMEOUT" -gt 0 ] \
+    || fail "M08_BOOT_TIMEOUT must be a positive integer"
+[ "$BOOT_TIMEOUT" -le 180 ] \
+    || fail "M08_BOOT_TIMEOUT must not exceed 180 seconds"
+case "$SERVICE_TIMEOUT" in
+    ''|*[!0-9]*) fail "M08_SERVICE_TIMEOUT must be a positive integer" ;;
+esac
+[ "$SERVICE_TIMEOUT" -gt 0 ] \
+    || fail "M08_SERVICE_TIMEOUT must be a positive integer"
 
 TMP=$(mktemp -d)
 ROOT="$TMP/rootfs"
@@ -170,6 +184,37 @@ unmount_root_paths() {
         | sort -rn | cut -d' ' -f2-)
 }
 
+root_mode() {
+    stat -c '%a' "$ROOT" 2>/dev/null || printf 'missing\n'
+}
+
+assert_root_mode() {
+    local mode
+    mode=$(root_mode)
+    log "rootfs directory mode: $mode"
+    [ "$mode" = "755" ] \
+        || fail "rootfs directory mode is $mode, expected 755"
+}
+
+print_boot_diagnostics() {
+    local state=$1
+    printf 'boot diagnostics: system state=%s\n' "${state:-unknown}" >&2
+    printf 'rootfs directory mode: %s\n' "$(root_mode)" >&2
+    if command -v journalctl >/dev/null 2>&1; then
+        printf '%s\n' '--- angara/dbus journal from rootfs ---' >&2
+        journalctl --root="$ROOT" --no-pager -n 200 \
+            -u angara.service -u dbus.service >&2 || true
+    fi
+    printf '%s\n' '--- failed units ---' >&2
+    timeout 5 systemctl -M "$MACHINE" --failed --no-pager >&2 || true
+    if [ -f "$TMP/nspawn.log" ]; then
+        printf '%s\n' '--- nspawn.log ---' >&2
+        cat "$TMP/nspawn.log" >&2
+    fi
+}
+
+DEBOOTSTRAP_CACHE_DIR="$TMP/debootstrap-cache"
+install -d -m 0755 "$DEBOOTSTRAP_CACHE_DIR"
 DEBOOTSTRAP_START=$(date +%s)
 DEBOOTSTRAP_CODE=1
 DEBOOTSTRAP_ATTEMPT=0
@@ -178,10 +223,15 @@ for attempt in $(seq 1 "$DEBOOTSTRAP_ATTEMPTS"); do
     DEBOOTSTRAP_ATTEMPT=$attempt
     unmount_root_paths
     rm -rf --one-file-system "$ROOT" 2>/dev/null || true
+    # debootstrap creates the target with the caller's umask.  The script
+    # runs with umask 077, so create the target explicitly with the mode that
+    # system services need, and keep the package cache outside the rootfs.
+    install -d -m 0755 "$ROOT"
     DEBOOTSTRAP_LAST_LOG="$TMP/debootstrap-${attempt}.log"
     set +e
     WGETRC="$TMP/wgetrc" timeout --kill-after=30 "$DEBOOTSTRAP_TIMEOUT" debootstrap \
         --variant=minbase \
+        --cache-dir="$DEBOOTSTRAP_CACHE_DIR" \
         --include=systemd,systemd-sysv,dbus,iproute2,procps,curl,ca-certificates,python3 \
         noble "$ROOT" "$UBUNTU_MIRROR" \
         >"$DEBOOTSTRAP_LAST_LOG" 2>&1 &
@@ -214,6 +264,7 @@ if [ "$DEBOOTSTRAP_CODE" -ne 0 ]; then
     fail "debootstrap failed with exit code ${DEBOOTSTRAP_CODE} after ${DEBOOTSTRAP_ATTEMPT} attempt(s)"
 fi
 log "debootstrap completed in ${DEBOOTSTRAP_ELAPSED}s on attempt ${DEBOOTSTRAP_ATTEMPT}"
+assert_root_mode
 if [ "$DEBOOTSTRAP_ONLY" -eq 1 ]; then
     log "debootstrap-only mode; skipping archive install and boot"
     exit 0
@@ -230,37 +281,43 @@ systemctl --root="$ROOT" enable angara.service >/dev/null
 [ -L "$ROOT/etc/systemd/system/multi-user.target.wants/angara.service" ] \
     || fail "angara.service was not enabled in the rootfs"
 
+assert_root_mode
+
 log "booting $MACHINE"
 systemd-nspawn -D "$ROOT" --machine="$MACHINE" --boot --network-veth \
     >"$TMP/nspawn.log" 2>&1 &
 NSPAWN_PID=$!
 
+BOOT_DEADLINE=$(($(date +%s) + BOOT_TIMEOUT))
 SYSTEM_STATE=
-for _ in $(seq 1 180); do
+while [ "$(date +%s)" -lt "$BOOT_DEADLINE" ]; do
     SYSTEM_STATE=$(timeout 5 systemctl -M "$MACHINE" is-system-running 2>/dev/null || true)
-    case "$SYSTEM_STATE" in
-        running|degraded) break ;;
-    esac
+    if [ "$SYSTEM_STATE" = "running" ]; then
+        break
+    fi
     if ! kill -0 "$NSPAWN_PID" 2>/dev/null; then
-        cat "$TMP/nspawn.log" >&2
+        print_boot_diagnostics "$SYSTEM_STATE"
         fail "systemd-nspawn exited before boot"
     fi
     sleep 1
 done
-case "$SYSTEM_STATE" in
-    running|degraded) ;;
-    *)
-        cat "$TMP/nspawn.log" >&2
-        fail "container systemd did not become ready (state=${SYSTEM_STATE:-unknown})"
-        ;;
-esac
+if [ "$SYSTEM_STATE" != "running" ]; then
+    print_boot_diagnostics "$SYSTEM_STATE"
+    fail "container systemd did not become ready (state=${SYSTEM_STATE:-unknown}) within ${BOOT_TIMEOUT}s"
+fi
 
-for _ in $(seq 1 120); do
-    systemctl -M "$MACHINE" is-active --quiet angara.service && break
+SERVICE_DEADLINE=$(($(date +%s) + SERVICE_TIMEOUT))
+while [ "$(date +%s)" -lt "$SERVICE_DEADLINE" ]; do
+    if systemctl -M "$MACHINE" is-active --quiet angara.service; then
+        break
+    fi
     sleep 0.5
 done
-systemctl -M "$MACHINE" is-active --quiet angara.service \
-    || { systemctl -M "$MACHINE" status angara.service --no-pager >&2 || true; fail "angara.service did not autostart"; }
+if ! systemctl -M "$MACHINE" is-active --quiet angara.service; then
+    print_boot_diagnostics "$SYSTEM_STATE"
+    systemctl -M "$MACHINE" status angara.service --no-pager >&2 || true
+    fail "angara.service did not autostart within ${SERVICE_TIMEOUT}s"
+fi
 assert_eq "$(systemctl -M "$MACHINE" is-enabled angara.service)" "enabled" "boot enable state"
 
 assert_eq "$(systemd-run --machine="$MACHINE" --quiet --pipe --wait --collect /bin/cat /proc/1/comm)" \
