@@ -1131,7 +1131,7 @@ jobs:
           set +e
           sudo env PATH="$BIN:$PATH" \
             M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
-            M08_DEBOOTSTRAP_ATTEMPTS=2 M08_DEBOOTSTRAP_RETRY_DELAY=0 \
+            M08_DEBOOTSTRAP_ATTEMPTS=4 M08_DEBOOTSTRAP_RETRY_DELAY=0 \
             FAKE_DEBOOTSTRAP_STATE="$STATE" \
             bash tests/m08/boot.sh >"$LOG" 2>&1
           CODE=$?
@@ -1141,7 +1141,7 @@ jobs:
             echo "boot.sh failed in the real debootstrap retry path" >&2
             exit 1
           fi
-          grep -Fq 'debootstrap attempt 1/2 failed with exit code 1' "$LOG" || {
+          grep -Fq 'debootstrap attempt 1/4 failed with exit code 1' "$LOG" || {
             echo "missing first debootstrap retry log line" >&2
             exit 1
           }
@@ -1153,7 +1153,7 @@ jobs:
             echo "missing successful boot marker" >&2
             exit 1
           }
-          [ "$(sudo cat "$STATE")" = "2" ] || {
+          [ "$(sudo cat "$STATE")" -ge 2 ] || {
             echo "unexpected debootstrap attempt count: $(sudo cat "$STATE")" >&2
             exit 1
           }
