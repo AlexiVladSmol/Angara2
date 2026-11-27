@@ -60,6 +60,9 @@ jobs:
       - name: M10 cache resource evidence
         run: cargo test --locked --test m10_limits -- --nocapture --test-threads=1
 
+      - name: M08 soak RSS checker self-test
+        run: python3 tests/m08/soak_rss_test.py -v
+
       - name: CPU evidence (multi-worker HTTP path)
         run: |
           cargo test --locked --test http_forward \

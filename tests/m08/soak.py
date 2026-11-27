@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from soak_rss import evaluate_rss
+
 
 def run(command: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(command, check=check, capture_output=True, text=True)
@@ -170,9 +172,9 @@ def main() -> int:
         ]
 
     try:
-        # The threshold is relative to a warmed process, not the cold startup
-        # allocator.  Run the same 20-client auth/TLS mix for two minutes,
-        # let idle work settle, then record the warmed baseline.
+        # Warm up before collecting RSS samples and the FD baseline.  The RSS
+        # leak decision uses the whole series (see soak_rss.py); the baseline
+        # remains the reference for FD growth only.
         warmup_report = batch_dir / "warmup.json"
         warmup_started = time.monotonic()
         warmup = subprocess.run(
@@ -258,14 +260,14 @@ def main() -> int:
             "fds": max((item["fds"] for item in samples), default=0),
             "threads": max((item["threads"] for item in samples), default=0),
         }
+        rss_check = evaluate_rss(samples)
         threshold_ok = (
             bool(samples)
-            and peak["rss_kib"] <= 524288
+            and rss_check["ok"]
             and after is not None
             and baseline is not None
             and peak["fds"] <= baseline["fds"] + 512
             and after["fds"] <= baseline["fds"] + 8
-            and after["rss_kib"] <= baseline["rss_kib"] + 65536
         )
         warmup_ok = warmup.returncode == 0
         report = {
@@ -291,6 +293,7 @@ def main() -> int:
             "baseline": baseline,
             "peak": peak,
             "after": after,
+            "rss_check": rss_check,
             "samples": samples,
             "reloads": reloads,
             "batches": batch_results,
@@ -308,6 +311,7 @@ def main() -> int:
                     "baseline": baseline,
                     "peak": peak,
                     "after": after,
+                    "rss_check": rss_check,
                     "reloads": reloads,
                 },
                 indent=2,
