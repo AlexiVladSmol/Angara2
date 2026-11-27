@@ -498,6 +498,9 @@ def main() -> int:
         peak_fd_ok = (
             baseline is not None and peak_fds <= baseline["fds"] + 512
         )
+        # Short cohorts check an absolute RSS ceiling and FD recovery.  A
+        # baseline-relative RSS threshold is not stable at this duration; the
+        # hour-long soak is the leak check (tests/m08/soak_rss.py).
         resource_ok = (
             peak is not None
             and peak_rss > 0

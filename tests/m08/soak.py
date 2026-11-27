@@ -172,9 +172,9 @@ def main() -> int:
         ]
 
     try:
-        # The threshold is relative to a warmed process, not the cold startup
-        # allocator.  Run the same 20-client auth/TLS mix for two minutes,
-        # let idle work settle, then record the warmed baseline.
+        # Warm up before collecting RSS samples and the FD baseline.  The RSS
+        # leak decision uses the whole series (see soak_rss.py); the baseline
+        # remains the reference for FD growth only.
         warmup_report = batch_dir / "warmup.json"
         warmup_started = time.monotonic()
         warmup = subprocess.run(
