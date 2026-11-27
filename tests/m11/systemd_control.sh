@@ -68,7 +68,7 @@ wait_both_active() {
 wait_snapshot() {
     local i output
     for i in $(seq 1 100); do
-        output=$(sudo -u "$ADMIN" python3 "$CLIENT" --socket "$PUBLIC" --op snapshot 2>/dev/null || true)
+        output=$(python3 "$CLIENT" --socket "$PUBLIC" --op snapshot 2>/dev/null || true)
         if printf '%s' "$output" | grep -q '"ok":true'; then
             printf '%s' "$output"
             return 0
@@ -200,6 +200,14 @@ wait_server_ready() {
         fi
         sleep 0.2
     done
+    log "control diagnostics: socket directory"
+    ls -l /run/angara >&2 || true
+    log "control diagnostics: environment"
+    systemctl show -p Environment angara.service >&2 || true
+    log "control diagnostics: admin hello"
+    call_as "$ADMIN" hello >&2 || true
+    log "control diagnostics: admin snapshot"
+    call_as "$ADMIN" snapshot >&2 || true
     fail_control "proxy/control did not become ready"
 }
 wait_server_ready
