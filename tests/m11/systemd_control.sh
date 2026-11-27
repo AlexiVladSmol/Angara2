@@ -67,7 +67,7 @@ wait_both_active() {
 
 wait_snapshot() {
     local i output
-    for i in $(seq 1 200); do
+    for i in $(seq 1 100); do
         output=$(sudo -u "$ADMIN" python3 "$CLIENT" --socket "$PUBLIC" --op snapshot 2>/dev/null || true)
         if printf '%s' "$output" | grep -q '"ok":true'; then
             printf '%s' "$output"
@@ -75,7 +75,7 @@ wait_snapshot() {
         fi
         sleep 0.1
     done
-    fail_control "snapshot through control.sock did not become available"
+    return 1
 }
 
 call_as() {
@@ -185,13 +185,17 @@ wait_port 127.0.0.1 "$ORIGIN_PORT"
 
 systemctl stop "$CONTROL_SERVICE" angara.service >/dev/null 2>&1 || true
 systemctl reset-failed angara.service "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+log "M11 setup: starting angara.service and $CONTROL_SERVICE"
 systemctl start angara.service "$CONTROL_SERVICE"
 wait_both_active
+log "M11 setup: units active, waiting for control snapshot"
 wait_server_ready() {
     local i
-    for i in $(seq 1 200); do
-        wait_snapshot >/dev/null 2>&1 && return 0
-        sleep 0.1
+    for i in $(seq 1 3); do
+        if wait_snapshot >/dev/null; then
+            return 0
+        fi
+        sleep 0.2
     done
     fail_control "proxy/control did not become ready"
 }
