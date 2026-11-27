@@ -44,13 +44,13 @@ fail_control() {
 }
 
 json_field() {
-    python3 - "$1" <<'PY'
+    python3 -c '
 import json, sys
 value = json.load(sys.stdin)
 for part in sys.argv[1].split("."):
     value = value[part]
 print(value)
-PY
+' "$1"
 }
 
 active() {
