@@ -356,6 +356,28 @@ ensure_admin_group() {
 install_managed_unit() {
     local source_name=$1 unit_name=$2 target
     target=$(path "$UNIT_DIR/$unit_name")
+    if [ ! -f "$RELEASE_DIR/systemd/$source_name" ]; then
+        # Older accepted archives have no privileged control unit. Installing
+        # such an archive with the newer installer must remain possible, and a
+        # stale control unit from a newer release must not survive a downgrade.
+        if [ "$source_name" = "$CONTROL_SERVICE" ]; then
+            if [ -e "$target" ]; then
+                [ -f "$target" ] && [ ! -L "$target" ] \
+                    || die "existing control unit is not a regular managed file: $target"
+                grep -q '^# Managed by Angara package' "$target" \
+                    || die "existing control unit is foreign and will not be removed: $target"
+                if [ -z "$DESTDIR" ] && [ "$NO_SYSTEMD" -eq 0 ] \
+                    && command -v systemctl >/dev/null 2>&1; then
+                    systemctl disable "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+                    systemctl stop "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+                fi
+                rm -f "$target"
+                UNIT_CHANGED=1
+            fi
+            return 0
+        fi
+        die "release has no unit $source_name"
+    fi
     if [ -e "$target" ]; then
         [ -f "$target" ] && [ ! -L "$target" ] \
             || die "existing unit is not a regular managed file: $target"

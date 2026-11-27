@@ -853,7 +853,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Действия"),
         Line::from("  a добавить · e изменить · d удалить"),
         Line::from("  J/K переместить правило · v раздел ACL · i ip_default"),
-        Line::from("  c проверить · A применить"),
+        Line::from("  c проверить · A применить · f фильтр событий"),
         Line::from("  Enter открыть/проверить · Esc отмена"),
         Line::from(""),
         Line::from("Пароль вводится скрыто и не попадает в argv, env или журнал."),

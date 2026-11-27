@@ -278,7 +278,13 @@ install_release_metadata() {
     local unit_name
     for unit_name in "$SERVICE" "$CONTROL_SERVICE"; do
         if [ ! -f "$release/systemd/$unit_name" ]; then
-            [ "$unit_name" = "$CONTROL_SERVICE" ] && continue
+            if [ "$unit_name" = "$CONTROL_SERVICE" ]; then
+                if [ -e "$UNIT_DIR/$CONTROL_SERVICE" ]; then
+                    rm -f "$UNIT_DIR/$CONTROL_SERVICE" || return 1
+                    UNIT_METADATA_CHANGED=1
+                fi
+                continue
+            fi
             printf 'error: release has no unit %s\n' "$unit_name" >&2
             return 1
         fi
@@ -347,15 +353,21 @@ set_previous() {
     mv -Tf "$PREFIX/previous.tmp" "$PREFIX/previous"
 }
 
+control_unit_present() {
+    [ -e "$UNIT_DIR/$CONTROL_SERVICE" ]
+}
+
 service_active() {
     systemctl is-active --quiet "$SERVICE" \
-        || systemctl is-active --quiet "$CONTROL_SERVICE"
+        || { control_unit_present && systemctl is-active --quiet "$CONTROL_SERVICE"; }
 }
 
 stop_service() {
-    if service_active; then
-        systemctl stop "$CONTROL_SERVICE" "$SERVICE" \
-            || die "systemctl stop $SERVICE $CONTROL_SERVICE failed"
+    if control_unit_present && systemctl is-active --quiet "$CONTROL_SERVICE"; then
+        systemctl stop "$CONTROL_SERVICE" || die "systemctl stop $CONTROL_SERVICE failed"
+    fi
+    if systemctl is-active --quiet "$SERVICE"; then
+        systemctl stop "$SERVICE" || die "systemctl stop $SERVICE failed"
     fi
     if service_active; then
         die "$SERVICE or $CONTROL_SERVICE is still active after stop"
@@ -601,8 +613,12 @@ start_service() {
     # An explicit maintenance command may recover a unit that previously hit
     # its automatic start limit.  The unit's Restart=on-failure policy is still
     # enforced for unexpected crashes.
-    systemctl reset-failed "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
-    systemctl start "$SERVICE" "$CONTROL_SERVICE" || return 1
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$SERVICE" || return 1
+    if control_unit_present; then
+        systemctl reset-failed "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$CONTROL_SERVICE" || return 1
+    fi
     if ! probe_service "$expected"; then
         journal_tail
         return 1
@@ -796,12 +812,19 @@ command_recover() {
         systemctl daemon-reload || die "systemctl daemon-reload failed"
     fi
     if service_active; then
-        systemctl restart "$SERVICE" "$CONTROL_SERVICE" \
-            || die "systemctl restart $SERVICE $CONTROL_SERVICE failed"
+        systemctl restart "$SERVICE" || die "systemctl restart $SERVICE failed"
+        if control_unit_present; then
+            systemctl restart "$CONTROL_SERVICE" \
+                || die "systemctl restart $CONTROL_SERVICE failed"
+        fi
     else
-        systemctl reset-failed "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
-        systemctl start "$SERVICE" "$CONTROL_SERVICE" \
-            || die "systemctl start $SERVICE $CONTROL_SERVICE failed"
+        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$SERVICE" || die "systemctl start $SERVICE failed"
+        if control_unit_present; then
+            systemctl reset-failed "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+            systemctl start "$CONTROL_SERVICE" \
+                || die "systemctl start $CONTROL_SERVICE failed"
+        fi
     fi
     probe_service "$current" || die "recovered service did not become ready"
     printf 'active=%s\n' "$(basename "$current")"
@@ -811,9 +834,11 @@ command_status() {
     printf 'service=%s\n' "$SERVICE"
     printf 'active_state=%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
     printf 'unit_state=%s\n' "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
-    printf 'control_service=%s\n' "$CONTROL_SERVICE"
-    printf 'control_active_state=%s\n' "$(systemctl is-active "$CONTROL_SERVICE" 2>/dev/null || true)"
-    printf 'control_unit_state=%s\n' "$(systemctl is-enabled "$CONTROL_SERVICE" 2>/dev/null || true)"
+    if control_unit_present; then
+        printf 'control_service=%s\n' "$CONTROL_SERVICE"
+        printf 'control_active_state=%s\n' "$(systemctl is-active "$CONTROL_SERVICE" 2>/dev/null || true)"
+        printf 'control_unit_state=%s\n' "$(systemctl is-enabled "$CONTROL_SERVICE" 2>/dev/null || true)"
+    fi
     local pid
     pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
     printf 'main_pid=%s\n' "${pid:-0}"
@@ -830,7 +855,9 @@ command_status() {
     printf 'release_count=%s\n' "$(find "$PREFIX/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
     printf 'config_sha256=%s\n' "$(sha256sum "$SYSCONFDIR/angara.toml" 2>/dev/null | awk '{print $1}')"
     printf 'unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$SERVICE" 2>/dev/null | awk '{print $1}')"
-    printf 'control_unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$CONTROL_SERVICE" 2>/dev/null | awk '{print $1}')"
+    if control_unit_present; then
+        printf 'control_unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$CONTROL_SERVICE" 2>/dev/null | awk '{print $1}')"
+    fi
     printf 'limits:\n'
     systemctl show -p LimitNOFILE -p TasksMax -p KillMode -p TimeoutStopUSec -p Restart "$SERVICE" 2>/dev/null || true
     printf 'listeners:\n'

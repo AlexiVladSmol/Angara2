@@ -392,6 +392,10 @@ impl ViewModel {
         }
     }
 
+    pub fn reset_pages(&mut self) {
+        self.page = [0; 8];
+    }
+
     pub fn page_offset(&self) -> usize {
         self.page[self.screen.index()] * 100
     }
@@ -529,6 +533,7 @@ impl ViewModel {
 
     pub fn apply_write(&mut self, outcome: WriteOutcome) {
         self.pending = false;
+        self.error = None;
         if outcome.applied
             || self.form.as_ref().is_some_and(|form| {
                 matches!(form.kind, FormKind::AddUser | FormKind::ChangePassword)
@@ -564,6 +569,7 @@ impl ViewModel {
 
     pub fn apply_reload(&mut self, outcome: ReloadOutcome) {
         self.pending = false;
+        self.error = None;
         self.status_message = match outcome {
             ReloadOutcome::Valid { generation } => {
                 format!("проверено · поколение {generation}")

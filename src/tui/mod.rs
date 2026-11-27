@@ -93,9 +93,11 @@ fn apply_update(model: &mut ViewModel, update: Update, client: &Client) {
                 crate::control_protocol::EventKind::ConfigSaved
                 | crate::control_protocol::EventKind::ConfigApplied
                 | crate::control_protocol::EventKind::ConfigRejected => {
+                    model.reset_pages();
                     client.send(Command::RefreshAll);
                 }
                 crate::control_protocol::EventKind::Resync => {
+                    model.reset_pages();
                     client.send(Command::RefreshAll);
                 }
             }
@@ -106,10 +108,12 @@ fn apply_update(model: &mut ViewModel, update: Update, client: &Client) {
         }
         Update::Write(outcome) => {
             model.apply_write(outcome);
+            model.reset_pages();
             client.send(Command::RefreshAll);
         }
         Update::Reload(outcome) => {
             model.apply_reload(outcome);
+            model.reset_pages();
             client.send(Command::RefreshAll);
         }
         Update::Preview(preview) => model.apply_preview(preview),
@@ -262,7 +266,10 @@ fn handle_key(model: &mut ViewModel, key: KeyEvent, client: &Client) {
         KeyCode::Up | KeyCode::Char('k') => model.select_previous(),
         KeyCode::PageDown => model.select_page(1),
         KeyCode::PageUp => model.select_page(-1),
-        KeyCode::Esc => model.clear_transient(),
+        KeyCode::Esc => {
+            model.clear_transient();
+            client.send(model.search_command());
+        }
         KeyCode::Char('r') => client.send(model.search_command()),
         KeyCode::Char('f') if model.screen == Screen::Events => model.cycle_event_filter(),
         KeyCode::Char(']') => {

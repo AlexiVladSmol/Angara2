@@ -310,6 +310,17 @@ where
         return usage_error("не указан --config");
     };
     let path = std::path::absolute(&path).unwrap_or(path);
+    // The packaged unit uses an environment variable so an older M10 binary
+    // can ignore the M11 private-reader setting during an A->B->A swap.
+    let control_socket = if matches!(mode, Mode::Serve) {
+        control_socket.or_else(|| {
+            std::env::var_os("ANGARA_CONTROL_READ_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+    } else {
+        None
+    };
 
     let config = match Config::load(&path) {
         Ok(config) => config,

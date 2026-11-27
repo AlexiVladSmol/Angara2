@@ -16,7 +16,8 @@ WorkingDirectory=/etc/angara
 RuntimeDirectory=angara
 RuntimeDirectoryMode=0750
 ExecStartPre=/opt/angara/current/bin/angara check --config /etc/angara/angara.toml
-ExecStart=/opt/angara/current/bin/angara serve --config /etc/angara/angara.toml --control-read-socket /run/angara/control-read.sock
+Environment=ANGARA_CONTROL_READ_SOCKET=/run/angara/control-read.sock
+ExecStart=/opt/angara/current/bin/angara serve --config /etc/angara/angara.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
