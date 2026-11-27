@@ -1068,6 +1068,7 @@ jobs:
           sudo env M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
             M08_UBUNTU_MIRROR=http://127.0.0.1:18089/ubuntu/ \
             M08_WGET_READ_TIMEOUT=3 M08_DEBOOTSTRAP_TIMEOUT=60 \
+            M08_DEBOOTSTRAP_ATTEMPTS=1 \
             TMPDIR="$THIRD_TMPDIR" bash tests/m08/boot.sh \
             >"$THIRD_LOG" 2>&1
           WGET_CODE=$?
@@ -1099,14 +1100,150 @@ jobs:
             exit 1
           fi
           echo "wget timeout path: code=$WGET_CODE elapsed=${WGET_ELAPSED}s mounts=none temp=empty"
-      - name: Boot pristine rootfs
+      - name: Boot pristine rootfs after debootstrap retry
         run: |
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
-          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
-            sudo --preserve-env=M08_ARCHIVE,M08_SHA256 bash tests/m08/boot.sh
+          TEST_TMP=$(mktemp -d)
+          BIN="$TEST_TMP/bin"
+          STATE="$TEST_TMP/attempts"
+          LOG="$TEST_TMP/boot.log"
+          mkdir -p "$BIN"
+          REAL_DEBOOTSTRAP=$(command -v debootstrap)
+          cat >"$BIN/debootstrap" <<SH
+          #!/usr/bin/env bash
+          set -euo pipefail
+          state=\${FAKE_DEBOOTSTRAP_STATE:?}
+          count=\$(cat "\$state" 2>/dev/null || echo 0)
+          count=\$((count + 1))
+          echo "\$count" >"\$state"
+          if [ "\$count" -eq 1 ]; then
+            echo "synthetic first debootstrap attempt failure" >&2
+            exit 1
+          fi
+          exec "$REAL_DEBOOTSTRAP" "\$@"
+          SH
+          chmod +x "$BIN/debootstrap"
+          cleanup() {
+            sudo rm -rf "$TEST_TMP"
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          set +e
+          sudo env PATH="$BIN:$PATH" \
+            M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_DEBOOTSTRAP_ATTEMPTS=4 M08_DEBOOTSTRAP_RETRY_DELAY=0 \
+            FAKE_DEBOOTSTRAP_STATE="$STATE" \
+            bash tests/m08/boot.sh >"$LOG" 2>&1
+          CODE=$?
+          set -e
+          cat "$LOG"
+          if [ "$CODE" -ne 0 ]; then
+            echo "boot.sh failed in the real debootstrap retry path" >&2
+            exit 1
+          fi
+          grep -Fq 'debootstrap attempt 1/4 failed with exit code 1' "$LOG" || {
+            echo "missing first debootstrap retry log line" >&2
+            exit 1
+          }
+          grep -Fq 'rootfs directory mode: 755' "$LOG" || {
+            echo "missing 755 rootfs mode evidence" >&2
+            exit 1
+          }
+          grep -Fq 'boot checks passed' "$LOG" || {
+            echo "missing successful boot marker" >&2
+            exit 1
+          }
+          [ "$(sudo cat "$STATE")" -ge 2 ] || {
+            echo "unexpected debootstrap attempt count: $(sudo cat "$STATE")" >&2
+            exit 1
+          }
+          echo "real retry path: attempts=$(sudo cat "$STATE") code=$CODE rootfs_mode=755 boot=passed"
+
+      - name: Verify debootstrap retries and final failure
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls artifacts/b/*.tar.gz)
+          SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
+          TEST_TMP=$(mktemp -d)
+          BIN="$TEST_TMP/bin"
+          mkdir -p "$BIN"
+          cat >"$BIN/debootstrap" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          state=${FAKE_DEBOOTSTRAP_STATE:?}
+          count=$(cat "$state" 2>/dev/null || echo 0)
+          count=$((count + 1))
+          echo "$count" >"$state"
+          if [ "${FAKE_DEBOOTSTRAP_FAIL:-0}" = "1" ]; then
+            exit 1
+          fi
+          if [ "$count" -lt "${FAKE_DEBOOTSTRAP_SUCCEED_AT:-2}" ]; then
+            exit 1
+          fi
+          args=("$@")
+          root="${args[${#args[@]}-2]}"
+          mkdir -p "$root"
+          SH
+          chmod +x "$BIN/debootstrap"
+          SUCCESS_TMP=$(mktemp -d)
+          SUCCESS_LOG=$(mktemp)
+          SUCCESS_STATE=$(mktemp)
+          FAIL_TMP=$(mktemp -d)
+          FAIL_LOG=$(mktemp)
+          FAIL_STATE=$(mktemp)
+          sudo chown root:root "$SUCCESS_STATE" "$FAIL_STATE"
+          sudo chmod 0644 "$SUCCESS_STATE" "$FAIL_STATE"
+          cleanup() {
+            sudo rm -rf "$TEST_TMP" "$SUCCESS_TMP" "$FAIL_TMP"
+            sudo rm -f "$SUCCESS_LOG" "$SUCCESS_STATE" "$FAIL_LOG" "$FAIL_STATE"
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          set +e
+          sudo env PATH="$BIN:$PATH" \
+            M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_DEBOOTSTRAP_ONLY=1 M08_DEBOOTSTRAP_ATTEMPTS=3 \
+            M08_DEBOOTSTRAP_RETRY_DELAY=0 TMPDIR="$SUCCESS_TMP" \
+            FAKE_DEBOOTSTRAP_STATE="$SUCCESS_STATE" \
+            bash tests/m08/boot.sh >"$SUCCESS_LOG" 2>&1
+          SUCCESS_CODE=$?
+          set -e
+          cat "$SUCCESS_LOG"
+          [ "$SUCCESS_CODE" -eq 0 ] || {
+            echo "boot.sh did not succeed on the second debootstrap attempt" >&2
+            exit 1
+          }
+          grep -Fq 'debootstrap attempt 1/3 failed with exit code 1' "$SUCCESS_LOG" || {
+            echo "missing retry log line" >&2
+            exit 1
+          }
+          [ "$(cat "$SUCCESS_STATE")" = "2" ] || {
+            echo "unexpected debootstrap attempt count: $(cat "$SUCCESS_STATE")" >&2
+            exit 1
+          }
+
+          set +e
+          sudo env PATH="$BIN:$PATH" \
+            M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_DEBOOTSTRAP_ONLY=1 M08_DEBOOTSTRAP_ATTEMPTS=2 \
+            M08_DEBOOTSTRAP_RETRY_DELAY=0 TMPDIR="$FAIL_TMP" \
+            FAKE_DEBOOTSTRAP_STATE="$FAIL_STATE" FAKE_DEBOOTSTRAP_FAIL=1 \
+            bash tests/m08/boot.sh >"$FAIL_LOG" 2>&1
+          FAIL_CODE=$?
+          set -e
+          cat "$FAIL_LOG"
+          [ "$FAIL_CODE" -ne 0 ] || {
+            echo "boot.sh unexpectedly succeeded after all failed attempts" >&2
+            exit 1
+          }
+          grep -Fq 'debootstrap failed with exit code 1 after 2 attempt(s)' "$FAIL_LOG" || {
+            echo "missing final debootstrap failure after all attempts" >&2
+            exit 1
+          }
+          echo "debootstrap retry paths: success_attempts=$(cat "$SUCCESS_STATE") final_code=$FAIL_CODE"
 
   vm-boot:
     name: Disposable Ubuntu cloud VM install and boot
