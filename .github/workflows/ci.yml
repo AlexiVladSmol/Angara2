@@ -11,15 +11,51 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
 jobs:
+  scope:
+    name: Select CI and validate documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select suite from Git history
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 ci/doc_changes.py select "$EVENT" "$BASE" "$HEAD"
+      - name: Ensure distribution Markdown parser is available
+        run: |
+          if ! /usr/bin/python3 -c 'import markdown_it'; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends python3-markdown-it
+          fi
+      - name: Exercise CI selection and link checks
+        if: steps.select.outputs.mode == 'full'
+        run: /usr/bin/python3 -m unittest discover -s ci -v
+      - name: Check changed Markdown and release inputs
+        if: steps.select.outputs.mode == 'docs'
+        env:
+          PATHS_JSON: ${{ steps.select.outputs.paths }}
+        run: /usr/bin/python3 ci/doc_changes.py check "$PATHS_JSON"
+
   rust:
+    needs: scope
+    if: needs.scope.outputs.mode == 'full'
     name: Rust checks (Ubuntu 24.04)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -542,6 +578,8 @@ jobs:
           rm -rf "$TMP"
 
   release:
+    needs: scope
+    if: needs.scope.outputs.mode == 'full'
     name: Release artifacts A and B
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -1330,6 +1368,8 @@ jobs:
           if-no-files-found: ignore
 
   deny:
+    needs: scope
+    if: needs.scope.outputs.mode == 'full'
     name: Dependency policy (advisories, licenses, sources)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1346,3 +1386,33 @@ jobs:
           command: check
           manifest-path: ./Cargo.toml
           log-level: warn
+
+  result:
+    name: CI result
+    if: always()
+    needs: [scope, rust, release, installer, systemd, functional, network, load, upgrade, boot, vm-boot, soak, deny]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify all jobs expected for this event and mode
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        shell: python
+        run: |
+          import json
+          import os
+          import sys
+
+          jobs = json.loads(os.environ["NEEDS"])
+          scope = jobs.pop("scope")
+          mode = scope["outputs"].get("mode")
+          if scope["result"] != "success" or mode not in {"docs", "full"}:
+              sys.exit("CI selection or documentation check did not succeed")
+          if os.environ["EVENT"] == "workflow_dispatch" and mode != "full":
+              sys.exit("Manual dispatch requires the full suite")
+          for job, status in jobs.items():
+              required = mode == "full" and (job != "soak" or os.environ["EVENT"] == "workflow_dispatch")
+              expected = "success" if required else "skipped"
+              if status["result"] != expected:
+                  sys.exit(f"{job}: expected {expected}, got {status['result']}")
