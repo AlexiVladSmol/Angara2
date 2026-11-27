@@ -1903,8 +1903,10 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
     let origin_address = listener.local_addr().expect("origin address");
     let slow_gets = Arc::new(AtomicUsize::new(0));
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let release = Arc::new(tokio::sync::Notify::new());
     let task_gets = Arc::clone(&slow_gets);
+    let task_held = Arc::clone(&held);
     let task_release = Arc::clone(&release);
     let task = tokio::spawn(async move {
         loop {
@@ -1912,6 +1914,7 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
                 return;
             };
             let gets = Arc::clone(&task_gets);
+            let held = Arc::clone(&task_held);
             let release = Arc::clone(&task_release);
             tokio::spawn(async move {
                 while let Some(head) = read_head(&mut stream).await {
@@ -1929,10 +1932,13 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
                         if stream.write_all(&vec![b'x'; 512]).await.is_err() {
                             return;
                         }
-                        // Keep the fill active until the test has flooded the
-                        // idle URIs.  A plain sleep makes the test depend on
-                        // how fast 8300 POSTs happen to be.
-                        release.notified().await;
+                        // Only the first slow GET is held open. A second GET
+                        // can only happen when the fill was canceled; it must
+                        // complete so the assertion reports slow_gets=2 rather
+                        // than a client timeout.
+                        if !held.swap(true, Ordering::SeqCst) {
+                            release.notified().await;
+                        }
                         if stream.write_all(&vec![b'x'; 4096 - 512]).await.is_err() {
                             return;
                         }
@@ -1948,13 +1954,31 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
         }
     });
 
-    let (server, proxy) = start(&cache_config(DEFAULT_CACHE, "")).await;
+    let text = cache_config(DEFAULT_CACHE, "")
+        .replace("idle_timeout_ms = 5000", "idle_timeout_ms = 60000");
+    let (server, proxy) = start(&text).await;
     let uri = format!("http://{origin_address}/slow");
     let host = origin_address.to_string();
-    let slow_uri = uri.clone();
-    let slow_host = host.clone();
-    let slow = tokio::spawn(async move { get(proxy, &slow_uri, &slow_host, &[]).await });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client_release = Arc::new(tokio::sync::Notify::new());
+    let task_client_release = Arc::clone(&client_release);
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    let slow = tokio::spawn(async move {
+        let mut client = RawClient::connect(proxy).await.expect("slow client");
+        client
+            .send(m03::request("GET", origin_address, "/slow", &[], b"").as_slice())
+            .await
+            .expect("send slow GET");
+        let head = client.read_head().await.expect("slow head");
+        let length = head
+            .header("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("slow content-length");
+        let _ = head_tx.send(());
+        task_client_release.notified().await;
+        let body = client.read_exact_bytes(length).await.expect("slow body");
+        (head.status, body)
+    });
+    head_rx.await.expect("slow headers");
 
     let mut posts = RawClient::connect(proxy).await.expect("post client");
     for index in 0..8_300 {
@@ -1976,8 +2000,13 @@ async fn m10_cache48_many_idle_invalidations_do_not_cancel_slow_fill() {
         "slow fill finished before the idle POST flood; the test cannot prove the registry overflow"
     );
     release.notify_one();
-    let slow_response = slow.await.expect("slow request");
-    assert_eq!(slow_response.body.len(), 4096);
+    client_release.notify_one();
+    let (slow_status, slow_body) = tokio::time::timeout(Duration::from_secs(60), slow)
+        .await
+        .expect("slow request exceeded the 60 s test deadline")
+        .expect("slow request");
+    assert_eq!(slow_status, 200);
+    assert_eq!(slow_body.len(), 4096);
     let again = get(proxy, &uri, &host, &[]).await;
     assert_eq!(again.body.len(), 4096);
     assert_eq!(
