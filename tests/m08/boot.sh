@@ -223,9 +223,10 @@ for attempt in $(seq 1 "$DEBOOTSTRAP_ATTEMPTS"); do
     DEBOOTSTRAP_ATTEMPT=$attempt
     unmount_root_paths
     rm -rf --one-file-system "$ROOT" 2>/dev/null || true
-    # debootstrap creates the target with the caller's umask.  The script
-    # runs with umask 077, so create the target explicitly with the mode that
-    # system services need, and keep the package cache outside the rootfs.
+    # A previous version created $ROOT with mkdir -p under umask 077, which
+    # left it at 0700 and system services could not start.  debootstrap itself
+    # creates the target with 0755; create it explicitly to keep the mode
+    # deterministic and keep the package cache outside the rootfs.
     install -d -m 0755 "$ROOT"
     DEBOOTSTRAP_LAST_LOG="$TMP/debootstrap-${attempt}.log"
     set +e
