@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::auth::{BlockState, format_blocked_until};
 use crate::config::{Config, ConfigError};
 use crate::http::forward::Proxy;
 use crate::http::server::ShutdownHandle;
@@ -16,7 +18,7 @@ use crate::snapshot::{MAX_LIVE_GENERATIONS, PublishError, SnapshotStore};
 use crate::telemetry::{MetricsSnapshot, Telemetry};
 
 /// Service lifecycle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     /// Normal operation and reload allowed.
@@ -60,7 +62,7 @@ pub enum ShutdownReason {
 }
 
 /// Safe typed control outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReloadOutcome {
     /// Candidate was published with a new generation.
     Applied {
@@ -106,34 +108,40 @@ pub enum ReloadOutcome {
 }
 
 /// Bounded listener projection.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListenerStatus {
     /// Configured listener ID.
     pub id: String,
     /// Configured local bind address.
     pub bind: String,
     /// `http` or `https`.
-    pub transport: &'static str,
+    pub transport: String,
+    /// `basic` or `none`.
+    pub auth: String,
 }
 
 /// Bounded egress projection. Only configured local bind data is exposed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EgressStatus {
     /// Configured egress ID.
     pub id: String,
     /// `system` or `bind_ip`.
-    pub mode: &'static str,
+    pub mode: String,
     /// Configured local source IP for `bind_ip`.
     pub bind_ip: Option<String>,
 }
 
 /// Owned safe status projection.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     /// Current lifecycle.
     pub lifecycle: Lifecycle,
     /// Published generation.
     pub generation: u64,
+    /// SHA-256 of the configuration bytes represented by the active root.
+    pub config_version: String,
+    /// SHA-256 of the users file represented by the active root.
+    pub users_version: Option<String>,
     /// Actually retained published roots.
     pub live_generations: usize,
     /// Service uptime in milliseconds.
@@ -168,6 +176,45 @@ pub struct StatusSnapshot {
     pub reload_busy: bool,
     /// Last safe reload/validation outcome.
     pub last_reload: Option<ReloadOutcome>,
+}
+
+/// Read-only account projection. Never contains a password hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserStatus {
+    /// Login.
+    pub username: String,
+    /// `active`, `permanent` or `temporary`.
+    pub block: String,
+    /// Absolute UTC end for a temporary block.
+    pub blocked_until: Option<String>,
+    /// Whole seconds remaining for a temporary block.
+    pub remaining_seconds: Option<u64>,
+}
+
+/// Read-only active block projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockStatus {
+    /// Login.
+    pub username: String,
+    /// `permanent` or `temporary`.
+    pub kind: String,
+    /// Absolute UTC end for a temporary block.
+    pub blocked_until: Option<String>,
+    /// Whole seconds remaining for a temporary block.
+    pub remaining_seconds: Option<u64>,
+}
+
+/// Bounded access summary without per-rule host data.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessSummary {
+    /// Configured source CIDRs.
+    pub source_allow: Vec<String>,
+    /// Number of ordered request rules.
+    pub rule_count: usize,
+    /// Number of ordered destination-IP rules.
+    pub ip_rule_count: usize,
+    /// `public_only` or `deny`.
+    pub ip_default: String,
 }
 
 /// In-process typed control handle.
@@ -227,7 +274,13 @@ impl ControlState {
                 transport: match listener.transport() {
                     crate::config::Transport::Http => "http",
                     crate::config::Transport::Https => "https",
-                },
+                }
+                .to_owned(),
+                auth: match listener.auth() {
+                    crate::auth::AuthMode::None => "none",
+                    crate::auth::AuthMode::Basic => "basic",
+                }
+                .to_owned(),
             })
             .collect();
         let egress = config
@@ -238,7 +291,8 @@ impl ControlState {
                 mode: match profile.mode() {
                     crate::config::EgressMode::System => "system",
                     crate::config::EgressMode::BindIp(_) => "bind_ip",
-                },
+                }
+                .to_owned(),
                 bind_ip: match profile.mode() {
                     crate::config::EgressMode::System => None,
                     crate::config::EgressMode::BindIp(ip) => Some(ip.to_string()),
@@ -249,6 +303,8 @@ impl ControlState {
         StatusSnapshot {
             lifecycle: self.lifecycle(),
             generation: root.generation(),
+            config_version: config.version().to_owned(),
+            users_version: config.users_version().map(str::to_owned),
             live_generations: self.snapshots.live_generations(),
             uptime_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             worker_threads: config.runtime().worker_threads().resolve(),
@@ -284,6 +340,244 @@ impl ControlState {
                 || self.preparation.available_permits() == 0,
         );
         snapshot
+    }
+
+    /// Configuration path used by this server, when started from a file.
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Resolved users-file path from the active root.
+    pub fn users_path(&self) -> Option<PathBuf> {
+        self.snapshots
+            .load()
+            .config()
+            .auth()
+            .map(|auth| auth.users_file().to_path_buf())
+    }
+
+    /// Number of configured accounts in the active root.
+    pub fn user_count(&self) -> usize {
+        self.snapshots
+            .load()
+            .config()
+            .auth()
+            .map(|auth| auth.snapshot().user_count())
+            .unwrap_or(0)
+    }
+
+    /// Number of blocks active at `now` in the active root.
+    pub fn block_count(&self, now: DateTime<Utc>) -> usize {
+        self.snapshots
+            .load()
+            .config()
+            .auth()
+            .map(|auth| auth.snapshot().block_count(now))
+            .unwrap_or(0)
+    }
+
+    /// Filtered users page with explicit block state at `now`.
+    pub fn users(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> (Vec<UserStatus>, usize) {
+        let root = self.snapshots.load();
+        let config = root.config();
+        let Some(auth) = config.auth() else {
+            return (Vec::new(), 0);
+        };
+        let needle = query.to_lowercase();
+        let mut users = auth
+            .snapshot()
+            .records()
+            .filter(|record| needle.is_empty() || record.username.to_lowercase().contains(&needle))
+            .map(|record| {
+                let (block, blocked_until, remaining_seconds) = match &record.block {
+                    BlockState::Active => ("active".to_owned(), None, None),
+                    BlockState::Permanent => ("permanent".to_owned(), None, None),
+                    BlockState::Until(until) if now < *until => (
+                        "temporary".to_owned(),
+                        Some(format_blocked_until(until.to_owned())),
+                        Some(until.signed_duration_since(now).num_seconds().max(0) as u64),
+                    ),
+                    BlockState::Until(_) => ("active".to_owned(), None, None),
+                };
+                UserStatus {
+                    username: record.username.clone(),
+                    block,
+                    blocked_until,
+                    remaining_seconds,
+                }
+            })
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| left.username.cmp(&right.username));
+        let total = users.len();
+        let page = users.into_iter().skip(offset).take(limit).collect();
+        (page, total)
+    }
+
+    /// Active blocks page. Expired temporary blocks are omitted without a
+    /// filesystem write.
+    pub fn blocks(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> (Vec<BlockStatus>, usize) {
+        let root = self.snapshots.load();
+        let config = root.config();
+        let Some(auth) = config.auth() else {
+            return (Vec::new(), 0);
+        };
+        let needle = query.to_lowercase();
+        let mut blocks = auth
+            .snapshot()
+            .records()
+            .filter(|record| needle.is_empty() || record.username.to_lowercase().contains(&needle))
+            .filter_map(|record| match &record.block {
+                BlockState::Permanent => Some(BlockStatus {
+                    username: record.username.clone(),
+                    kind: "permanent".to_owned(),
+                    blocked_until: None,
+                    remaining_seconds: None,
+                }),
+                BlockState::Until(until) if now < *until => Some(BlockStatus {
+                    username: record.username.clone(),
+                    kind: "temporary".to_owned(),
+                    blocked_until: Some(format_blocked_until(until.to_owned())),
+                    remaining_seconds: Some(
+                        until.signed_duration_since(now).num_seconds().max(0) as u64
+                    ),
+                }),
+                BlockState::Active | BlockState::Until(_) => None,
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by(|left, right| left.username.cmp(&right.username));
+        let total = blocks.len();
+        let page = blocks.into_iter().skip(offset).take(limit).collect();
+        (page, total)
+    }
+
+    /// Safe access summary from the active policy.
+    pub fn access_summary(&self) -> AccessSummary {
+        let root = self.snapshots.load();
+        let access = root.config().access();
+        AccessSummary {
+            source_allow: access
+                .source_allow()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            rule_count: access.rules().len(),
+            ip_rule_count: access.ip_rules().len(),
+            ip_default: match access.ip_default() {
+                crate::config::IpDefault::PublicOnly => "public_only",
+                crate::config::IpDefault::Deny => "deny",
+            }
+            .to_owned(),
+        }
+    }
+
+    /// One safe access page for the TUI and independent clients.
+    pub fn access_page(
+        &self,
+        section: crate::control_protocol::AccessSection,
+        offset: usize,
+        limit: usize,
+    ) -> crate::control_protocol::AccessPage {
+        use crate::config::{HostSelectors, RuleAction};
+        use crate::control_protocol::{AccessPage, AccessRuleView, AccessSection, IpRuleView};
+        let root = self.snapshots.load();
+        let access = root.config().access();
+        let action = |action: RuleAction| match action {
+            RuleAction::Allow => "allow".to_owned(),
+            RuleAction::Deny => "deny".to_owned(),
+        };
+        let source_allow = access
+            .source_allow()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let ip_default = match access.ip_default() {
+            crate::config::IpDefault::PublicOnly => "public_only",
+            crate::config::IpDefault::Deny => "deny",
+        }
+        .to_owned();
+        let mut page = AccessPage {
+            section,
+            source_allow,
+            rules: Vec::new(),
+            ip_rules: Vec::new(),
+            ip_default,
+            offset,
+            total: 0,
+        };
+        match section {
+            AccessSection::Summary => {
+                page.total = access.rules().len() + access.ip_rules().len();
+            }
+            AccessSection::Source => {
+                let all = std::mem::take(&mut page.source_allow);
+                page.total = all.len();
+                page.source_allow = all.into_iter().skip(offset).take(limit).collect();
+            }
+            AccessSection::Rules => {
+                page.total = access.rules().len();
+                page.rules = access
+                    .rules()
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|rule| {
+                        let selectors = rule.selectors();
+                        let (host_exact, host_suffix) = match selectors.hosts() {
+                            HostSelectors::Any => (None, None),
+                            HostSelectors::Exact(hosts) => {
+                                (Some(hosts.iter().map(ToString::to_string).collect()), None)
+                            }
+                            HostSelectors::Suffix(hosts) => {
+                                (None, Some(hosts.iter().map(ToString::to_string).collect()))
+                            }
+                        };
+                        AccessRuleView {
+                            id: rule.id().to_owned(),
+                            action: action(rule.action()),
+                            listeners: selectors.listeners().map(|values| values.to_vec()),
+                            sources: selectors
+                                .sources()
+                                .map(|values| values.iter().map(ToString::to_string).collect()),
+                            methods: selectors
+                                .methods()
+                                .map(|values| values.iter().map(ToString::to_string).collect()),
+                            ports: selectors.ports().map(|values| values.to_vec()),
+                            users: selectors.users().map(|values| values.to_vec()),
+                            host_exact,
+                            host_suffix,
+                        }
+                    })
+                    .collect();
+            }
+            AccessSection::IpRules => {
+                page.total = access.ip_rules().len();
+                page.ip_rules = access
+                    .ip_rules()
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|rule| IpRuleView {
+                        id: rule.id().to_owned(),
+                        action: action(rule.action()),
+                        networks: rule.networks().iter().map(ToString::to_string).collect(),
+                        allow_special: rule.allow_special(),
+                    })
+                    .collect();
+            }
+        }
+        page
     }
 
     /// Test seam: hold the single preparation slot for a controlled duration.

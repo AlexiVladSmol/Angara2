@@ -1,0 +1,59 @@
+# Managed by Angara package. Use drop-ins for local changes.
+[Unit]
+Description=Angara privileged local control writer
+Documentation=file:///opt/angara/current/docs/ADMIN_GUIDE.md
+After=angara.service
+Requires=angara.service
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/etc/angara
+ExecStart=/opt/angara/current/bin/angara control-write \
+    --config /etc/angara/angara.toml \
+    --socket /run/angara/control.sock \
+    --read-socket /run/angara/control-read.sock \
+    --admin-group angara-admin \
+    --socket-group angara
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/etc/angara /run/angara
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+LimitNOFILE=1024
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=angara-control
+
+[Install]
+WantedBy=multi-user.target

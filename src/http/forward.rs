@@ -325,6 +325,7 @@ pub struct Proxy {
     auth: Option<AuthService>,
     telemetry: Arc<Telemetry>,
     client_caps: Arc<CapController>,
+    connections: Arc<crate::connections::ConnectionRegistry>,
     logger: Mutex<Logger>,
     next_id: AtomicU64,
 }
@@ -387,6 +388,7 @@ impl Proxy {
             auth,
             telemetry,
             client_caps,
+            connections: Arc::new(crate::connections::ConnectionRegistry::new()),
             logger,
             next_id: AtomicU64::new(1),
         })
@@ -439,6 +441,11 @@ impl Proxy {
     /// Shared telemetry counters.
     pub fn telemetry(&self) -> Arc<Telemetry> {
         Arc::clone(&self.telemetry)
+    }
+
+    /// Bounded live-connection projection used by the local control API.
+    pub fn connections(&self) -> Arc<crate::connections::ConnectionRegistry> {
+        Arc::clone(&self.connections)
     }
 
     /// Shared snapshot store used by the control service and accept loops.

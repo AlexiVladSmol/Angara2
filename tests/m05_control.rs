@@ -585,7 +585,7 @@ async fn m05_ops01_snapshot_is_immutable_until_restart() {
     );
     disabled.shutdown().await;
 
-    m05::write_secure(&users, "version = 2\nusers = []\n");
+    m05::write_secure(&users, "version = 3\nusers = []\n");
     assert!(
         Config::load(&config_path).is_err(),
         "an invalid users file must reject the next startup"

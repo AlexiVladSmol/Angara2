@@ -25,7 +25,9 @@ NO_SYSTEMD=0
 NO_OWNER=0
 CHECK_SERVICE_USER=0
 SERVICE=angara.service
+CONTROL_SERVICE=angara-control.service
 SERVICE_USER=angara
+ADMIN_GROUP=angara-admin
 WORKDIR=
 STAGING_RELEASE=
 STAGED_SOURCE=
@@ -338,6 +340,45 @@ ensure_service_user() {
     fi
 }
 
+ensure_admin_group() {
+    [ "$CANDIDATE_ONLY" -eq 0 ] || return 0
+    [ -z "$DESTDIR" ] || return 0
+    [ "$NO_OWNER" -eq 0 ] || return 0
+    if ! getent group "$ADMIN_GROUP" >/dev/null 2>&1; then
+        groupadd --system "$ADMIN_GROUP"
+    else
+        local gid
+        gid=$(getent group "$ADMIN_GROUP" | cut -d: -f3)
+        [ "$gid" -ne 0 ] || die "group $ADMIN_GROUP must not be GID 0"
+    fi
+}
+
+install_managed_unit() {
+    local source_name=$1 unit_name=$2 target
+    target=$(path "$UNIT_DIR/$unit_name")
+    if [ -e "$target" ]; then
+        [ -f "$target" ] && [ ! -L "$target" ] \
+            || die "existing unit is not a regular managed file: $target"
+        grep -q '^# Managed by Angara package' "$target" \
+            || die "existing unit is foreign and will not be overwritten: $target"
+    fi
+    mkdir -p "$(dirname "$target")"
+    rm -f "$target.new"
+    install -m 0644 "$RELEASE_DIR/systemd/$source_name" "$target.new"
+    if [ -e "$target" ] && cmp -s "$target" "$target.new"; then
+        rm -f "$target.new"
+    else
+        if [ -e "$target" ]; then
+            install -m 0644 "$target" "$(path "$PREFIX/state/$unit_name.previous")"
+        fi
+        mv -f "$target.new" "$target"
+        UNIT_CHANGED=1
+    fi
+    if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+        chown root:root "$target"
+    fi
+}
+
 validate_managed_template() {
     local value=$1 part
     case "$value" in
@@ -396,6 +437,7 @@ for managed in \
     "$(path "$SYSCONFDIR/angara.toml")" \
     "$(path "$UNIT_DIR")" \
     "$(path "$UNIT_DIR/$SERVICE")" \
+    "$(path "$UNIT_DIR/$CONTROL_SERVICE")" \
     "$(path "$BINDIR")" \
     "$(path "$SBINDIR")" \
     "$(path "$SBINDIR/angaractl")" \
@@ -429,6 +471,13 @@ preflight_managed_conflicts() {
             || die "existing unit is not a regular managed file: $unit_target"
         grep -q '^# Managed by Angara package' "$unit_target" \
             || die "existing unit is foreign and will not be overwritten: $unit_target"
+    fi
+    control_unit_target=$(path "$UNIT_DIR/$CONTROL_SERVICE")
+    if [ -e "$control_unit_target" ]; then
+        [ -f "$control_unit_target" ] && [ ! -L "$control_unit_target" ] \
+            || die "existing control unit is not a regular managed file: $control_unit_target"
+        grep -q '^# Managed by Angara package' "$control_unit_target" \
+            || die "existing control unit is foreign and will not be overwritten: $control_unit_target"
     fi
     helper_target=$(path "$SBINDIR/angaractl")
     if [ -e "$helper_target" ]; then
@@ -480,6 +529,7 @@ preflight_managed_conflicts() {
 preflight_managed_conflicts
 
 ensure_service_user
+ensure_admin_group
 ensure_dir "$(path "$PREFIX")" 0755 root root
 ensure_dir "$(path "$PREFIX/releases")" 0755 root root
 if [ "$CANDIDATE_ONLY" -eq 0 ]; then
@@ -488,6 +538,9 @@ if [ "$CANDIDATE_ONLY" -eq 0 ]; then
     ensure_dir "$(path "$SYSCONFDIR/tls")" 0750 root "$SERVICE_USER"
     ensure_dir "$(path "$VARLIB")" 0700 root root
     ensure_dir "$(path "$VARLIB/backups")" 0700 root root
+    if [ -z "$DESTDIR" ] && [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+        install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" /run/angara
+    fi
 fi
 
 RELEASE_LINK="$PREFIX/releases/$CANDIDATE"
@@ -532,28 +585,8 @@ fi
 UNIT_CHANGED=0
 CONFIG_PRESERVED=0
 if [ "$CANDIDATE_ONLY" -eq 0 ]; then
-    UNIT_TARGET=$(path "$UNIT_DIR/$SERVICE")
-    if [ -e "$UNIT_TARGET" ]; then
-        [ -f "$UNIT_TARGET" ] && [ ! -L "$UNIT_TARGET" ] \
-            || die "existing unit is not a regular managed file: $UNIT_TARGET"
-        grep -q '^# Managed by Angara package' "$UNIT_TARGET" \
-            || die "existing unit is foreign and will not be overwritten: $UNIT_TARGET"
-    fi
-    mkdir -p "$(dirname "$UNIT_TARGET")"
-    rm -f "$UNIT_TARGET.new"
-    install -m 0644 "$RELEASE_DIR/systemd/angara.service" "$UNIT_TARGET.new"
-    if [ -e "$UNIT_TARGET" ] && cmp -s "$UNIT_TARGET" "$UNIT_TARGET.new"; then
-        rm -f "$UNIT_TARGET.new"
-    else
-        if [ -e "$UNIT_TARGET" ]; then
-            install -m 0644 "$UNIT_TARGET" "$(path "$PREFIX/state/angara.service.previous")"
-        fi
-        mv -f "$UNIT_TARGET.new" "$UNIT_TARGET"
-        UNIT_CHANGED=1
-    fi
-    if [ "$NO_OWNER" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
-        chown root:root "$UNIT_TARGET"
-    fi
+    install_managed_unit "$SERVICE" "$SERVICE"
+    install_managed_unit "$CONTROL_SERVICE" "$CONTROL_SERVICE"
 
     CONFIG_TARGET=$(path "$SYSCONFDIR/angara.toml")
     if [ -e "$CONFIG_TARGET" ]; then
@@ -650,6 +683,7 @@ printf 'candidate_only=%s\n' "$CANDIDATE_ONLY"
 if [ -n "$DESTDIR" ]; then
     printf 'staged_under=%s\n' "$DESTDIR"
 else
-    printf 'next: systemctl enable %s\n' "$SERVICE"
-    printf 'next: systemctl start %s\n' "$SERVICE"
+    printf 'next: systemctl enable %s %s\n' "$SERVICE" "$CONTROL_SERVICE"
+    printf 'next: systemctl start %s %s\n' "$SERVICE" "$CONTROL_SERVICE"
+    printf 'next: add administrators to group %s (read socket group %s)\n' "$ADMIN_GROUP" "$SERVICE_USER"
 fi

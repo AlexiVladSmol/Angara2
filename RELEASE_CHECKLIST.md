@@ -97,3 +97,16 @@ Do not pre-fill results.
 - [ ] PR has `Closes #23`, head SHA, archive SHA-256, CI links and owner check.
 - [ ] Merge, license choice, first deployment and public v0.1 release remain
       owner decisions.
+
+## M11 control plane (post-v0.1)
+
+- [ ] `angara tui` opens two sessions; closing one does not affect the proxy.
+- [ ] `angara-control.service` runs as root; the proxy unit has no write path to `/etc/angara`.
+- [ ] `angara` group can read the public socket; only `angara-admin` can add users, change passwords, block or edit ACL.
+- [ ] Ordinary UID is denied on the server side, not only by socket mode.
+- [ ] Password, PHC, Authorization, private keys and full URLs absent from responses, events, journal, previews and test dumps.
+- [ ] Temporary block expires without TOML write, survives a restart after expiry, and existing CONNECT tunnels follow the documented policy.
+- [ ] Stale file version is rejected; comments, rule order and unrelated sections survive ACL edits.
+- [ ] `restart_required`, invalid candidate and lost-response states are visible and do not claim application.
+- [ ] Limits for clients, subscribers, request line, page, event ring and expensive operations are exercised.
+- [ ] Wide and narrow TUI screenshots on synthetic data are attached to the PR with the tested SHA.

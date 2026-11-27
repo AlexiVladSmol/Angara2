@@ -220,7 +220,7 @@ users = ["alice"]
     write_secure(&config_path, &text);
 
     let cases = [
-        ("version = 2\nusers = []\n".to_owned(), "version"),
+        ("version = 3\nusers = []\n".to_owned(), "version"),
         (
             users_text(&[
                 ("alice", &hash("one"), false),
@@ -1210,7 +1210,7 @@ fn users_snapshot_rejects_too_many_entries_and_bad_toml() {
     )
     .replace("auth = \"basic\"", "auth = \"none\"");
     write_secure(&config_path, &none_config);
-    write_secure(&dir.path().join("users.toml"), "version = 2\nusers = []\n");
+    write_secure(&dir.path().join("users.toml"), "version = 3\nusers = []\n");
     let error = Config::load(&config_path)
         .expect_err("declared auth must reject even with no Basic listener")
         .to_string();

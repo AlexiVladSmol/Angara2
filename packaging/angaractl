@@ -10,6 +10,7 @@ BINDIR=/usr/local/bin
 SBINDIR=/usr/local/sbin
 VARLIB=/var/lib/angara
 SERVICE=angara.service
+CONTROL_SERVICE=angara-control.service
 SERVICE_USER=angara
 
 ARCHIVE=
@@ -213,7 +214,6 @@ backup_config() {
 }
 
 check_release_metadata_conflicts() {
-    local unit_target="$UNIT_DIR/$SERVICE"
     local helper_target="$SBINDIR/angaractl"
     local current="$PREFIX/current"
     local previous="$PREFIX/previous"
@@ -224,12 +224,16 @@ check_release_metadata_conflicts() {
         || die "helper directory is missing or is a symlink: $SBINDIR"
     [ -d "$BINDIR" ] && [ ! -L "$BINDIR" ] \
         || die "CLI directory is missing or is a symlink: $BINDIR"
-    if [ -e "$unit_target" ]; then
-        [ -f "$unit_target" ] && [ ! -L "$unit_target" ] \
-            || die "existing unit is not a regular file: $unit_target"
-        grep -q '^# Managed by Angara package' "$unit_target" \
-            || die "existing unit is foreign and will not be overwritten: $unit_target"
-    fi
+    local unit_target unit_name
+    for unit_name in "$SERVICE" "$CONTROL_SERVICE"; do
+        unit_target="$UNIT_DIR/$unit_name"
+        if [ -e "$unit_target" ]; then
+            [ -f "$unit_target" ] && [ ! -L "$unit_target" ] \
+                || die "existing unit is not a regular file: $unit_target"
+            grep -q '^# Managed by Angara package' "$unit_target" \
+                || die "existing unit is foreign and will not be overwritten: $unit_target"
+        fi
+    done
     if [ -e "$helper_target" ]; then
         [ -f "$helper_target" ] && [ ! -L "$helper_target" ] \
             || die "existing helper is not a regular file: $helper_target"
@@ -270,27 +274,35 @@ install_release_metadata() {
         printf 'error: cannot create unit directory: %s\n' "$UNIT_DIR" >&2
         return 1
     }
-    rm -f "$UNIT_DIR/$SERVICE.new" || return 1
-    install -m 0644 "$release/systemd/angara.service" \
-        "$UNIT_DIR/$SERVICE.new" || {
-        printf 'error: cannot stage unit from %s\n' "$release" >&2
-        return 1
-    }
-    if [ -e "$UNIT_DIR/$SERVICE" ] \
-        && cmp -s "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$SERVICE.new"; then
-        rm -f "$UNIT_DIR/$SERVICE.new" || return 1
-        UNIT_METADATA_CHANGED=0
-    else
-        mv -f "$UNIT_DIR/$SERVICE.new" "$UNIT_DIR/$SERVICE" || {
-            printf 'error: cannot install unit %s\n' "$UNIT_DIR/$SERVICE" >&2
+    UNIT_METADATA_CHANGED=0
+    local unit_name
+    for unit_name in "$SERVICE" "$CONTROL_SERVICE"; do
+        if [ ! -f "$release/systemd/$unit_name" ]; then
+            [ "$unit_name" = "$CONTROL_SERVICE" ] && continue
+            printf 'error: release has no unit %s\n' "$unit_name" >&2
+            return 1
+        fi
+        rm -f "$UNIT_DIR/$unit_name.new" || return 1
+        install -m 0644 "$release/systemd/$unit_name" \
+            "$UNIT_DIR/$unit_name.new" || {
+            printf 'error: cannot stage unit %s from %s\n' "$unit_name" "$release" >&2
             return 1
         }
-        UNIT_METADATA_CHANGED=1
-    fi
-    chown root:root "$UNIT_DIR/$SERVICE" || {
-        printf 'error: cannot chown unit %s\n' "$UNIT_DIR/$SERVICE" >&2
-        return 1
-    }
+        if [ -e "$UNIT_DIR/$unit_name" ] \
+            && cmp -s "$UNIT_DIR/$unit_name" "$UNIT_DIR/$unit_name.new"; then
+            rm -f "$UNIT_DIR/$unit_name.new" || return 1
+        else
+            mv -f "$UNIT_DIR/$unit_name.new" "$UNIT_DIR/$unit_name" || {
+                printf 'error: cannot install unit %s\n' "$UNIT_DIR/$unit_name" >&2
+                return 1
+            }
+            UNIT_METADATA_CHANGED=1
+        fi
+        chown root:root "$UNIT_DIR/$unit_name" || {
+            printf 'error: cannot chown unit %s\n' "$UNIT_DIR/$unit_name" >&2
+            return 1
+        }
+    done
     install -d -m 0755 "$SBINDIR" || {
         printf 'error: cannot create helper directory: %s\n' "$SBINDIR" >&2
         return 1
@@ -336,15 +348,17 @@ set_previous() {
 }
 
 service_active() {
-    systemctl is-active --quiet "$SERVICE"
+    systemctl is-active --quiet "$SERVICE" \
+        || systemctl is-active --quiet "$CONTROL_SERVICE"
 }
 
 stop_service() {
     if service_active; then
-        systemctl stop "$SERVICE" || die "systemctl stop $SERVICE failed"
+        systemctl stop "$CONTROL_SERVICE" "$SERVICE" \
+            || die "systemctl stop $SERVICE $CONTROL_SERVICE failed"
     fi
     if service_active; then
-        die "$SERVICE is still active after stop"
+        die "$SERVICE or $CONTROL_SERVICE is still active after stop"
     fi
 }
 
@@ -587,8 +601,8 @@ start_service() {
     # An explicit maintenance command may recover a unit that previously hit
     # its automatic start limit.  The unit's Restart=on-failure policy is still
     # enforced for unexpected crashes.
-    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
-    systemctl start "$SERVICE" || return 1
+    systemctl reset-failed "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$SERVICE" "$CONTROL_SERVICE" || return 1
     if ! probe_service "$expected"; then
         journal_tail
         return 1
@@ -782,10 +796,12 @@ command_recover() {
         systemctl daemon-reload || die "systemctl daemon-reload failed"
     fi
     if service_active; then
-        systemctl restart "$SERVICE" || die "systemctl restart $SERVICE failed"
+        systemctl restart "$SERVICE" "$CONTROL_SERVICE" \
+            || die "systemctl restart $SERVICE $CONTROL_SERVICE failed"
     else
-        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
-        systemctl start "$SERVICE" || die "systemctl start $SERVICE failed"
+        systemctl reset-failed "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+        systemctl start "$SERVICE" "$CONTROL_SERVICE" \
+            || die "systemctl start $SERVICE $CONTROL_SERVICE failed"
     fi
     probe_service "$current" || die "recovered service did not become ready"
     printf 'active=%s\n' "$(basename "$current")"
@@ -795,6 +811,9 @@ command_status() {
     printf 'service=%s\n' "$SERVICE"
     printf 'active_state=%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
     printf 'unit_state=%s\n' "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+    printf 'control_service=%s\n' "$CONTROL_SERVICE"
+    printf 'control_active_state=%s\n' "$(systemctl is-active "$CONTROL_SERVICE" 2>/dev/null || true)"
+    printf 'control_unit_state=%s\n' "$(systemctl is-enabled "$CONTROL_SERVICE" 2>/dev/null || true)"
     local pid
     pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
     printf 'main_pid=%s\n' "${pid:-0}"
@@ -811,6 +830,7 @@ command_status() {
     printf 'release_count=%s\n' "$(find "$PREFIX/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
     printf 'config_sha256=%s\n' "$(sha256sum "$SYSCONFDIR/angara.toml" 2>/dev/null | awk '{print $1}')"
     printf 'unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$SERVICE" 2>/dev/null | awk '{print $1}')"
+    printf 'control_unit_sha256=%s\n' "$(sha256sum "$UNIT_DIR/$CONTROL_SERVICE" 2>/dev/null | awk '{print $1}')"
     printf 'limits:\n'
     systemctl show -p LimitNOFILE -p TasksMax -p KillMode -p TimeoutStopUSec -p Restart "$SERVICE" 2>/dev/null || true
     printf 'listeners:\n'
@@ -825,13 +845,13 @@ command_uninstall() {
     if service_active; then
         stop_service
     fi
-    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/$SERVICE"
+    systemctl disable "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$CONTROL_SERVICE"
     rm -f "$BINDIR/angara" "$SBINDIR/angaractl"
     rm -f "$PREFIX/current" "$PREFIX/previous"
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
-        systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SERVICE" "$CONTROL_SERVICE" >/dev/null 2>&1 || true
     fi
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$PREFIX" "$SYSCONFDIR" "$VARLIB"

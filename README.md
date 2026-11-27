@@ -74,7 +74,9 @@ cargo deny check
 | --- | --- |
 | `angara --version` | Печатает `angara 0.1.0`, код 0 |
 | `angara check --config <path>` | Читает, разбирает и проверяет TOML; код 0 при успехе, без сети |
-| `angara serve --config <path>` | Проверяет config, связывает все listeners, затем обслуживает HTTP/1.1 forward proxy; код 0 при штатной остановке по SIGINT/SIGTERM, 3 при ошибке bind/запуска |
+| `angara serve --config <path>` | Проверяет config, связывает все listeners, затем обслуживает HTTP/1.1 forward proxy; код 0 при штатной остановке по SIGINT/SIGTERM, 3 при ошибке bind/запуска. `--control-read-socket <path>` включает приватный read API |
+| `angara control-write --config <path>` | Привилегированный writer: публичный `/run/angara/control.sock`, проверка peer прав, атомарная запись users/ACL и reload |
+| `angara tui [--socket <path>]` | Терминальная панель Ratatui/Crossterm; по умолчанию `/run/angara/control.sock` |
 | `angara users hash` | Читает пароль и подтверждение из TTY без echo и печатает один Argon2id PHC в stdout; без TTY требует явный `--password-stdin` |
 | `angara users hash --password-stdin` | Читает одну ограниченную строку stdin, проверяет UTF-8/NFC и печатает один PHC; пароль не принимается через argv или env |
 | `angara --help` | Печатает справку, код 0 |
@@ -1084,3 +1086,14 @@ M08 слит через PR #25 (`b1e82ef`). В доработках M08 меня
 рабочее развёртывание и публичный выпуск v0.1 остаются решениями владельца.
 
 Лицензия — MIT ([`LICENSE`](LICENSE)). Совместимость с конфигурационным синтаксисом Squid не заявляется. Сроки и показатели производительности будут уточнены по параметрам первого сервера и результатам измерений.
+
+## M11: терминальное управление (в работе)
+
+M11 добавляет `angara tui`, локальный JSONL API v1 на Unix-сокете, отдельный
+привилегированный writer, пользователей и пароли, временные/бессрочные
+блокировки, ACL-формы, версии файлов и подтверждение применения. Прокси
+работает без TUI; writer — единственный компонент с правом записи в конфиг и
+users-файл. Подробности — [ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md#11-терминальное-управление-m11),
+контракт — [CONTROL_API.md](docs/CONTROL_API.md).
+Скриншоты: [широкий](docs/screenshots/m11-wide.png) и
+[узкий](docs/screenshots/m11-narrow.png).

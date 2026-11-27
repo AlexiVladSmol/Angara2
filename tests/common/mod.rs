@@ -10,6 +10,7 @@ pub mod m04;
 pub mod m05;
 pub mod m06;
 pub mod m09;
+pub mod m11;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -161,6 +161,7 @@ pub struct Config {
     operations: OperationsConfig,
     observability: ObservabilityConfig,
     prepared_tls: HashMap<String, Arc<PreparedTls>>,
+    version: String,
 }
 
 impl Config {
@@ -222,6 +223,8 @@ impl Config {
                 message: "restart-required field changed".to_owned(),
             });
         }
+        let mut config = config;
+        config.version = crate::version::content_version(input.as_bytes());
         Ok(config)
     }
 
@@ -236,7 +239,9 @@ impl Config {
             let path = (path != ".").then_some(path);
             ConfigError::from_toml(input, path, error.into_inner())
         })?;
-        validate(raw, base_dir)
+        let mut config = validate(raw, base_dir)?;
+        config.version = crate::version::content_version(input.as_bytes());
+        Ok(config)
     }
 
     /// Returns the first restart-required field that differs. Hot-only
@@ -325,6 +330,18 @@ impl Config {
     /// Stable instance suffix used in `Via`.
     pub fn instance_id(&self) -> &str {
         self.runtime.instance_id()
+    }
+
+    /// SHA-256 token of the exact configuration bytes represented by this
+    /// parsed snapshot.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// SHA-256 token of the users file represented by the authentication
+    /// snapshot, when `[auth]` is configured.
+    pub fn users_version(&self) -> Option<&str> {
+        self.auth.as_ref().map(|auth| auth.snapshot.version())
     }
 
     /// Resource limits shared by listeners.
@@ -1581,6 +1598,7 @@ fn validate_with(
         operations,
         observability,
         prepared_tls,
+        version: String::new(),
     })
 }
 
