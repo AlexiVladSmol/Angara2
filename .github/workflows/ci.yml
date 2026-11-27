@@ -1097,14 +1097,67 @@ jobs:
             exit 1
           fi
           echo "wget timeout path: code=$WGET_CODE elapsed=${WGET_ELAPSED}s mounts=none temp=empty"
-      - name: Boot pristine rootfs
+      - name: Boot pristine rootfs after debootstrap retry
         run: |
           set -euo pipefail
           ARCHIVE=$(ls artifacts/b/*.tar.gz)
           SHA=$(awk '{print $1}' artifacts/b/SHA256SUMS)
           printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c - >/dev/null
-          M08_ARCHIVE="$ARCHIVE" M08_SHA256="$SHA" \
-            sudo --preserve-env=M08_ARCHIVE,M08_SHA256 bash tests/m08/boot.sh
+          TEST_TMP=$(mktemp -d)
+          BIN="$TEST_TMP/bin"
+          STATE="$TEST_TMP/attempts"
+          LOG="$TEST_TMP/boot.log"
+          mkdir -p "$BIN"
+          REAL_DEBOOTSTRAP=$(command -v debootstrap)
+          cat >"$BIN/debootstrap" <<SH
+          #!/usr/bin/env bash
+          set -euo pipefail
+          state=\${FAKE_DEBOOTSTRAP_STATE:?}
+          count=\$(cat "\$state" 2>/dev/null || echo 0)
+          count=\$((count + 1))
+          echo "\$count" >"\$state"
+          if [ "\$count" -eq 1 ]; then
+            echo "synthetic first debootstrap attempt failure" >&2
+            exit 1
+          fi
+          exec "$REAL_DEBOOTSTRAP" "\$@"
+          SH
+          chmod +x "$BIN/debootstrap"
+          cleanup() {
+            sudo rm -rf "$TEST_TMP"
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          set +e
+          sudo env PATH="$BIN:$PATH" \
+            M08_ARCHIVE="$PWD/$ARCHIVE" M08_SHA256="$SHA" \
+            M08_DEBOOTSTRAP_ATTEMPTS=2 M08_DEBOOTSTRAP_RETRY_DELAY=0 \
+            FAKE_DEBOOTSTRAP_STATE="$STATE" \
+            bash tests/m08/boot.sh >"$LOG" 2>&1
+          CODE=$?
+          set -e
+          cat "$LOG"
+          if [ "$CODE" -ne 0 ]; then
+            echo "boot.sh failed in the real debootstrap retry path" >&2
+            exit 1
+          fi
+          grep -Fq 'debootstrap attempt 1/2 failed with exit code 1' "$LOG" || {
+            echo "missing first debootstrap retry log line" >&2
+            exit 1
+          }
+          grep -Fq 'rootfs directory mode: 755' "$LOG" || {
+            echo "missing 755 rootfs mode evidence" >&2
+            exit 1
+          }
+          grep -Fq 'boot checks passed' "$LOG" || {
+            echo "missing successful boot marker" >&2
+            exit 1
+          }
+          [ "$(sudo cat "$STATE")" = "2" ] || {
+            echo "unexpected debootstrap attempt count: $(sudo cat "$STATE")" >&2
+            exit 1
+          }
+          echo "real retry path: attempts=$(sudo cat "$STATE") code=$CODE rootfs_mode=755 boot=passed"
 
       - name: Verify debootstrap retries and final failure
         run: |
