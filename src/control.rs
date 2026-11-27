@@ -228,6 +228,7 @@ pub struct ControlState {
     lifecycle: Arc<AtomicU8>,
     publication: Mutex<()>,
     started: Instant,
+    instance_id: String,
     last_reload: Mutex<Option<ReloadOutcome>>,
     test_preparation_delay: Mutex<Option<Duration>>,
 }
@@ -242,6 +243,12 @@ impl ControlState {
         config_path: Option<PathBuf>,
         lifecycle: Arc<AtomicU8>,
     ) -> Arc<Self> {
+        let configured = snapshots.load().config().instance_id().to_owned();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let instance_id = format!("{configured}-{}-{nonce:x}", std::process::id());
         Arc::new(Self {
             snapshots,
             telemetry,
@@ -252,6 +259,7 @@ impl ControlState {
             lifecycle,
             publication: Mutex::new(()),
             started: Instant::now(),
+            instance_id,
             last_reload: Mutex::new(None),
             test_preparation_delay: Mutex::new(None),
         })
@@ -259,6 +267,12 @@ impl ControlState {
 
     fn lifecycle(&self) -> Lifecycle {
         Lifecycle::load(&self.lifecycle)
+    }
+
+    /// Process-specific control identity. It changes on every process start,
+    /// unlike the stable configuration `runtime.instance_id` used in `Via`.
+    pub fn control_instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Owned status without config/users/secret Arcs.

@@ -231,6 +231,12 @@ cargo clippy --locked --all-targets -- -D warnings
 комментариев/секций, `restart_required`, право записи и лимиты строки/страницы.
 `m11_tui` запускает бинарник в PTY, проверяет отрисовку, поиск, resize,
 альтернативный экран, восстановление терминала и состояние «нет связи».
+В job `systemd` после M08-проверок запускается
+`tests/m11/systemd_control.sh`: установленные `angara.service` и
+`angara-control.service`, режимы сокетов, чтение членом `angara`, отказ
+`nobody`, запись членом `angara-admin`, owner/group/mode users-файла,
+`kill -9` прокси с сохранением публичного сокета и новым `instance_id`,
+`systemctl restart` с `PartOf`, остановка и отсутствие пароля/PHC в журнале.
 
 | ID | Автоматическая часть | Ручная/стендовая часть |
 | --- | --- | --- |

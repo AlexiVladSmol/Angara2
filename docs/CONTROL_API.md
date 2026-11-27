@@ -55,7 +55,9 @@
 
 ### Snapshot
 
-`Snapshot` содержит `api_version`, `instance_id`, `generation`,
+`Snapshot` содержит `api_version`, `instance_id` (идентификатор процесса
+control-сервиса; меняется при каждом старте процесса, в отличие от стабильного
+`runtime.instance_id` в `Via`), `generation`,
 `config_version`, `users_version`, `config_path`, `users_path`, `status`,
 `access`, `routing`, `counters`, `user_count`, `block_count`,
 `connection_count`, `limits`, `event_cursor`, `writable`. Версии —

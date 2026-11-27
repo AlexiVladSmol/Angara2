@@ -110,3 +110,4 @@ Do not pre-fill results.
 - [ ] `restart_required`, invalid candidate and lost-response states are visible and do not claim application.
 - [ ] Limits for clients, subscribers, request line, page, event ring and expensive operations are exercised.
 - [ ] Wide and narrow TUI screenshots on synthetic data are attached to the PR with the tested SHA.
+- [ ] Before rollback to M10, temporary `blocked_until` entries are cleared (users file returns to `version = 1`) or the users file is restored from backup; M10 cannot start on users v2.

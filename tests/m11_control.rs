@@ -1068,3 +1068,52 @@ async fn m11_load01_many_independent_clients_do_not_block_the_proxy() {
     writer.shutdown().await;
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn m11_empty01_first_user_can_be_added_to_an_empty_users_file() {
+    let dir = common::TempDir::new("m11-empty-users");
+    let origin = m03::spawn_origin(|_, _| m03::response("200 OK", &[], b"ok"))
+        .await
+        .expect("origin");
+    let auth = m05::AuthConfig::default();
+    let config_path = auth.write(&dir);
+    let users_path = dir.path().join("users.toml");
+    m05::write_secure(&users_path, "version = 1\nusers = []\n");
+    let read_socket = dir.path().join("read.sock");
+    let socket = dir.path().join("control.sock");
+    let server = m11::start_proxy(&config_path, &read_socket).await;
+    let mut options = WriterOptions::new(config_path);
+    options.read_socket = read_socket;
+    options.socket_path = socket.clone();
+    options.admin_group = "definitely-missing-angara-admin".to_owned();
+    options.test_allow_uid = Some(m11::effective_uid());
+    let writer = ControlWriter::start(options).await.expect("writer");
+    let proxy = server.addresses()[0].1;
+
+    let config = m11::ok(&socket, "config", json!({})).await;
+    let version = config["disk_users_version"].as_str().unwrap().to_owned();
+    let added = m11::ok(
+        &socket,
+        "user.add",
+        json!({
+            "username": "first",
+            "password": "first secret",
+            "password_confirm": "first secret",
+            "operation_id": "empty-first",
+            "expected_version": version,
+        }),
+    )
+    .await;
+    assert_eq!(added["state"], "applied");
+    let text = std::fs::read_to_string(&users_path).unwrap();
+    assert!(text.contains("version = 1"));
+    assert!(text.contains("[[users]]"));
+    assert!(text.contains("username = \"first\""));
+    assert_eq!(
+        http_status(proxy, origin.address, "first", "first secret").await,
+        200,
+        "the first account must authenticate after being added"
+    );
+    writer.shutdown().await;
+    server.shutdown().await;
+}

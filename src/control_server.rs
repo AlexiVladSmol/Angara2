@@ -291,7 +291,7 @@ pub fn proxy_snapshot(
     let now = Utc::now();
     ProxySnapshot {
         api_version: API_VERSION,
-        instance_id: config.instance_id().to_owned(),
+        instance_id: control.control_instance_id().to_owned(),
         generation: status.generation,
         config_version: status.config_version.clone(),
         users_version: status.users_version.clone(),

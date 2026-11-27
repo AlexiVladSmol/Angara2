@@ -38,9 +38,7 @@ pub fn apply_users_edit(
     document: &mut DocumentMut,
     edit: &UsersEdit,
 ) -> Result<(), CandidateError> {
-    let tables = document["users"]
-        .as_array_of_tables_mut()
-        .ok_or_else(|| CandidateError::invalid("users must be an array of tables", vec![]))?;
+    let tables = users_tables_mut(document)?;
     match edit {
         UsersEdit::Add {
             username,
@@ -97,6 +95,39 @@ pub fn apply_users_edit(
     }
     sync_users_version(document);
     Ok(())
+}
+
+fn users_tables_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables, CandidateError> {
+    let replace = match document.get("users") {
+        None => true,
+        Some(Item::ArrayOfTables(_)) => false,
+        Some(Item::Value(Value::Array(array))) if array.is_empty() => true,
+        Some(Item::Value(Value::Array(_))) => {
+            return Err(CandidateError::invalid(
+                "writer supports only [[users]] tables, not an inline users array",
+                vec!["users".to_owned()],
+            ));
+        }
+        Some(_) => {
+            return Err(CandidateError::invalid(
+                "users must be an array of tables",
+                vec!["users".to_owned()],
+            ));
+        }
+    };
+    if replace {
+        document["users"] = Item::ArrayOfTables(ArrayOfTables::new());
+        if let Some(mut key) = document.as_table_mut().key_mut("users") {
+            key.leaf_decor_mut().set_suffix("");
+        }
+    }
+    match document.get_mut("users") {
+        Some(Item::ArrayOfTables(tables)) => Ok(tables),
+        _ => Err(CandidateError::invalid(
+            "cannot create the users table",
+            vec!["users".to_owned()],
+        )),
+    }
 }
 
 fn find_user<'a>(tables: &'a mut ArrayOfTables, username: &str) -> Option<&'a mut Table> {
@@ -575,6 +606,43 @@ mod tests {
         assert!(text.contains("version = 1"));
         assert!(!text.contains("blocked_until"));
         assert!(text.contains("disabled = true"), "bob stays blocked");
+    }
+
+    #[test]
+    fn add_user_accepts_an_empty_inline_users_array() {
+        let mut document = doc("# keep this header\nversion = 1\nusers = []\n");
+        let password = crate::auth::prepare_password("synthetic").expect("password");
+        let phc = crate::auth::hash_password(&password, &[3_u8; 16]).expect("hash");
+        apply_users_edit(
+            &mut document,
+            &UsersEdit::Add {
+                username: "alice".to_owned(),
+                password_hash: phc,
+            },
+        )
+        .expect("empty users array becomes a table array");
+        let text = document.to_string();
+        assert!(text.contains("# keep this header"));
+        assert!(text.contains("version = 1"));
+        assert!(text.contains("[[users]]"));
+        assert!(text.contains("username = \"alice\""));
+        crate::auth::UsersSnapshot::parse(&text).expect("candidate parses");
+    }
+
+    #[test]
+    fn add_user_rejects_a_non_empty_inline_users_array() {
+        let mut document = doc("version = 1\nusers = [{ username = \"alice\" }]\n");
+        let before = document.to_string();
+        let error = apply_users_edit(
+            &mut document,
+            &UsersEdit::Add {
+                username: "bob".to_owned(),
+                password_hash: "synthetic-phc".to_owned(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("[[users]]"), "{}", error.message);
+        assert_eq!(document.to_string(), before);
     }
 
     #[test]

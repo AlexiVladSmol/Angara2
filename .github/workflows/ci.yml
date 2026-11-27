@@ -700,6 +700,8 @@ jobs:
           echo "M08_BIN=/usr/local/bin/angara" >>"$GITHUB_ENV"
       - name: Run systemd checks
         run: sudo --preserve-env=M08_BIN bash tests/m08/systemd.sh
+      - name: M11 installed control writer checks
+        run: sudo --preserve-env=M08_BIN bash tests/m11/systemd_control.sh
       - name: Parent credentials recipe is readable by service user
         run: |
           set -euo pipefail

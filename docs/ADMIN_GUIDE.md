@@ -339,6 +339,10 @@ unit/служебный скрипт выбранной версии, запус
 запуском произошло прерывание, повторите `upgrade` или выполните
 `angaractl recover`.
 
+**Перед откатом на M10** снимите все временные блокировки новым бинарником
+(users-файл вернётся к `version = 1`) или восстановите users-файл из
+резервной копии: M10 не читает `blocked_until` и не стартует с v2.
+
 Проверка фактической версии:
 
 ```sh
@@ -580,7 +584,10 @@ M11 добавляет два независимых компонента:
 
 Публичный сокет принадлежит привилегированному writer-процессу. Прокси
 открывает только приватный сокет; writer подключается к нему как root или
-тот же UID и не может использовать его для записи файлов. Writer работает
+тот же UID и не может использовать его для записи файлов. Каталог
+`/run/angara` сохраняется при перезапуске прокси
+(`RuntimeDirectoryPreserve=restart`), поэтому аварийный restart не удаляет
+публичный сокет writer-а; при остановке каталог и оба сокета удаляются. Writer работает
 только с основным TOML и путём из `[auth].users_file`, проверяет тип файла,
 владельца, режим и число ссылок, сохраняет owner/group/mode и делает
 атомарную замену с `fsync`.
@@ -595,6 +602,8 @@ sudo usermod -aG angara,angara-admin "$USER"
 # выйдите и войдите снова, чтобы группы применились
 ```
 
+Группа `angara-admin` должна быть локальной группой в `/etc/group`: writer
+читает `/etc/group` и `/etc/passwd` напрямую и не видит членство из LDAP/sssd.
 Служебный UID `angara` в `angara-admin` не добавляется. Файлы должны иметь
 владельца `root` и режим `0640` (группа `angara`); users-файл не должен быть
 group/world-writable. Если `users_file` указывает за пределы `/etc/angara`,
@@ -737,6 +746,7 @@ sudo -u nobody test -r /run/angara/control.sock && echo unexpected
 | `status=226/NAMESPACE` | sandbox unit несовместим с окружением; проверьте `systemd-analyze verify` и `/etc/systemd/system/angara.service.d/` |
 | `check` не читает users/TLS | владелец/режим `root:angara 0640`, каталог `/etc/angara` не world-writable |
 | TUI не подключается | проверьте `angara-control.service`, режим сокета и группы `angara`/`angara-admin`; `journalctl -u angara-control` |
+| writer не стартует | при невалидном TOML на диске `angara-control.service` падает до открытия сокета; выполните `angara check --config /etc/angara/angara.toml` и `journalctl -u angara-control` |
 | reload отклонён | `reload_rejected`, `outcome`; исправьте файл и повторите SIGHUP; PID/ACL должны сохраниться |
 | клиент получает 407 | нет/неверные credentials; проверьте `users.local.toml` и `auth` listener |
 | клиент получает 403 | нет allow-правила ACL, запрещён source/domain/IP/port или сработал default deny |
