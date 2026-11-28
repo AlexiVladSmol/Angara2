@@ -4,13 +4,20 @@
 //! listeners, Basic authentication, the outbound policy/DNS/egress pipeline,
 //! the bounded in-memory HTTP cache, and the M07 operational layer: atomic
 //! snapshots, typed reload/control, bounded JSON logging and fixed metrics.
-//! Network administration is not part of this milestone.
+//! M11 adds the local JSONL control API, the privileged file writer and the
+//! Ratatui terminal panel. No TCP administration listener is exposed.
 
 pub mod auth;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod connections;
 pub mod control;
+pub mod control_edit;
+pub mod control_files;
+pub mod control_protocol;
+pub mod control_server;
+pub mod control_write;
 pub mod http;
 pub mod limits;
 pub mod logging;
@@ -25,3 +32,5 @@ pub mod target;
 pub mod telemetry;
 mod tls;
 pub mod transport;
+pub mod tui;
+pub mod version;

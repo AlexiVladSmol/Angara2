@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, Transport};
+use crate::connections::{ConnectionGuard, ConnectionState};
 use crate::http::connect::{TunnelEnd, TunnelGauge, TunnelProgress, TunnelSetup};
 use crate::http::forward::{ClientInfo, ExchangeMeta, Proxy};
 use crate::http::headers;
@@ -58,6 +59,7 @@ pub struct HttpServer {
     addresses: Vec<(String, SocketAddr)>,
     shutdown: ShutdownHandle,
     control: std::sync::Arc<crate::control::ControlState>,
+    _read_server: Option<crate::control_server::ReadServer>,
     _proxy: Arc<Proxy>,
 }
 
@@ -148,7 +150,7 @@ impl ShutdownHandle {
 impl HttpServer {
     /// Binds every configured listener before accepting any connection.
     pub async fn bind(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, false, None, None, None).await
+        Self::bind_inner(config, false, None, None, None, None).await
     }
 
     /// Binds from a real config path and enables typed reload operations.
@@ -156,13 +158,48 @@ impl HttpServer {
         config: Arc<Config>,
         config_path: std::path::PathBuf,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, false, None, None, Some(config_path)).await
+        Self::bind_inner(config, false, None, None, Some(config_path), None).await
+    }
+
+    /// Binds from a real config path and serves the private control reader.
+    pub async fn bind_with_path_and_control(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+        control_socket: std::path::PathBuf,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(
+            config,
+            false,
+            None,
+            None,
+            Some(config_path),
+            Some(control_socket),
+        )
+        .await
+    }
+
+    /// Test/library API: ephemeral listeners and the private control reader.
+    #[doc(hidden)]
+    pub async fn bind_ephemeral_with_path_and_control(
+        config: Arc<Config>,
+        config_path: std::path::PathBuf,
+        control_socket: std::path::PathBuf,
+    ) -> Result<Self, ServerError> {
+        Self::bind_inner(
+            config,
+            true,
+            None,
+            None,
+            Some(config_path),
+            Some(control_socket),
+        )
+        .await
     }
 
     /// Test/library API that binds configured listeners with ephemeral ports.
     #[doc(hidden)]
     pub async fn bind_ephemeral(config: Arc<Config>) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, None, None).await
+        Self::bind_inner(config, true, None, None, None, None).await
     }
 
     /// Ephemeral bind with a config path for reload tests.
@@ -171,7 +208,7 @@ impl HttpServer {
         config: Arc<Config>,
         config_path: std::path::PathBuf,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, None, Some(config_path)).await
+        Self::bind_inner(config, true, None, None, Some(config_path), None).await
     }
 
     /// Test/library API with an injected resolver and dialer.
@@ -181,7 +218,7 @@ impl HttpServer {
         resolver: Arc<dyn crate::resolver::Resolver>,
         dialer: Arc<dyn crate::transport::Dialer>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, Some((resolver, dialer)), None, None).await
+        Self::bind_inner(config, true, Some((resolver, dialer)), None, None, None).await
     }
 
     /// Test/library API with an injected password verifier.
@@ -190,7 +227,7 @@ impl HttpServer {
         config: Arc<Config>,
         verifier: Arc<dyn crate::auth::PasswordVerifier>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, Some(verifier), None).await
+        Self::bind_inner(config, true, None, Some(verifier), None, None).await
     }
 
     /// Test/library API with injected components and a password verifier.
@@ -201,7 +238,15 @@ impl HttpServer {
         dialer: Arc<dyn crate::transport::Dialer>,
         verifier: Arc<dyn crate::auth::PasswordVerifier>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, Some((resolver, dialer)), Some(verifier), None).await
+        Self::bind_inner(
+            config,
+            true,
+            Some((resolver, dialer)),
+            Some(verifier),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Test/library API with a startup config path and injected verifier.
@@ -211,7 +256,7 @@ impl HttpServer {
         config_path: std::path::PathBuf,
         verifier: Arc<dyn crate::auth::PasswordVerifier>,
     ) -> Result<Self, ServerError> {
-        Self::bind_inner(config, true, None, Some(verifier), Some(config_path)).await
+        Self::bind_inner(config, true, None, Some(verifier), Some(config_path), None).await
     }
 
     async fn bind_inner(
@@ -223,6 +268,7 @@ impl HttpServer {
         )>,
         verifier: Option<Arc<dyn crate::auth::PasswordVerifier>>,
         config_path: Option<std::path::PathBuf>,
+        control_socket: Option<std::path::PathBuf>,
     ) -> Result<Self, ServerError> {
         let mut listeners = Vec::new();
         let mut addresses = Vec::new();
@@ -329,10 +375,25 @@ impl HttpServer {
             config_path,
             lifecycle,
         );
+        let read_server = match control_socket {
+            Some(path) => Some(
+                crate::control_server::ReadServer::bind(
+                    path,
+                    Arc::clone(&control),
+                    proxy.connections(),
+                )
+                .await
+                .map_err(|_| ServerError {
+                    detail: "cannot bind the control read socket",
+                })?,
+            ),
+            None => None,
+        };
         Ok(Self {
             addresses,
             shutdown,
             control,
+            _read_server: read_server,
             _proxy: proxy,
         })
     }
@@ -380,9 +441,12 @@ impl HttpServer {
     /// The deadline is shared with the runtime and CLI; no phase gets a fresh
     /// full window after it has elapsed.
     #[doc(hidden)]
-    pub async fn shutdown_until(self, deadline: std::time::Instant) {
+    pub async fn shutdown_until(mut self, deadline: std::time::Instant) {
         self.control
             .begin_shutdown(crate::control::ShutdownReason::Server);
+        if let Some(read_server) = self._read_server.take() {
+            read_server.shutdown().await;
+        }
         self.shutdown.begin(deadline).await;
     }
 }
@@ -917,6 +981,13 @@ async fn accept_loop(
                         let handshake_permits = Arc::clone(&handshake_permits);
                         let tls = tls.clone();
                         let telemetry = proxy.telemetry();
+                        let transport = if tls.is_some() { "https" } else { "http" };
+                        let connection = proxy.connections().open(&listener_id, transport);
+                        if tls.is_some()
+                            && let Some(guard) = &connection
+                        {
+                            guard.set_state(ConnectionState::TlsHandshake);
+                        }
                         tasks.spawn(async move {
                             let _gauge = ClientGauge::new(telemetry);
                             if let Some(acceptor) = tls {
@@ -931,13 +1002,22 @@ async fn accept_loop(
                                     handshake_permits,
                                     handshake_timeout,
                                     config,
+                                    connection,
                                     drain,
                                     force,
                                 )
                                 .await;
                             } else {
                                 serve_client(
-                                    stream, peer, listener_id, proxy, permit, config, None, drain,
+                                    stream,
+                                    peer,
+                                    listener_id,
+                                    proxy,
+                                    permit,
+                                    config,
+                                    None,
+                                    connection,
+                                    drain,
                                     force,
                                 )
                                 .await;
@@ -965,6 +1045,7 @@ async fn serve_tls_client(
     handshake_permits: Arc<Semaphore>,
     handshake_timeout: Duration,
     config: Arc<Config>,
+    connection: Option<ConnectionGuard>,
     mut drain: watch::Receiver<bool>,
     mut force: watch::Receiver<bool>,
 ) {
@@ -1020,6 +1101,7 @@ async fn serve_tls_client(
         permit,
         config,
         Some(observer),
+        connection,
         drain,
         force,
     )
@@ -1035,12 +1117,17 @@ async fn serve_client<S>(
     permit: CapPermit,
     config: Arc<Config>,
     observer: Option<Arc<TransportProgress>>,
+    connection: Option<ConnectionGuard>,
     mut drain: watch::Receiver<bool>,
     mut force: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let _client_permit = permit;
+    let tracked_connection = connection.as_ref().map(ConnectionGuard::id);
+    if let Some(guard) = &connection {
+        guard.set_state(ConnectionState::Http);
+    }
     let idle_timeout = config.limits().idle_timeout();
     let idle_state = observer
         .as_ref()
@@ -1071,6 +1158,7 @@ async fn serve_client<S>(
     let service_output = Arc::clone(&output);
     let tunnel_slot: Arc<Mutex<Option<TunnelSetup>>> = Arc::new(Mutex::new(None));
     let service_slot = Arc::clone(&tunnel_slot);
+    let state_proxy = Arc::clone(&proxy);
     let service = service_fn(move |mut request| {
         let proxy = Arc::clone(&proxy);
         let client = client.clone();
@@ -1079,6 +1167,9 @@ async fn serve_client<S>(
         let service_output = Arc::clone(&service_output);
         let service_slot = Arc::clone(&service_slot);
         async move {
+            if let Some(id) = tracked_connection {
+                proxy.connections().count_request(id);
+            }
             let Ok(permit) = exchange_gate.acquire_owned().await else {
                 return Ok::<_, Infallible>(headers::error_response(
                     http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1201,6 +1292,11 @@ async fn serve_client<S>(
                     drop(connection);
                     drop(hub);
                     tunnel_mode.store(true, Ordering::Release);
+                    if let Some(id) = tracked_connection {
+                        state_proxy
+                            .connections()
+                            .set_state(id, ConnectionState::Connect);
+                    }
                     let TunnelSetup {
                         on_upgrade,
                         origin,

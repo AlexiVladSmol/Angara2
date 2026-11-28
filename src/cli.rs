@@ -30,7 +30,9 @@ const USAGE: &str = "\
 Usage:
   angara --version
   angara check --config <path>
-  angara serve --config <path>
+  angara serve --config <path> [--control-read-socket <path>]
+  angara control-write --config <path> [--socket <path>] [--read-socket <path>]
+  angara tui [--socket <path>]
   angara users hash [--password-stdin]
   angara --help";
 
@@ -40,7 +42,9 @@ Angara proxy
 Usage:
   angara --version
   angara check --config <path>
-  angara serve --config <path>
+  angara serve --config <path> [--control-read-socket <path>]
+  angara control-write --config <path> [--socket <path>] [--read-socket <path>]
+  angara tui [--socket <path>]
   angara users hash [--password-stdin]
   angara --help
 
@@ -48,6 +52,8 @@ Commands:
   check --config <path>       Validate the configuration without network access.
   serve --config <path>       Bind all listeners and run the HTTP/1.1 proxy
                               (HTTP and HTTPS ingress).
+  control-write               Run the privileged local control writer.
+  tui                         Open the terminal control panel.
   users hash                  Read a password from the terminal without echo.
   users hash --password-stdin Read exactly one password line from stdin.
   --version                   Print the version and stop.
@@ -92,6 +98,8 @@ where
         }
         Some("check") => run_config_command(Mode::Check, args),
         Some("serve") => run_config_command(Mode::Serve, args),
+        Some("control-write") => run_control_write(args),
+        Some("tui") => run_tui(args),
         Some("users") => run_users(args),
         _ => usage_error("неизвестная команда или аргумент"),
     }
@@ -231,7 +239,7 @@ impl Mode {
     fn usage(self) -> &'static str {
         match self {
             Self::Check => "Usage: angara check --config <path>",
-            Self::Serve => "Usage: angara serve --config <path>",
+            Self::Serve => "Usage: angara serve --config <path> [--control-read-socket <path>]",
         }
     }
 }
@@ -242,6 +250,7 @@ where
 {
     let mut args = args.into_iter();
     let mut config_path = None;
+    let mut control_socket = None;
 
     while let Some(argument) = args.next() {
         if argument == "--help" || argument == "-h" {
@@ -271,6 +280,29 @@ where
             continue;
         }
 
+        if argument == "--control-read-socket" && matches!(mode, Mode::Serve) {
+            if control_socket.is_some() {
+                return usage_error("--control-read-socket указан повторно");
+            }
+            let Some(value) = args.next() else {
+                return usage_error("после --control-read-socket требуется путь");
+            };
+            control_socket = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--control-read-socket="))
+            && matches!(mode, Mode::Serve)
+        {
+            if control_socket.is_some() {
+                return usage_error("--control-read-socket указан повторно");
+            }
+            control_socket = Some(PathBuf::from(value));
+            continue;
+        }
+
         return usage_error("неподдерживаемый аргумент команды");
     }
 
@@ -278,6 +310,17 @@ where
         return usage_error("не указан --config");
     };
     let path = std::path::absolute(&path).unwrap_or(path);
+    // The packaged unit uses an environment variable so an older M10 binary
+    // can ignore the M11 private-reader setting during an A->B->A swap.
+    let control_socket = if matches!(mode, Mode::Serve) {
+        control_socket.or_else(|| {
+            std::env::var_os("ANGARA_CONTROL_READ_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+    } else {
+        None
+    };
 
     let config = match Config::load(&path) {
         Ok(config) => config,
@@ -316,7 +359,12 @@ where
                         ));
                     }
                 };
-                let server = HttpServer::bind_with_path(config, path).await?;
+                let server = match control_socket {
+                    Some(socket) => {
+                        HttpServer::bind_with_path_and_control(config, path, socket).await?
+                    }
+                    None => HttpServer::bind_with_path(config, path).await?,
+                };
                 let telemetry = server.telemetry();
                 let logger = if observability.log_level() == crate::config::LogLevel::Off {
                     Logger::disabled(telemetry)
@@ -537,6 +585,168 @@ fn log_reload(logger: &Logger, outcome: &ReloadOutcome) {
         }
     }
     logger.log(record);
+}
+
+fn run_control_write<I>(args: I) -> u8
+where
+    I: IntoIterator<Item = OsString>,
+{
+    const USAGE: &str = "Usage: angara control-write --config <path> [--socket <path>] [--read-socket <path>] [--admin-group <name>] [--socket-group <name>]";
+    let mut config_path = None;
+    let mut options = None::<crate::control_write::WriterOptions>;
+    let mut arguments = args.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--help" || argument == "-h" {
+            println!("{USAGE}");
+            return EXIT_OK;
+        }
+        let Some(flag) = argument.to_str() else {
+            eprintln!("error: неподдерживаемый аргумент control-write");
+            return EXIT_USAGE;
+        };
+        let value = match flag {
+            "--config" | "--socket" | "--read-socket" | "--admin-group" | "--socket-group" => {
+                let Some(value) = arguments.next() else {
+                    eprintln!("error: после {flag} требуется значение");
+                    return EXIT_USAGE;
+                };
+                value
+            }
+            _ => {
+                eprintln!("error: неподдерживаемый аргумент control-write");
+                return EXIT_USAGE;
+            }
+        };
+        match flag {
+            "--config" => config_path = Some(PathBuf::from(value)),
+            "--socket" => {
+                let mut current = options
+                    .take()
+                    .unwrap_or_else(|| crate::control_write::WriterOptions::new(PathBuf::new()));
+                current.socket_path = PathBuf::from(value);
+                options = Some(current);
+            }
+            "--read-socket" => {
+                let mut current = options
+                    .take()
+                    .unwrap_or_else(|| crate::control_write::WriterOptions::new(PathBuf::new()));
+                current.read_socket = PathBuf::from(value);
+                options = Some(current);
+            }
+            "--admin-group" => {
+                let mut current = options
+                    .take()
+                    .unwrap_or_else(|| crate::control_write::WriterOptions::new(PathBuf::new()));
+                current.admin_group = value.to_string_lossy().into_owned();
+                options = Some(current);
+            }
+            "--socket-group" => {
+                let mut current = options
+                    .take()
+                    .unwrap_or_else(|| crate::control_write::WriterOptions::new(PathBuf::new()));
+                current.socket_group = value.to_string_lossy().into_owned();
+                options = Some(current);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let Some(config_path) = config_path else {
+        eprintln!("error: не указан --config");
+        eprintln!("{USAGE}");
+        return EXIT_USAGE;
+    };
+    let config_path = std::path::absolute(&config_path).unwrap_or(config_path);
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return EXIT_CONFIG_ERROR;
+        }
+    };
+    let mut options =
+        options.unwrap_or_else(|| crate::control_write::WriterOptions::new(config_path.clone()));
+    options.config_path = config_path;
+    let runtime = match AngaraRuntime::build(&config) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return EXIT_SERVER_ERROR;
+        }
+    };
+    let result = runtime.block_on(async move {
+        let handle = crate::control_write::ControlWriter::start(options).await?;
+        wait_for_control_signal().await;
+        let socket = handle.socket_path.clone();
+        handle.shutdown().await;
+        Ok::<PathBuf, std::io::Error>(socket)
+    });
+    match result {
+        Ok(socket) => {
+            println!("control writer stopped: {}", socket.display());
+            runtime.shutdown();
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            runtime.shutdown();
+            EXIT_SERVER_ERROR
+        }
+    }
+}
+
+async fn wait_for_control_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn run_tui<I>(args: I) -> u8
+where
+    I: IntoIterator<Item = OsString>,
+{
+    const USAGE: &str = "Usage: angara tui [--socket <path>]";
+    let mut socket = PathBuf::from(crate::control_write::DEFAULT_SOCKET);
+    let mut arguments = args.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--help" || argument == "-h" {
+            println!("{USAGE}");
+            return EXIT_OK;
+        }
+        if argument == "--socket" {
+            let Some(value) = arguments.next() else {
+                eprintln!("error: после --socket требуется путь");
+                return EXIT_USAGE;
+            };
+            socket = PathBuf::from(value);
+            continue;
+        }
+        eprintln!("error: неподдерживаемый аргумент tui");
+        eprintln!("{USAGE}");
+        return EXIT_USAGE;
+    }
+    match crate::tui::run(&socket) {
+        Ok(()) => EXIT_OK,
+        Err(error) => {
+            eprintln!("error: {error}");
+            EXIT_CONFIG_ERROR
+        }
+    }
 }
 
 fn usage_error(message: &str) -> u8 {

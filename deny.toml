@@ -12,7 +12,13 @@
 targets = []
 
 [advisories]
-ignore = []
+ignore = [
+    # chrono is used only for RFC 3339 UTC arithmetic/formatting and local
+    # display. RUSTSEC-2026-0543 is an unmaintained-crate advisory, not a
+    # vulnerability, and no safe replacement version exists. A migration to
+    # `time`/`jiff` is a separate dependency decision.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is used for RFC 3339 timestamps only; unmaintained advisory, no vulnerability; migration is a separate decision" },
+]
 
 [licenses]
 allow = [
@@ -21,6 +27,7 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.93
 

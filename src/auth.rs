@@ -19,6 +19,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier as _,
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{DateTime, SecondsFormat, Utc};
 use http::header::PROXY_AUTHORIZATION;
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -26,6 +27,8 @@ use serde_path_to_error::{Path as SerdePath, Segment as SerdeSegment};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use unicode_normalization::UnicodeNormalization;
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::version::{content_version, is_version};
 
 /// Maximum users file size accepted from one open regular-file handle.
 pub const MAX_USERS_FILE_BYTES: u64 = 1_048_576;
@@ -68,12 +71,48 @@ pub enum AuthMode {
     Basic,
 }
 
+/// First users-file schema: active or permanently disabled accounts.
+pub const USERS_SCHEMA_V1: i64 = 1;
+/// Second users-file schema: adds the optional absolute `blocked_until`.
+pub const USERS_SCHEMA_V2: i64 = 2;
+
 /// A single validated local account.
 #[derive(Clone)]
 pub(crate) struct UserRecord {
     pub(crate) username: String,
     pub(crate) password_hash: PasswordHashValue,
-    pub(crate) disabled: bool,
+    pub(crate) block: BlockState,
+}
+
+/// Explicit three-state account block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BlockState {
+    /// No block; normal password and ACL checks apply.
+    Active,
+    /// Blocked until an operator clears it.
+    Permanent,
+    /// Blocked while the server clock is strictly before this UTC instant.
+    Until(DateTime<Utc>),
+}
+
+impl BlockState {
+    /// Whether the account may pass authentication at `now`.
+    pub(crate) fn allows_access(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Active => true,
+            Self::Permanent => false,
+            Self::Until(until) => now >= *until,
+        }
+    }
+
+    /// Absolute end of a temporary block.
+    #[cfg(test)]
+    pub(crate) fn until(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Until(until) => Some(*until),
+            Self::Active | Self::Permanent => None,
+        }
+    }
 }
 
 impl fmt::Debug for UserRecord {
@@ -81,7 +120,7 @@ impl fmt::Debug for UserRecord {
         formatter
             .debug_struct("UserRecord")
             .field("username", &self.username)
-            .field("disabled", &self.disabled)
+            .field("block", &self.block)
             .finish_non_exhaustive()
     }
 }
@@ -111,6 +150,7 @@ static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 /// One immutable users snapshot. Snapshots are never merged.
 pub struct UsersSnapshot {
     id: u64,
+    version: String,
     users: HashMap<String, UserRecord>,
     dummy: PasswordHashValue,
 }
@@ -120,13 +160,14 @@ impl fmt::Debug for UsersSnapshot {
         formatter
             .debug_struct("UsersSnapshot")
             .field("id", &self.id)
+            .field("version", &self.version)
             .field("users", &self.users.len())
             .finish_non_exhaustive()
     }
 }
 
 impl UsersSnapshot {
-    /// Compares the effective username/PHC/disabled records without exposing
+    /// Compares the effective username/PHC/block records without exposing
     /// them. Snapshot IDs and dummy entries are intentionally ignored.
     pub fn same_records(&self, other: &Self) -> bool {
         if self.users.len() != other.users.len() {
@@ -134,7 +175,7 @@ impl UsersSnapshot {
         }
         self.users.iter().all(|(username, left)| {
             other.users.get(username).is_some_and(|right| {
-                left.disabled == right.disabled
+                left.block == right.block
                     && left.password_hash.as_str() == right.password_hash.as_str()
             })
         })
@@ -154,7 +195,8 @@ impl UsersSnapshot {
         Self::parse(&text)
     }
 
-    fn parse(text: &str) -> Result<Self, UsersFileError> {
+    /// Parses and validates users-file text without touching the filesystem.
+    pub(crate) fn parse(text: &str) -> Result<Self, UsersFileError> {
         let deserializer =
             toml::de::Deserializer::parse(text).map_err(|error| UsersFileError::Toml {
                 position: error.span().map(|span| line_column(text, span.start)),
@@ -172,7 +214,7 @@ impl UsersSnapshot {
                 }
             })?;
 
-        if raw.version != 1 {
+        if raw.version != USERS_SCHEMA_V1 && raw.version != USERS_SCHEMA_V2 {
             return Err(UsersFileError::Version);
         }
         if raw.users.len() > MAX_USERS {
@@ -195,18 +237,31 @@ impl UsersSnapshot {
             if users.contains_key(&username) {
                 return Err(UsersFileError::DuplicateUsername { index });
             }
+            let block = match (raw_user.disabled, raw_user.blocked_until) {
+                (true, Some(_)) => return Err(UsersFileError::IncompatibleBlock { index }),
+                (true, None) => BlockState::Permanent,
+                (false, Some(_)) if raw.version == USERS_SCHEMA_V1 => {
+                    return Err(UsersFileError::BlockedUntilRequiresV2 { index });
+                }
+                (false, Some(value)) => BlockState::Until(
+                    parse_blocked_until(&value)
+                        .ok_or(UsersFileError::InvalidBlockTime { index })?,
+                ),
+                (false, None) => BlockState::Active,
+            };
             users.insert(
                 username.clone(),
                 UserRecord {
                     username,
                     password_hash: PasswordHashValue(password_hash),
-                    disabled: raw_user.disabled,
+                    block,
                 },
             );
         }
 
         Ok(Self {
             id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
+            version: content_version(text.as_bytes()),
             users,
             dummy,
         })
@@ -217,9 +272,50 @@ impl UsersSnapshot {
         self.id
     }
 
-    fn enabled_user(&self, username: &str) -> Option<&UserRecord> {
-        self.users.get(username).filter(|record| !record.disabled)
+    /// Version of the exact users-file text represented by this snapshot.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
     }
+
+    /// All records in unspecified order for read-only control projections.
+    pub(crate) fn records(&self) -> impl Iterator<Item = &UserRecord> {
+        self.users.values()
+    }
+
+    /// Number of configured accounts.
+    pub(crate) fn user_count(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Number of blocks that are active at `now`.
+    pub(crate) fn block_count(&self, now: DateTime<Utc>) -> usize {
+        self.users
+            .values()
+            .filter(|record| !record.block.allows_access(now))
+            .count()
+    }
+
+    fn active_user(&self, username: &str, now: DateTime<Utc>) -> Option<&UserRecord> {
+        self.users
+            .get(username)
+            .filter(|record| record.block.allows_access(now))
+    }
+}
+
+/// Parses one explicit RFC 3339 instant and normalizes it to UTC.
+pub(crate) fn parse_blocked_until(value: &str) -> Option<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    Some(parsed.with_timezone(&Utc))
+}
+
+/// Formats a block instant for the users file and the control API.
+pub(crate) fn format_blocked_until(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Whether a value is a valid non-empty content version token.
+pub(crate) fn is_content_version(value: &str) -> bool {
+    is_version(value)
 }
 
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>, UsersFileError> {
@@ -414,6 +510,15 @@ pub(crate) enum UsersFileError {
     DuplicateUsername {
         index: usize,
     },
+    IncompatibleBlock {
+        index: usize,
+    },
+    BlockedUntilRequiresV2 {
+        index: usize,
+    },
+    InvalidBlockTime {
+        index: usize,
+    },
     Internal(&'static str),
 }
 
@@ -454,7 +559,7 @@ impl fmt::Display for UsersFileError {
                 let message = crate::config::escape_control(message, 240);
                 write!(formatter, ": {message}")
             }
-            Self::Version => formatter.write_str("users file version must be 1"),
+            Self::Version => formatter.write_str("users file version must be 1 or 2"),
             Self::TooManyUsers => formatter.write_str("users file exceeds 1024 users"),
             Self::InvalidUsername { index } => {
                 write!(formatter, "users[{index}].username is invalid")
@@ -465,6 +570,18 @@ impl fmt::Display for UsersFileError {
             Self::DuplicateUsername { index } => {
                 write!(formatter, "users[{index}].username is duplicated")
             }
+            Self::IncompatibleBlock { index } => write!(
+                formatter,
+                "users[{index}] combines disabled = true with blocked_until"
+            ),
+            Self::BlockedUntilRequiresV2 { index } => write!(
+                formatter,
+                "users[{index}].blocked_until requires users file version 2"
+            ),
+            Self::InvalidBlockTime { index } => write!(
+                formatter,
+                "users[{index}].blocked_until must be an RFC 3339 instant with an explicit offset"
+            ),
             Self::Internal(message) => formatter.write_str(message),
         }
     }
@@ -490,7 +607,14 @@ fn line_column(input: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-const USERS_FIELDS: [&str; 5] = ["version", "users", "username", "password_hash", "disabled"];
+const USERS_FIELDS: [&str; 6] = [
+    "version",
+    "users",
+    "username",
+    "password_hash",
+    "disabled",
+    "blocked_until",
+];
 
 fn sanitize_users_path(path: &SerdePath) -> Option<String> {
     let mut sanitized = String::new();
@@ -653,6 +777,22 @@ impl PasswordVerifier for Argon2Verifier {
     }
 }
 
+/// Server clock used for temporary block expiry.
+pub trait Clock: Send + Sync + 'static {
+    /// Current UTC instant.
+    fn now(&self) -> DateTime<Utc>;
+}
+
+/// Production system clock.
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
 /// One per-server authentication service.
 #[derive(Clone)]
 pub struct AuthService {
@@ -661,6 +801,7 @@ pub struct AuthService {
     verify_timeout: Duration,
     verifier: Arc<dyn PasswordVerifier>,
     telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl fmt::Debug for AuthService {
@@ -669,6 +810,7 @@ impl fmt::Debug for AuthService {
             .debug_struct("AuthService")
             .field("max_verifying", &self.permits.available_permits())
             .field("verify_timeout", &self.verify_timeout)
+            .field("clock", &self.clock.now())
             .finish_non_exhaustive()
     }
 }
@@ -706,12 +848,33 @@ impl AuthService {
         verifier: Arc<dyn PasswordVerifier>,
         telemetry: Option<Arc<crate::telemetry::Telemetry>>,
     ) -> Option<Self> {
+        Self::build(config, verifier, telemetry, Arc::new(SystemClock))
+    }
+
+    /// Builds a service with an injected verifier and clock for deterministic
+    /// block-expiry tests.
+    #[doc(hidden)]
+    pub fn from_config_with_verifier_and_clock(
+        config: &crate::config::Config,
+        verifier: Arc<dyn PasswordVerifier>,
+        clock: Arc<dyn Clock>,
+    ) -> Option<Self> {
+        Self::build(config, verifier, None, clock)
+    }
+
+    fn build(
+        config: &crate::config::Config,
+        verifier: Arc<dyn PasswordVerifier>,
+        telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+        clock: Arc<dyn Clock>,
+    ) -> Option<Self> {
         config.auth().map(|auth| Self {
             snapshot: Arc::clone(auth.snapshot()),
             permits: Arc::new(Semaphore::new(auth.max_verifying())),
             verify_timeout: auth.verify_timeout(),
             verifier,
             telemetry,
+            clock,
         })
     }
 
@@ -745,7 +908,7 @@ impl AuthService {
         credentials: BasicCredentials,
         snapshot: &Arc<UsersSnapshot>,
     ) -> Result<VerifiedIdentity, AuthError> {
-        let enabled = snapshot.enabled_user(&credentials.username);
+        let enabled = snapshot.active_user(&credentials.username, self.clock.now());
         let is_real = enabled.is_some();
         let hash = match enabled {
             Some(record) => record.password_hash.clone(),
@@ -1074,6 +1237,8 @@ struct RawUser {
     password_hash: String,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    blocked_until: Option<String>,
 }
 
 #[cfg(test)]
@@ -1081,6 +1246,7 @@ pub(crate) fn test_identity(username: &str) -> VerifiedIdentity {
     VerifiedIdentity {
         snapshot: Arc::new(UsersSnapshot {
             id: 0,
+            version: content_version(b""),
             users: HashMap::new(),
             dummy: PasswordHashValue::new(DUMMY_PHC.to_owned()),
         }),
@@ -1139,6 +1305,7 @@ mod tests {
             verify_timeout,
             verifier,
             telemetry: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -1392,8 +1559,9 @@ mod tests {
             UsersSnapshot::parse(&text),
             Err(UsersFileError::DuplicateUsername { index: 1 })
         ));
+        assert!(UsersSnapshot::parse("version = 2\nusers = []\n").is_ok());
         assert!(matches!(
-            UsersSnapshot::parse("version = 2\nusers = []\n"),
+            UsersSnapshot::parse("version = 3\nusers = []\n"),
             Err(UsersFileError::Version)
         ));
         assert!(matches!(
@@ -1423,6 +1591,125 @@ mod tests {
             assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    fn blocked_user_file(until: &str) -> String {
+        format!(
+            "version = 2\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{DUMMY_PHC}\"\nblocked_until = \"{until}\"\n"
+        )
+    }
+
+    #[test]
+    fn blocks_have_exactly_three_schema_states() {
+        let active = UsersSnapshot::parse(&user_file("alice", false)).expect("active");
+        assert!(active.active_user("alice", Utc::now()).is_some());
+
+        let permanent = UsersSnapshot::parse(&user_file("alice", true)).expect("permanent");
+        assert!(permanent.active_user("alice", Utc::now()).is_none());
+
+        let until = "2026-11-27T18:00:00Z";
+        let temporary = UsersSnapshot::parse(&blocked_user_file(until)).expect("temporary");
+        assert!(matches!(
+            temporary.users.get("alice").map(|record| &record.block),
+            Some(BlockState::Until(_))
+        ));
+        let before = DateTime::parse_from_rfc3339("2026-11-27T17:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let boundary = DateTime::parse_from_rfc3339(until)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(temporary.active_user("alice", before).is_none());
+        assert!(temporary.active_user("alice", boundary).is_some());
+        assert_eq!(
+            temporary
+                .users
+                .get("alice")
+                .and_then(|record| record.block.until())
+                .map(format_blocked_until)
+                .as_deref(),
+            Some(until)
+        );
+
+        assert!(matches!(
+            UsersSnapshot::parse(&format!(
+                "version = 2\n\n[[users]]\nusername = \"alice\"\npassword_hash = \"{DUMMY_PHC}\"\ndisabled = true\nblocked_until = \"2026-11-27T18:00:00Z\"\n"
+            )),
+            Err(UsersFileError::IncompatibleBlock { index: 0 })
+        ));
+        assert!(matches!(
+            UsersSnapshot::parse(&blocked_user_file(until).replace("version = 2", "version = 1")),
+            Err(UsersFileError::BlockedUntilRequiresV2 { index: 0 })
+        ));
+        assert!(matches!(
+            UsersSnapshot::parse(&blocked_user_file("2026-11-27 18:00:00")),
+            Err(UsersFileError::InvalidBlockTime { index: 0 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn temporary_block_is_checked_before_hashing_and_expires_on_the_server_clock() {
+        let snapshot = snapshot_with_users(&blocked_user_file("2026-11-27T18:00:00Z"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = Arc::new(MockVerifier {
+            calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
+            result: Ok(true),
+            panic: false,
+        });
+        let before = DateTime::parse_from_rfc3339("2026-11-27T17:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let service = AuthService {
+            snapshot,
+            permits: Arc::new(Semaphore::new(1)),
+            verify_timeout: Duration::from_secs(1),
+            verifier: Arc::clone(&verifier) as Arc<dyn PasswordVerifier>,
+            telemetry: None,
+            clock: Arc::new(FixedClock(before)),
+        };
+        assert_eq!(
+            service
+                .authenticate_headers(&basic("alice", "secret"))
+                .await
+                .unwrap_err(),
+            AuthError::InvalidCredentials
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let after = DateTime::parse_from_rfc3339("2026-11-27T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let service = AuthService {
+            clock: Arc::new(FixedClock(after)),
+            ..service
+        };
+        assert_eq!(
+            service
+                .authenticate_headers(&basic("alice", "secret"))
+                .await
+                .expect("expired block")
+                .username(),
+            "alice"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn version_changes_with_block_schema_and_does_not_expose_phc() {
+        let first = UsersSnapshot::parse(&user_file("alice", false)).expect("users");
+        let second = UsersSnapshot::parse(&user_file("alice", true)).expect("users");
+        assert!(is_content_version(first.version()));
+        assert_ne!(first.version(), second.version());
+        assert!(!first.same_records(&second));
     }
 
     #[tokio::test]

@@ -95,7 +95,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 SOURCE_DIR=$(CDPATH= cd -- "$SOURCE_DIR" && pwd)
-OUTPUT_DIR=$(CDPATH= cd -- "$OUTPUT_DIR" 2>/dev/null || { mkdir -p "$OUTPUT_DIR"; CDPATH= cd -- "$OUTPUT_DIR" && pwd; })
+OUTPUT_DIR=$(CDPATH= cd -- "$OUTPUT_DIR" 2>/dev/null && pwd || { mkdir -p "$OUTPUT_DIR" && CDPATH= cd -- "$OUTPUT_DIR" && pwd; })
 [ -f "$SOURCE_DIR/Cargo.toml" ] || die "source tree has no Cargo.toml: $SOURCE_DIR"
 [ -f "$SOURCE_DIR/Cargo.lock" ] || die "source tree has no Cargo.lock: $SOURCE_DIR"
 
@@ -159,11 +159,16 @@ rm -rf "$DIST"
 mkdir -p "$DIST"/{bin,systemd,config,docs,examples,licenses,provenance}
 install -m 0755 "$BINARY" "$DIST/bin/angara"
 install -m 0644 "$SCRIPT_DIR/angara.service" "$DIST/systemd/angara.service"
+install -m 0644 "$SCRIPT_DIR/angara-control.service" "$DIST/systemd/angara-control.service"
 install -m 0755 "$SCRIPT_DIR/install.sh" "$DIST/install.sh"
 install -m 0755 "$SCRIPT_DIR/angaractl" "$DIST/angaractl"
 install -m 0755 "$SCRIPT_DIR/verify_manifest.py" "$DIST/verify_manifest.py"
 install -m 0644 "$SCRIPT_DIR/angara.toml.default" "$DIST/config/angara.toml.default"
 install -m 0644 "$REPO_DIR/docs/ADMIN_GUIDE.md" "$DIST/docs/ADMIN_GUIDE.md"
+install -m 0644 "$REPO_DIR/docs/CONTROL_API.md" "$DIST/docs/CONTROL_API.md"
+mkdir -p "$DIST/docs/screenshots"
+install -m 0644 "$REPO_DIR/docs/screenshots/m11-wide.png" "$DIST/docs/screenshots/m11-wide.png"
+install -m 0644 "$REPO_DIR/docs/screenshots/m11-narrow.png" "$DIST/docs/screenshots/m11-narrow.png"
 install -m 0644 "$REPO_DIR/docs/RELEASE.md" "$DIST/docs/RELEASE.md"
 install -m 0644 "$REPO_DIR/RELEASE_CHECKLIST.md" "$DIST/RELEASE_CHECKLIST.md"
 install -m 0644 "$REPO_DIR/README.md" "$DIST/README.md"
