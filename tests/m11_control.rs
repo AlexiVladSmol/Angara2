@@ -550,8 +550,16 @@ async fn m11_expiry01_temporary_block_expires_without_a_write_or_restart() {
         .expect("origin");
     let (server, writer, socket, users_path) = start(&dir).await;
     let proxy = server.addresses()[0].1;
-    let until = chrono::Utc::now() + chrono::Duration::seconds(1);
-    let until = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // Round down to whole seconds and keep a real margin for block.set,
+    // reload and the first request.  A 1 s deadline could be reduced to a
+    // fraction of a second by truncation when the test starts near a second
+    // boundary.
+    let until_dt = chrono::DateTime::from_timestamp(
+        (chrono::Utc::now() + chrono::Duration::seconds(3)).timestamp(),
+        0,
+    )
+    .expect("valid block deadline");
+    let until = until_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let config = m11::ok(&socket, "config", json!({})).await;
     let version = config["disk_users_version"].as_str().unwrap().to_owned();
     let applied = m11::ok(
@@ -565,14 +573,26 @@ async fn m11_expiry01_temporary_block_expires_without_a_write_or_restart() {
     )
     .await;
     assert_eq!(applied["state"], "applied");
+    assert!(
+        chrono::Utc::now() < until_dt,
+        "block deadline {until} expired before the first 407 check"
+    );
+    let before_deadline = http_status(proxy, origin.address, "alice", "secret").await;
     assert_eq!(
-        http_status(proxy, origin.address, "alice", "secret").await,
-        407
+        before_deadline, 407,
+        "expected 407 before the block deadline {until}, got {before_deadline}"
     );
     let saved = std::fs::read(&users_path).unwrap();
     let saved_version = angara::version::content_version(&saved);
 
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    // Wait until the parsed deadline plus a small clock/read margin, measured
+    // from the current time rather than as a fixed sleep.
+    let wait_until = until_dt + chrono::Duration::milliseconds(350);
+    let wait = wait_until
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    tokio::time::sleep(wait).await;
     assert_eq!(
         http_status(proxy, origin.address, "alice", "secret").await,
         200,

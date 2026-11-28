@@ -751,7 +751,7 @@ sudo -u nobody test -r /run/angara/control.sock && echo unexpected
 | клиент получает 407 | нет/неверные credentials; проверьте `users.local.toml` и `auth` listener |
 | клиент получает 403 | нет allow-правила ACL, запрещён source/domain/IP/port или сработал default deny |
 | TLS-клиент получает ошибку сертификата | проверьте CA/имя/срок; не отключайте проверку на клиенте |
-| сервис ушёл в start-limit | `systemctl reset-failed angara`; устраните конфигурацию/порт, затем `systemctl start` |
+| сервис ушёл в start-limit | `systemctl reset-failed angara`; устраните конфигурацию/порт, затем `systemctl restart angara.service` (restart передаётся writer-у через `PartOf=`) |
 | `Too many open files` | `LimitNOFILE=16384`; проверьте `log_dropped`, активные соединения и pool |
 | журнал не содержит записей | `observability.log_level`, journald, `log_dropped`; `serve` пишет JSON только в stderr/journal |
 

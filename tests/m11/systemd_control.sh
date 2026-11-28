@@ -118,8 +118,8 @@ write_config() {
 install -m 0755 "$CLIENT" "$CLIENT_TMP"
 CLIENT=$CLIENT_TMP
 
-# Fresh synthetic accounts.  The reader has only the proxy group; the admin
-# has angara-admin as primary group and angara as a supplementary group.
+# Fresh synthetic accounts. The reader has only the proxy group; the admin
+# has angara as its primary group and angara-admin as a supplementary group.
 userdel "$READER" >/dev/null 2>&1 || true
 userdel "$ADMIN" >/dev/null 2>&1 || true
 useradd --system --gid angara --home-dir /nonexistent \
